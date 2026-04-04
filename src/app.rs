@@ -75,6 +75,10 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::get(http::get_channel_prefill),
         )
         .route(
+            "/channels/{channel_id}/probe",
+            axum::routing::post(http::probe_channel),
+        )
+        .route(
             "/channels/{channel_id}",
             axum::routing::patch(http::update_channel).delete(http::delete_channel),
         )

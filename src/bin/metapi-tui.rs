@@ -1,5 +1,9 @@
-use std::{error::Error, io::Write, time::Duration};
+use std::{error::Error, time::Duration};
 
+#[cfg(not(windows))]
+use std::io::Write;
+
+#[cfg(not(windows))]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use futures_util::StreamExt;
@@ -1323,6 +1327,112 @@ impl App {
         self.confirm_selected_channel_action(ChannelAction::ResetCooldown);
     }
 
+    async fn probe_selected_channel(&mut self) {
+        let Some(channel) = self.selected_channel_ref() else {
+            self.status = "no channel selected".to_string();
+            return;
+        };
+        let channel_id = channel.channel_id;
+        let label = channel.channel_label.clone();
+        let site_name = channel.site_name.clone();
+
+        match self.probe_channel_request(channel_id).await {
+            Ok(updated) => {
+                let is_ready = updated.state == "ready";
+                if let Err(error) = self.reload_all().await {
+                    self.status = error;
+                    return;
+                }
+                if let Some(index) = self
+                    .channels
+                    .iter()
+                    .position(|candidate| candidate.channel_id == channel_id)
+                {
+                    self.selected_channel = index;
+                }
+                self.status = if is_ready {
+                    format!("probe OK for {label} @ {site_name}")
+                } else {
+                    format!(
+                        "probe failed for {label} @ {site_name}: {}",
+                        channel_state_badge(&updated)
+                    )
+                };
+            }
+            Err(error) => {
+                self.status = error;
+            }
+        }
+    }
+
+    async fn probe_selected_route(&mut self) {
+        let Some(route) = self.selected_route_ref() else {
+            self.status = "no route selected".to_string();
+            return;
+        };
+        let route_id = route.id;
+        let route_model = route.model_pattern.clone();
+
+        let envelope = match self.fetch_route_channels(route_id).await {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+
+        if envelope.channels.is_empty() {
+            self.status = format!("route {route_model} has no channels");
+            return;
+        }
+
+        let selected_channel_id = self
+            .selected_channel_ref()
+            .map(|channel| channel.channel_id);
+        let mut ok_count = 0usize;
+        let mut failed_count = 0usize;
+        let mut transport_failures = 0usize;
+
+        for channel in envelope.channels {
+            match self.probe_channel_request(channel.channel_id).await {
+                Ok(updated) => {
+                    if updated.state == "ready" {
+                        ok_count += 1;
+                    } else {
+                        failed_count += 1;
+                    }
+                }
+                Err(_) => {
+                    failed_count += 1;
+                    transport_failures += 1;
+                }
+            }
+        }
+
+        if let Err(error) = self.reload_all().await {
+            self.status = error;
+            return;
+        }
+
+        if let Some(selected_channel_id) = selected_channel_id {
+            if let Some(index) = self
+                .channels
+                .iter()
+                .position(|channel| channel.channel_id == selected_channel_id)
+            {
+                self.selected_channel = index;
+            }
+        }
+
+        self.status = if transport_failures > 0 {
+            format!(
+                "probed route {route_model}: {ok_count} ok, {failed_count} failed ({transport_failures} request errors)"
+            )
+        } else {
+            format!("probed route {route_model}: {ok_count} ok, {failed_count} failed")
+        };
+    }
+
     fn copy_base_url(&mut self) {
         match copy_to_clipboard(&format!("{}/v1", self.base_url.trim_end_matches('/'))) {
             Ok(()) => self.status = "OK copied downstream URL to clipboard".to_string(),
@@ -1708,6 +1818,14 @@ impl App {
         .await
     }
 
+    async fn probe_channel_request(&self, channel_id: i64) -> Result<ChannelSummary, String> {
+        self.post_empty(
+            &format!("/api/channels/{channel_id}/probe"),
+            "probe channel",
+        )
+        .await
+    }
+
     async fn delete_channel_request(
         &self,
         channel_id: i64,
@@ -1781,6 +1899,8 @@ async fn run_app(mut terminal: DefaultTerminal, mut app: App) -> Result<(), Box<
                         KeyCode::Char('e') => app.enable_selected_channel().await,
                         KeyCode::Char('d') => app.disable_selected_channel().await,
                         KeyCode::Char('c') => app.reset_selected_channel_cooldown().await,
+                        KeyCode::Char('t') => app.probe_selected_channel().await,
+                        KeyCode::Char('T') => app.probe_selected_route().await,
                         KeyCode::Char(' ') => app.toggle_selected_channel_state(),
                         KeyCode::Char('u') => app.copy_base_url(),
                         KeyCode::Char('K') => app.copy_auth_key(),
@@ -2062,6 +2182,8 @@ fn draw_help_modal(frame: &mut Frame) {
         Line::from("a       add route or channel based on current pane"),
         Line::from("i       edit current channel base/url/key and routing"),
         Line::from("x       delete empty route or selected channel"),
+        Line::from("t       probe selected channel"),
+        Line::from("T       probe all channels in selected route"),
         Line::from("Space   toggle current channel state"),
         Line::from("e       enable selected channel"),
         Line::from("d       disable selected channel"),
@@ -2242,13 +2364,13 @@ fn shortcut_hint(app: &App) -> &'static str {
         AppMode::Detail(_) => "Actions: Enter or Esc close",
         AppMode::Browse => match app.focus {
             FocusPane::Routes => {
-                "Actions: Up/Down move  Enter select  Right channels  a add route  x delete empty  / filter"
+                "Actions: Up/Down move  Enter select  Right channels  a add route  T probe route  x delete empty  / filter"
             }
             FocusPane::Channels => {
-                "Actions: Up/Down move  Enter detail  Left routes  Right logs  Space toggle  c recover  i edit  a add"
+                "Actions: Up/Down move  Enter detail  Left routes  Right logs  t probe  T probe route  Space toggle  c recover  i edit  a add"
             }
             FocusPane::Logs => {
-                "Actions: Up/Down move  Enter detail  Left channels  u copy URL  K copy key  r refresh"
+                "Actions: Up/Down move  Enter detail  Left channels  T probe route  u copy URL  K copy key  r refresh"
             }
         },
     }

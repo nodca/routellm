@@ -82,6 +82,12 @@ struct UpstreamDispatch {
     response_adapter: ResponseAdapter,
 }
 
+#[derive(Debug)]
+struct ProbeOutcome {
+    http_status: Option<u16>,
+    error_message: Option<String>,
+}
+
 pub async fn healthz() -> Json<Value> {
     Json(json!({ "ok": true }))
 }
@@ -195,6 +201,82 @@ pub async fn get_channel_prefill(
             "protocol": channel.protocol
         }
     })))
+}
+
+pub async fn probe_channel(
+    State(state): State<AppState>,
+    Path(channel_id): Path<i64>,
+) -> Result<Response<Body>, AppError> {
+    let channel = state.store.load_channel(channel_id).await?;
+    let started_at = Instant::now();
+    let outcome = execute_channel_probe(&state, &channel).await;
+    let latency_ms = started_at.elapsed().as_millis() as i64;
+
+    match outcome {
+        Ok(http_status) => {
+            state
+                .store
+                .mark_channel_success(channel_id, http_status)
+                .await?;
+            let updated = state.store.load_channel(channel_id).await?;
+            let now = now_ts();
+            let candidate = routing::inspect_candidates(vec![updated], None, now)
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    AppError::Internal("failed to evaluate probed channel".to_string())
+                })?;
+
+            build_json_response(
+                StatusCode::OK,
+                &json!({
+                    "data": channel_admin_view(&candidate, now),
+                    "meta": {
+                        "probe": {
+                            "ok": true,
+                            "http_status": http_status,
+                            "latency_ms": latency_ms
+                        }
+                    }
+                }),
+            )
+        }
+        Err(outcome) => {
+            state
+                .store
+                .mark_channel_failure(
+                    channel_id,
+                    outcome.http_status,
+                    outcome.error_message.as_deref().unwrap_or("probe failed"),
+                    None,
+                    true,
+                )
+                .await?;
+            let updated = state.store.load_channel(channel_id).await?;
+            let now = now_ts();
+            let candidate = routing::inspect_candidates(vec![updated], None, now)
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    AppError::Internal("failed to evaluate probed channel".to_string())
+                })?;
+
+            build_json_response(
+                StatusCode::OK,
+                &json!({
+                    "data": channel_admin_view(&candidate, now),
+                    "meta": {
+                        "probe": {
+                            "ok": false,
+                            "http_status": outcome.http_status,
+                            "latency_ms": latency_ms,
+                            "error_message": outcome.error_message
+                        }
+                    }
+                }),
+            )
+        }
+    }
 }
 
 pub async fn create_route_channel(
@@ -1070,9 +1152,82 @@ async fn probe_onboarding_channel(
         .filter(|value| !value.is_empty())
         .unwrap_or(route_model);
     let protocol = parse_required_protocol(&payload.protocol)?;
+    match run_upstream_probe(state, &base_url, api_key, upstream_model, protocol).await {
+        Ok(_) => Ok(()),
+        Err(outcome) => Err(AppError::BadRequest(format!(
+            "onboarding probe failed: {}",
+            outcome
+                .error_message
+                .unwrap_or_else(|| "unknown probe error".to_string())
+        ))),
+    }
+}
 
+async fn execute_channel_probe(
+    state: &AppState,
+    channel: &ChannelRow,
+) -> Result<u16, ProbeOutcome> {
+    let protocol = Protocol::parse(&channel.protocol).map_err(|error| ProbeOutcome {
+        http_status: None,
+        error_message: Some(error.to_string()),
+    })?;
+
+    run_upstream_probe(
+        state,
+        &channel.site_base_url,
+        &channel.account_api_key,
+        &channel.upstream_model,
+        protocol,
+    )
+    .await
+}
+
+async fn run_upstream_probe(
+    state: &AppState,
+    base_url: &str,
+    api_key: &str,
+    upstream_model: &str,
+    protocol: Protocol,
+) -> Result<u16, ProbeOutcome> {
     let probe_url = format!("{base_url}{}", protocol.path());
-    let probe_payload = match protocol {
+    let probe_payload = build_probe_payload(protocol, upstream_model);
+
+    let response = apply_upstream_auth(state.upstream_client.post(&probe_url), protocol, api_key)
+        .json(&probe_payload)
+        .send()
+        .await
+        .map_err(|error| ProbeOutcome {
+            http_status: None,
+            error_message: Some(format!("transport error: {error}")),
+        })?;
+
+    if response.status().is_success() {
+        return Ok(response.status().as_u16());
+    }
+
+    let status = response.status();
+    let body = response.bytes().await.unwrap_or_default();
+    let message = truncate(String::from_utf8_lossy(&body).as_ref(), 400);
+    let (kind, hint) = classify_upstream_error(Some(i64::from(status.as_u16())), Some(&message));
+    let hint_suffix = hint
+        .as_deref()
+        .map(|value| format!("; {value}"))
+        .unwrap_or_default();
+
+    Err(ProbeOutcome {
+        http_status: Some(status.as_u16()),
+        error_message: Some(format!(
+            "status={} kind={} message={}{}",
+            status.as_u16(),
+            kind,
+            message,
+            hint_suffix
+        )),
+    })
+}
+
+fn build_probe_payload(protocol: Protocol, upstream_model: &str) -> Value {
+    match protocol {
         Protocol::Responses => json!({
             "model": upstream_model,
             "input": "ping",
@@ -1088,36 +1243,7 @@ async fn probe_onboarding_channel(
             "messages": [{ "role": "user", "content": "ping" }],
             "max_tokens": 1
         }),
-    };
-
-    let response = apply_upstream_auth(state.upstream_client.post(&probe_url), protocol, api_key)
-        .json(&probe_payload)
-        .send()
-        .await
-        .map_err(|error| {
-            AppError::BadRequest(format!("onboarding probe failed: transport error: {error}"))
-        })?;
-
-    if response.status().is_success() {
-        return Ok(());
     }
-
-    let status = response.status();
-    let body = response.bytes().await.unwrap_or_default();
-    let message = truncate(String::from_utf8_lossy(&body).as_ref(), 400);
-    let (kind, hint) = classify_upstream_error(Some(i64::from(status.as_u16())), Some(&message));
-    let hint_suffix = hint
-        .as_deref()
-        .map(|value| format!("; {value}"))
-        .unwrap_or_default();
-
-    Err(AppError::BadRequest(format!(
-        "onboarding probe failed: status={} kind={} message={}{}",
-        status.as_u16(),
-        kind,
-        message,
-        hint_suffix
-    )))
 }
 
 fn parse_required_protocol(value: &str) -> Result<Protocol, AppError> {
@@ -3435,6 +3561,98 @@ mod tests {
         assert_eq!(enable_value["data"]["enabled"], true);
         assert_eq!(enable_value["data"]["state"], "ready");
         assert_eq!(enable_value["data"]["eligible"], true);
+    }
+
+    #[tokio::test]
+    async fn probe_channel_marks_success_ready() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("metapi.db");
+        let upstream_addr = spawn_json_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        seed_database(&config.database_url, upstream_addr).await;
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+        sqlx::query(
+            r#"
+            update channels
+            set manual_blocked = 1,
+                consecutive_fail_count = 3,
+                last_status = 401,
+                last_error = 'invalid api key'
+            where id = 1
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/channels/1/probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["data"]["state"], "ready");
+        assert_eq!(value["data"]["manual_blocked"], false);
+        assert_eq!(value["data"]["eligible"], true);
+        assert_eq!(value["data"]["last_status"], 200);
+        assert!(value["data"]["last_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn probe_channel_marks_failure_unavailable() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("metapi.db");
+        let upstream_addr = spawn_edge_blocked_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        seed_database(&config.database_url, upstream_addr).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/channels/1/probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["data"]["state"], "manual_intervention_required");
+        assert_eq!(value["data"]["manual_blocked"], true);
+        assert_eq!(value["data"]["eligible"], false);
+        assert_eq!(value["data"]["last_status"], 403);
+        assert_eq!(value["data"]["last_error_kind"], "edge_blocked");
+        assert!(value["data"]["cooldown_until"].is_null());
     }
 
     #[test]
