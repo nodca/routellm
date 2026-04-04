@@ -7,13 +7,13 @@ Usage: install-server.sh [options]
 
 Options:
   --repo owner/repo         GitHub repository, default nodca/routellm unless --asset-url is set
-  --tag v1.0                Release tag, defaults to latest
+  --tag v1.1.0              Release tag, defaults to latest
   --asset-url URL           Direct asset URL override
   --install-dir DIR         Install directory, default /opt/llmrouter
   --bin-path PATH           Binary install path, default <install-dir>/llmrouter
   --config-file PATH        Config path, default <install-dir>/llmrouter.toml
   --env-file PATH           Environment file, default /etc/llmrouter.env
-  --bind ADDR               Bind address, default 0.0.0.0:8080
+  --bind ADDR               Bind address, default 0.0.0.0:1290
   --master-key KEY          Downstream auth key, default auto-generated
   --request-timeout SECS    Request timeout, default 90
   --service-name NAME       systemd service name, default llmrouter
@@ -89,7 +89,7 @@ INSTALL_DIR="${LLMROUTER_INSTALL_DIR:-/opt/llmrouter}"
 BIN_PATH=""
 CONFIG_FILE=""
 ENV_FILE="${LLMROUTER_ENV_FILE:-/etc/llmrouter.env}"
-BIND_ADDR="${LLMROUTER_BIND_ADDR:-0.0.0.0:8080}"
+BIND_ADDR="${LLMROUTER_BIND_ADDR:-0.0.0.0:1290}"
 MASTER_KEY="${LLMROUTER_MASTER_KEY:-}"
 REQUEST_TIMEOUT="${LLMROUTER_REQUEST_TIMEOUT_SECS:-90}"
 SERVICE_NAME="${LLMROUTER_SERVICE_NAME:-llmrouter}"

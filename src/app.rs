@@ -52,7 +52,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/routes/decision", axum::routing::get(http::route_decision))
         .route(
             "/routes",
-            axum::routing::get(http::list_routes).post(http::onboard_route),
+            axum::routing::get(http::list_routes).post(http::create_route),
         )
         .route(
             "/routes/{route_id}",

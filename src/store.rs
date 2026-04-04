@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{collections::HashMap, str::FromStr};
 
 use sqlx::{
     SqlitePool,
@@ -7,7 +7,10 @@ use sqlx::{
 
 use crate::{
     config::Config,
-    domain::{AdminRouteRow, ChannelRow, ModelRouteRow, RequestLogRow, RequestLogWrite},
+    domain::{
+        AdminRouteRow, ChannelRow, ChannelRuntimeStats, ModelRouteRow, RequestLogRow,
+        RequestLogWrite,
+    },
     error::AppError,
     protocol::Protocol,
 };
@@ -21,7 +24,6 @@ pub struct SqliteStore {
 pub struct DeleteChannelOutcome {
     pub channel: ChannelRow,
     pub route_model: String,
-    pub route_deleted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -388,28 +390,11 @@ impl SqliteStore {
 
         cleanup_account_if_unused(&mut tx, channel.account_id).await?;
 
-        let remaining_channels =
-            sqlx::query_scalar::<_, i64>("select count(*) from channels where route_id = ?")
-                .bind(channel.route_id)
-                .fetch_one(&mut *tx)
-                .await?;
-
-        let route_deleted = if remaining_channels == 0 {
-            sqlx::query("delete from model_routes where id = ?")
-                .bind(channel.route_id)
-                .execute(&mut *tx)
-                .await?;
-            true
-        } else {
-            false
-        };
-
         tx.commit().await?;
 
         Ok(DeleteChannelOutcome {
             channel,
             route_model: route.model_pattern,
-            route_deleted,
         })
     }
 
@@ -545,8 +530,11 @@ impl SqliteStore {
               channel_id,
               http_status,
               latency_ms,
-              error_message
-            ) values (?, ?, ?, ?, ?, ?, ?, ?)
+              error_message,
+              input_tokens,
+              output_tokens,
+              total_tokens
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&log.request_id)
@@ -557,10 +545,80 @@ impl SqliteStore {
         .bind(log.http_status)
         .bind(log.latency_ms)
         .bind(&log.error_message)
+        .bind(log.input_tokens)
+        .bind(log.output_tokens)
+        .bind(log.total_tokens)
         .execute(&self.pool)
         .await?;
 
         Ok(())
+    }
+
+    pub async fn list_channel_runtime_stats(
+        &self,
+        route_id: i64,
+    ) -> Result<HashMap<i64, ChannelRuntimeStats>, AppError> {
+        let rows = sqlx::query_as::<_, ChannelRuntimeStats>(
+            r#"
+            select
+              c.id as channel_id,
+              c.avg_latency_ms as avg_latency_ms,
+              count(rl.id) as requests_24h,
+              coalesce(sum(case
+                when rl.http_status is not null
+                  and rl.http_status < 400
+                  and rl.error_message is null
+                then 1 else 0 end), 0) as success_requests_24h,
+              coalesce(sum(coalesce(rl.input_tokens, 0)), 0) as input_tokens_24h,
+              coalesce(sum(coalesce(rl.output_tokens, 0)), 0) as output_tokens_24h,
+              coalesce(sum(coalesce(rl.total_tokens, 0)), 0) as total_tokens_24h
+            from channels c
+            left join request_logs rl
+              on rl.channel_id = c.id
+             and rl.created_at >= datetime('now', '-1 day')
+            where c.route_id = ?
+            group by c.id, c.avg_latency_ms
+            order by c.id asc
+            "#,
+        )
+        .bind(route_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|row| (row.channel_id, row)).collect())
+    }
+
+    pub async fn load_channel_runtime_stats(
+        &self,
+        channel_id: i64,
+    ) -> Result<ChannelRuntimeStats, AppError> {
+        let row = sqlx::query_as::<_, ChannelRuntimeStats>(
+            r#"
+            select
+              c.id as channel_id,
+              c.avg_latency_ms as avg_latency_ms,
+              count(rl.id) as requests_24h,
+              coalesce(sum(case
+                when rl.http_status is not null
+                  and rl.http_status < 400
+                  and rl.error_message is null
+                then 1 else 0 end), 0) as success_requests_24h,
+              coalesce(sum(coalesce(rl.input_tokens, 0)), 0) as input_tokens_24h,
+              coalesce(sum(coalesce(rl.output_tokens, 0)), 0) as output_tokens_24h,
+              coalesce(sum(coalesce(rl.total_tokens, 0)), 0) as total_tokens_24h
+            from channels c
+            left join request_logs rl
+              on rl.channel_id = c.id
+             and rl.created_at >= datetime('now', '-1 day')
+            where c.id = ?
+            group by c.id, c.avg_latency_ms
+            "#,
+        )
+        .bind(channel_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.ok_or_else(|| AppError::NotFound(format!("channel not found: {channel_id}")))
     }
 
     pub async fn list_route_request_logs(
@@ -582,6 +640,9 @@ impl SqliteStore {
               rl.http_status,
               rl.latency_ms,
               rl.error_message,
+              rl.input_tokens,
+              rl.output_tokens,
+              rl.total_tokens,
               rl.created_at,
               c.label as channel_label,
               s.name as site_name,
@@ -607,6 +668,7 @@ impl SqliteStore {
         &self,
         channel_id: i64,
         http_status: u16,
+        latency_ms: Option<i64>,
     ) -> Result<(), AppError> {
         sqlx::query(
             r#"
@@ -616,11 +678,19 @@ impl SqliteStore {
                 consecutive_fail_count = 0,
                 last_status = ?,
                 last_error = null,
+                avg_latency_ms = case
+                    when ? is null then avg_latency_ms
+                    when avg_latency_ms is null then ?
+                    else cast(round(avg_latency_ms * 0.7 + ? * 0.3) as integer)
+                end,
                 updated_at = current_timestamp
             where id = ?
             "#,
         )
         .bind(i64::from(http_status))
+        .bind(latency_ms)
+        .bind(latency_ms)
+        .bind(latency_ms)
         .bind(channel_id)
         .execute(&self.pool)
         .await?;
@@ -673,12 +743,13 @@ const CHANNEL_SELECT_BY_ROUTE_SQL: &str = r#"
       s.status as site_status,
       c.label as channel_label,
       c.upstream_model,
-      c.protocol,
-      c.enabled,
-      c.priority,
-      c.cooldown_until,
-      c.manual_blocked,
-      c.consecutive_fail_count,
+              c.protocol,
+              c.enabled,
+              c.priority,
+              c.avg_latency_ms,
+              c.cooldown_until,
+              c.manual_blocked,
+              c.consecutive_fail_count,
       c.last_status,
       c.last_error
     from channels c
@@ -704,6 +775,7 @@ const CHANNEL_SELECT_BY_ID_SQL: &str = r#"
       c.protocol,
       c.enabled,
       c.priority,
+      c.avg_latency_ms,
       c.cooldown_until,
       c.manual_blocked,
       c.consecutive_fail_count,

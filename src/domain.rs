@@ -40,6 +40,7 @@ pub struct ChannelRow {
     pub protocol: String,
     pub enabled: i64,
     pub priority: i64,
+    pub avg_latency_ms: Option<i64>,
     pub cooldown_until: Option<i64>,
     pub manual_blocked: i64,
     pub consecutive_fail_count: i64,
@@ -58,10 +59,24 @@ pub struct RequestLogRow {
     pub http_status: Option<i64>,
     pub latency_ms: i64,
     pub error_message: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
     pub created_at: String,
     pub channel_label: String,
     pub site_name: String,
     pub upstream_model: String,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct ChannelRuntimeStats {
+    pub channel_id: i64,
+    pub avg_latency_ms: Option<i64>,
+    pub requests_24h: i64,
+    pub success_requests_24h: i64,
+    pub input_tokens_24h: i64,
+    pub output_tokens_24h: i64,
+    pub total_tokens_24h: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,4 +112,7 @@ pub struct RequestLogWrite {
     pub http_status: Option<i64>,
     pub latency_ms: i64,
     pub error_message: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
 }

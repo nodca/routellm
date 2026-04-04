@@ -176,6 +176,7 @@ Server:
 TUI:
   user         ${TUI_USER}
   binary       ${TUI_BIN_DIR}/llmrouter-tui
+  alias        ${TUI_BIN_DIR}/lrtui
   config       ${TUI_CONFIG_DIR}/tui.env
 
 Management key:
@@ -186,5 +187,5 @@ Next steps:
   2. Restart after editing:
      sudo systemctl restart ${SERVICE_NAME}
   3. Run TUI as ${TUI_USER}:
-     ${TUI_BIN_DIR}/llmrouter-tui
+     lrtui
 EOF

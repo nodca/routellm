@@ -7,7 +7,7 @@ Usage: install-tui.sh [options]
 
 Options:
   --repo owner/repo         GitHub repository, default nodca/routellm unless --asset-url is set
-  --tag v1.0                Release tag, defaults to latest
+  --tag v1.1.0              Release tag, defaults to latest
   --asset-url URL           Direct asset URL override
   --bin-dir DIR             Binary install directory, default ~/.local/bin
   --config-dir DIR          Config directory, default ~/.config/llmrouter
@@ -113,6 +113,7 @@ fi
 
 mkdir -p "$BIN_DIR"
 install -m 755 "${PACKAGE_ROOT}/llmrouter-tui" "${BIN_DIR}/llmrouter-tui"
+ln -sf "${BIN_DIR}/llmrouter-tui" "${BIN_DIR}/lrtui"
 
 ENV_FILE="${CONFIG_DIR}/tui.env"
 if [[ "$SKIP_ENV" -eq 0 ]]; then
@@ -130,6 +131,8 @@ TUI installation complete.
 
 Binary:
   ${BIN_DIR}/llmrouter-tui
+Alias:
+  ${BIN_DIR}/lrtui
 EOF
 
 if [[ "$SKIP_ENV" -eq 0 ]]; then
@@ -138,12 +141,12 @@ Env file:
   ${ENV_FILE}
 
 Run:
-  set -a; . "${ENV_FILE}"; set +a; "${BIN_DIR}/llmrouter-tui"
+  lrtui
 EOF
 else
   cat <<EOF
 Run:
-  LLMROUTER_BASE_URL=${SERVER_URL} ${BIN_DIR}/llmrouter-tui
+  LLMROUTER_BASE_URL=${SERVER_URL} lrtui
 EOF
 fi
 
@@ -152,5 +155,7 @@ case ":$PATH:" in
   *)
     echo
     echo "Note: ${BIN_DIR} is not in your PATH. Add it or run the binary with its full path."
+    echo "Direct path:"
+    echo "  ${BIN_DIR}/lrtui"
     ;;
 esac

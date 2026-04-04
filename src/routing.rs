@@ -36,6 +36,27 @@ pub fn decide_route(
     })
 }
 
+pub fn ordered_eligible_channels(candidates: &[CandidateEvaluation]) -> Vec<ChannelRow> {
+    let mut eligible = candidates
+        .iter()
+        .filter(|candidate| candidate.eligible)
+        .collect::<Vec<_>>();
+
+    eligible.sort_by_key(|candidate| {
+        (
+            candidate.channel.priority,
+            candidate.protocol_cost.unwrap_or(u8::MAX),
+            candidate.channel.avg_latency_ms.unwrap_or(i64::MAX),
+            candidate.channel.channel_id,
+        )
+    });
+
+    eligible
+        .into_iter()
+        .map(|candidate| candidate.channel.clone())
+        .collect()
+}
+
 pub fn inspect_candidates(
     channels: Vec<ChannelRow>,
     request_protocol: Option<Protocol>,
@@ -111,25 +132,11 @@ pub fn inspect_candidates(
 }
 
 fn choose_candidate(candidates: &[CandidateEvaluation]) -> Option<&ChannelRow> {
-    let best_priority = candidates
-        .iter()
-        .filter(|candidate| candidate.eligible)
-        .map(|candidate| candidate.channel.priority)
-        .min()?;
-    let best_protocol_cost = candidates
-        .iter()
-        .filter(|candidate| candidate.eligible)
-        .filter(|candidate| candidate.channel.priority == best_priority)
-        .filter_map(|candidate| candidate.protocol_cost)
-        .min()?;
-
+    let ordered = ordered_eligible_channels(candidates);
+    let selected_id = ordered.first()?.channel_id;
     candidates
         .iter()
-        .find(|candidate| {
-            candidate.eligible
-                && candidate.channel.priority == best_priority
-                && candidate.protocol_cost == Some(best_protocol_cost)
-        })
+        .find(|candidate| candidate.channel.channel_id == selected_id)
         .map(|candidate| &candidate.channel)
 }
 
@@ -189,6 +196,7 @@ mod tests {
             protocol: protocol.to_string(),
             enabled: 1,
             priority,
+            avg_latency_ms: None,
             cooldown_until,
             manual_blocked: 0,
             consecutive_fail_count: 0,
@@ -239,6 +247,18 @@ mod tests {
             Some(Protocol::Responses),
             100,
         );
+        let selected = choose_candidate(&candidates).unwrap();
+        assert_eq!(selected.channel_id, 1);
+    }
+
+    #[test]
+    fn selector_prefers_lower_latency_within_same_priority_and_protocol_group() {
+        let mut fast = channel(1, 0, "responses", None);
+        fast.avg_latency_ms = Some(120);
+        let mut slow = channel(2, 0, "responses", None);
+        slow.avg_latency_ms = Some(420);
+
+        let candidates = inspect_candidates(vec![slow, fast], Some(Protocol::Responses), 100);
         let selected = choose_candidate(&candidates).unwrap();
         assert_eq!(selected.channel_id, 1);
     }

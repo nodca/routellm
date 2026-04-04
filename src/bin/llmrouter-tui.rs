@@ -1,9 +1,12 @@
 use std::{
-    env, fs,
+    collections::HashSet,
+    env,
     error::Error,
+    fs,
     io::{self, IsTerminal},
     path::{Path, PathBuf},
     time::Duration,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(not(windows))]
@@ -22,6 +25,7 @@ use ratatui::{
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio::sync::mpsc;
 use tokio::time::{self, MissedTickBehavior};
 
 #[derive(Debug, Deserialize, Clone)]
@@ -36,7 +40,6 @@ struct RouteSummary {
     enabled: bool,
     routing_strategy: String,
     channel_count: i64,
-    enabled_channel_count: i64,
     ready_channel_count: i64,
     cooling_channel_count: i64,
     manual_blocked_channel_count: i64,
@@ -57,7 +60,6 @@ struct RouteLogsEnvelope {
 struct ChannelPrefill {
     base_url: String,
     api_key: String,
-    upstream_model: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -80,6 +82,7 @@ struct ChannelSummary {
     upstream_model: String,
     protocol: String,
     priority: i64,
+    avg_latency_ms: Option<i64>,
     manual_blocked: bool,
     cooldown_remaining_seconds: Option<i64>,
     consecutive_fail_count: i64,
@@ -90,6 +93,11 @@ struct ChannelSummary {
     eligible: bool,
     state: String,
     reason: String,
+    requests_24h: i64,
+    success_requests_24h: i64,
+    input_tokens_24h: i64,
+    output_tokens_24h: i64,
+    total_tokens_24h: i64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -102,6 +110,35 @@ struct RequestLogSummary {
     error_message: Option<String>,
     error_kind: String,
     created_at: String,
+    #[serde(default)]
+    probe: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LocalProbeLog {
+    route_id: i64,
+    log: RequestLogSummary,
+}
+
+#[derive(Debug, Clone)]
+struct ProbeChannelOutcome {
+    route_id: i64,
+    channel_id: i64,
+    channel_label: String,
+    site_name: String,
+    upstream_model: String,
+    result: Result<ChannelSummary, String>,
+}
+
+#[derive(Debug, Clone)]
+enum ProbeEvent {
+    Single(ProbeChannelOutcome),
+    Batch {
+        route_id: i64,
+        route_model: String,
+        selected_channel_id: Option<i64>,
+        outcomes: Vec<ProbeChannelOutcome>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,7 +396,13 @@ trait TextEditableForm {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct OnboardRouteRequest {
+struct CreateRouteRequest {
+    route_model: String,
+    cooldown_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CreateRouteFormRequest {
     route_model: String,
     base_url: String,
     api_key: String,
@@ -394,19 +437,13 @@ impl OnboardRouteForm {
         }
     }
 
-    fn add_channel(route: &RouteSummary, prefill: Option<&ChannelPrefill>) -> Self {
+    fn add_channel(route: &RouteSummary) -> Self {
         Self {
             mode: FormMode::AddChannel { route_id: route.id },
             route_model: route.model_pattern.clone(),
-            base_url: prefill
-                .map(|value| value.base_url.clone())
-                .unwrap_or_default(),
-            api_key: prefill
-                .map(|value| value.api_key.clone())
-                .unwrap_or_default(),
-            upstream_model: prefill
-                .map(|value| value.upstream_model.clone())
-                .unwrap_or_else(|| route.model_pattern.clone()),
+            base_url: String::new(),
+            api_key: String::new(),
+            upstream_model: route.model_pattern.clone(),
             protocol: String::new(),
             priority: "0".to_string(),
             active_field: OnboardRouteField::BaseUrl,
@@ -414,6 +451,9 @@ impl OnboardRouteForm {
     }
 
     fn editable_fields(&self) -> Vec<OnboardRouteField> {
+        if matches!(self.mode, FormMode::NewRoute) {
+            return vec![OnboardRouteField::RouteModel];
+        }
         let mut fields = OnboardRouteField::all().to_vec();
         if self.route_model_locked() {
             fields.retain(|field| *field != OnboardRouteField::RouteModel);
@@ -432,7 +472,7 @@ impl OnboardRouteForm {
         }
     }
 
-    fn to_request(&self) -> Result<OnboardRouteRequest, String> {
+    fn to_add_channel_request(&self) -> Result<CreateRouteFormRequest, String> {
         let route_model = self.route_model.trim().to_string();
         if route_model.is_empty() {
             return Err("route_model is required".to_string());
@@ -452,7 +492,7 @@ impl OnboardRouteForm {
         let upstream_model = self.upstream_model.trim();
         let protocol = normalize_protocol_input(&self.protocol)?;
 
-        Ok(OnboardRouteRequest {
+        Ok(CreateRouteFormRequest {
             route_model,
             base_url,
             api_key,
@@ -462,11 +502,23 @@ impl OnboardRouteForm {
         })
     }
 
+    fn to_create_route_request(&self) -> Result<CreateRouteRequest, String> {
+        let route_model = self.route_model.trim().to_string();
+        if route_model.is_empty() {
+            return Err("route_model is required".to_string());
+        }
+
+        Ok(CreateRouteRequest {
+            route_model,
+            cooldown_seconds: None,
+        })
+    }
+
     fn to_submission(&self) -> Result<FormSubmission, String> {
         match self.mode {
-            FormMode::NewRoute => Ok(FormSubmission::Onboard(self.to_request()?)),
+            FormMode::NewRoute => Ok(FormSubmission::CreateRoute(self.to_create_route_request()?)),
             FormMode::AddChannel { route_id } => {
-                let request = self.to_request()?;
+                let request = self.to_add_channel_request()?;
                 Ok(FormSubmission::AddChannel {
                     route_id,
                     request: CreateRouteChannelRequest {
@@ -510,7 +562,7 @@ impl TextEditableForm for OnboardRouteForm {
 }
 
 enum FormSubmission {
-    Onboard(OnboardRouteRequest),
+    CreateRoute(CreateRouteRequest),
     AddChannel {
         route_id: i64,
         request: CreateRouteChannelRequest,
@@ -518,10 +570,9 @@ enum FormSubmission {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-struct OnboardRouteResponse {
-    route_created: bool,
+struct CreateRouteResponse {
+    created: bool,
     route: RouteDetail,
-    channel: ChannelSummary,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -545,10 +596,8 @@ struct UpdateChannelRequest {
 #[derive(Debug, Deserialize, Clone)]
 struct DeleteChannelResponse {
     route_id: i64,
-    route_model: String,
     channel_label: String,
     site_name: String,
-    route_deleted: bool,
     deleted: bool,
 }
 
@@ -691,10 +740,12 @@ struct App {
     client: Client,
     base_url: String,
     auth_key: Option<String>,
+    probe_tx: mpsc::UnboundedSender<ProbeEvent>,
     routes: Vec<RouteSummary>,
     selected_route: usize,
     channels: Vec<ChannelSummary>,
     logs: Vec<RequestLogSummary>,
+    local_probe_logs: Vec<LocalProbeLog>,
     route_detail: Option<RouteDetail>,
     selected_channel: usize,
     selected_log: usize,
@@ -703,18 +754,25 @@ struct App {
     last_search: Option<LastSearch>,
     status: String,
     show_help: bool,
+    probing_channels: HashSet<i64>,
 }
 
 impl App {
-    fn new(base_url: String, auth_key: Option<String>) -> Self {
+    fn new(
+        base_url: String,
+        auth_key: Option<String>,
+        probe_tx: mpsc::UnboundedSender<ProbeEvent>,
+    ) -> Self {
         Self {
             client: Client::new(),
             base_url,
             auth_key,
+            probe_tx,
             routes: Vec::new(),
             selected_route: 0,
             channels: Vec::new(),
             logs: Vec::new(),
+            local_probe_logs: Vec::new(),
             route_detail: None,
             selected_channel: 0,
             selected_log: 0,
@@ -723,6 +781,7 @@ impl App {
             last_search: None,
             status: "loading...".to_string(),
             show_help: false,
+            probing_channels: HashSet::new(),
         }
     }
 
@@ -742,6 +801,12 @@ impl App {
             Err(error) => {
                 self.status = error;
             }
+        }
+    }
+
+    async fn refresh_background(&mut self) {
+        if let Err(error) = self.reload_all().await {
+            self.status = error;
         }
     }
 
@@ -775,12 +840,13 @@ impl App {
             self.selected_log = 0;
             return Ok(());
         };
+        let route_id = route.id;
 
-        let envelope = self.fetch_route_channels(route.id).await?;
-        let logs_envelope = self.fetch_route_logs(route.id).await?;
+        let envelope = self.fetch_route_channels(route_id).await?;
+        let logs_envelope = self.fetch_route_logs(route_id).await?;
         self.route_detail = Some(envelope.route);
         self.channels = envelope.channels;
-        self.logs = logs_envelope.logs;
+        self.logs = self.merge_route_logs(route_id, logs_envelope.logs);
         self.selected_channel = if self.channels.is_empty() {
             0
         } else {
@@ -944,6 +1010,22 @@ impl App {
         self.logs.iter().collect()
     }
 
+    fn merge_route_logs(
+        &self,
+        route_id: i64,
+        server_logs: Vec<RequestLogSummary>,
+    ) -> Vec<RequestLogSummary> {
+        let mut merged: Vec<RequestLogSummary> = self
+            .local_probe_logs
+            .iter()
+            .filter(|entry| entry.route_id == route_id)
+            .map(|entry| entry.log.clone())
+            .collect();
+        merged.extend(server_logs);
+        merged.truncate(20);
+        merged
+    }
+
     fn selected_log_ref(&self) -> Option<&RequestLogSummary> {
         self.visible_logs().get(self.selected_log).copied()
     }
@@ -1056,14 +1138,6 @@ impl App {
         }
     }
 
-    fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
-            FocusPane::Routes => FocusPane::Channels,
-            FocusPane::Channels => FocusPane::Logs,
-            FocusPane::Logs => FocusPane::Routes,
-        };
-    }
-
     async fn move_page_down(&mut self) {
         for _ in 0..5 {
             self.move_down().await;
@@ -1098,21 +1172,11 @@ impl App {
             return;
         };
         let route = route.clone();
-        let prefill = if let Some(channel) = self.selected_channel_ref() {
-            match self.fetch_channel_prefill(channel.channel_id).await {
-                Ok(prefill) => Some(prefill),
-                Err(error) => {
-                    self.status = format!("prefill unavailable, fallback to empty values: {error}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        self.mode = AppMode::OnboardRoute(OnboardRouteForm::add_channel(&route, prefill.as_ref()));
+        self.mode = AppMode::OnboardRoute(OnboardRouteForm::add_channel(&route));
     }
 
     fn open_new_route_form(&mut self) {
+        self.focus = FocusPane::Routes;
         self.mode = AppMode::OnboardRoute(OnboardRouteForm::new_route());
     }
 
@@ -1185,29 +1249,18 @@ impl App {
         };
 
         match submission {
-            FormSubmission::Onboard(request) => match self.onboard_route(&request).await {
+            FormSubmission::CreateRoute(request) => match self.create_route(&request).await {
                 Ok(result) => {
                     self.mode = AppMode::Browse;
                     self.select_route_by_id(result.route.id);
-                    let success_message = if result.route_created {
-                        format!(
-                            "created route {} and added {} @ {}",
-                            result.route.model_pattern,
-                            result.channel.channel_label,
-                            result.channel.site_name
-                        )
-                    } else {
-                        format!(
-                            "added {} @ {} to route {}",
-                            result.channel.channel_label,
-                            result.channel.site_name,
-                            result.route.model_pattern
-                        )
-                    };
                     if let Err(error) = self.reload_all().await {
                         self.status = error;
                     } else {
-                        self.status = success_message;
+                        self.status = if result.created {
+                            format!("created route {}", result.route.model_pattern)
+                        } else {
+                            format!("route {} already exists", result.route.model_pattern)
+                        };
                     }
                 }
                 Err(error) => {
@@ -1244,12 +1297,11 @@ impl App {
         }
     }
 
-    async fn onboard_route(
+    async fn create_route(
         &self,
-        request: &OnboardRouteRequest,
-    ) -> Result<OnboardRouteResponse, String> {
-        self.post_json("/api/routes", request, "onboard route")
-            .await
+        request: &CreateRouteRequest,
+    ) -> Result<CreateRouteResponse, String> {
+        self.post_json("/api/routes", request, "create route").await
     }
 
     async fn create_route_channel(
@@ -1338,37 +1390,39 @@ impl App {
             self.status = "no channel selected".to_string();
             return;
         };
-        let channel_id = channel.channel_id;
-        let label = channel.channel_label.clone();
-        let site_name = channel.site_name.clone();
+        let Some(route) = self.selected_route_ref() else {
+            self.status = "no route selected".to_string();
+            return;
+        };
 
-        match self.probe_channel_request(channel_id).await {
-            Ok(updated) => {
-                let is_ready = updated.state == "ready";
-                if let Err(error) = self.reload_all().await {
-                    self.status = error;
-                    return;
-                }
-                if let Some(index) = self
-                    .channels
-                    .iter()
-                    .position(|candidate| candidate.channel_id == channel_id)
-                {
-                    self.selected_channel = index;
-                }
-                self.status = if is_ready {
-                    format!("probe OK for {label} @ {site_name}")
-                } else {
-                    format!(
-                        "probe failed for {label} @ {site_name}: {}",
-                        channel_state_badge(&updated)
-                    )
-                };
-            }
-            Err(error) => {
-                self.status = error;
-            }
-        }
+        let outcome = ProbeChannelOutcome {
+            route_id: route.id,
+            channel_id: channel.channel_id,
+            channel_label: channel.channel_label.clone(),
+            site_name: channel.site_name.clone(),
+            upstream_model: channel.upstream_model.clone(),
+            result: Ok(channel.clone()),
+        };
+
+        self.probing_channels.insert(channel.channel_id);
+        self.status = format!(
+            "probing {} @ {}...",
+            outcome.channel_label, outcome.site_name
+        );
+
+        let client = self.client.clone();
+        let base_url = self.base_url.clone();
+        let auth_key = self.auth_key.clone();
+        let tx = self.probe_tx.clone();
+
+        tokio::spawn(async move {
+            let result =
+                probe_channel_request(client, base_url, auth_key, outcome.channel_id).await;
+            let _ = tx.send(ProbeEvent::Single(ProbeChannelOutcome {
+                result,
+                ..outcome
+            }));
+        });
     }
 
     async fn probe_selected_route(&mut self) {
@@ -1395,26 +1449,124 @@ impl App {
         let selected_channel_id = self
             .selected_channel_ref()
             .map(|channel| channel.channel_id);
-        let mut ok_count = 0usize;
-        let mut failed_count = 0usize;
-        let mut transport_failures = 0usize;
+        let route_model_for_status = route_model.clone();
+        let outcomes: Vec<ProbeChannelOutcome> = envelope
+            .channels
+            .into_iter()
+            .map(|channel| ProbeChannelOutcome {
+                route_id,
+                channel_id: channel.channel_id,
+                channel_label: channel.channel_label.clone(),
+                site_name: channel.site_name.clone(),
+                upstream_model: channel.upstream_model.clone(),
+                result: Ok(channel),
+            })
+            .collect();
 
-        for channel in envelope.channels {
-            match self.probe_channel_request(channel.channel_id).await {
-                Ok(updated) => {
-                    if updated.state == "ready" {
-                        ok_count += 1;
-                    } else {
-                        failed_count += 1;
+        for outcome in &outcomes {
+            self.probing_channels.insert(outcome.channel_id);
+        }
+        self.status = format!(
+            "probing route {route_model_for_status} ({})...",
+            outcomes.len()
+        );
+
+        let client = self.client.clone();
+        let base_url = self.base_url.clone();
+        let auth_key = self.auth_key.clone();
+        let tx = self.probe_tx.clone();
+
+        tokio::spawn(async move {
+            let mut completed = Vec::with_capacity(outcomes.len());
+            for outcome in outcomes {
+                let result = probe_channel_request(
+                    client.clone(),
+                    base_url.clone(),
+                    auth_key.clone(),
+                    outcome.channel_id,
+                )
+                .await;
+                completed.push(ProbeChannelOutcome { result, ..outcome });
+            }
+            let _ = tx.send(ProbeEvent::Batch {
+                route_id,
+                route_model,
+                selected_channel_id,
+                outcomes: completed,
+            });
+        });
+    }
+
+    async fn handle_probe_event(&mut self, event: ProbeEvent) {
+        match event {
+            ProbeEvent::Single(outcome) => {
+                self.probing_channels.remove(&outcome.channel_id);
+                self.apply_probe_outcomes(outcome.route_id, Some(outcome.channel_id), [&outcome])
+                    .await;
+                self.status = match &outcome.result {
+                    Ok(updated) if updated.state == "ready" => {
+                        format!(
+                            "probe OK for {} @ {}",
+                            outcome.channel_label, outcome.site_name
+                        )
+                    }
+                    Ok(updated) => format!(
+                        "probe failed for {} @ {}: {}",
+                        outcome.channel_label,
+                        outcome.site_name,
+                        channel_state_badge(updated, false)
+                    ),
+                    Err(error) => format!(
+                        "probe request failed for {} @ {}: {}",
+                        outcome.channel_label, outcome.site_name, error
+                    ),
+                };
+            }
+            ProbeEvent::Batch {
+                route_id,
+                route_model,
+                selected_channel_id,
+                outcomes,
+            } => {
+                for outcome in &outcomes {
+                    self.probing_channels.remove(&outcome.channel_id);
+                }
+                self.apply_probe_outcomes(route_id, selected_channel_id, outcomes.iter())
+                    .await;
+
+                let mut ok_count = 0usize;
+                let mut failed_count = 0usize;
+                let mut transport_failures = 0usize;
+                for outcome in &outcomes {
+                    match &outcome.result {
+                        Ok(updated) if updated.state == "ready" => ok_count += 1,
+                        Ok(_) => failed_count += 1,
+                        Err(_) => {
+                            failed_count += 1;
+                            transport_failures += 1;
+                        }
                     }
                 }
-                Err(_) => {
-                    failed_count += 1;
-                    transport_failures += 1;
-                }
+                self.status = if transport_failures > 0 {
+                    format!(
+                        "probed route {route_model}: {ok_count} ok, {failed_count} failed ({transport_failures} request errors)"
+                    )
+                } else {
+                    format!("probed route {route_model}: {ok_count} ok, {failed_count} failed")
+                };
             }
         }
+    }
 
+    async fn apply_probe_outcomes<'a, I>(
+        &mut self,
+        route_id: i64,
+        selected_channel_id: Option<i64>,
+        outcomes: I,
+    ) where
+        I: IntoIterator<Item = &'a ProbeChannelOutcome>,
+    {
+        let current_route_id = self.selected_route_ref().map(|route| route.id);
         if let Err(error) = self.reload_all().await {
             self.status = error;
             return;
@@ -1430,13 +1582,53 @@ impl App {
             }
         }
 
-        self.status = if transport_failures > 0 {
-            format!(
-                "probed route {route_model}: {ok_count} ok, {failed_count} failed ({transport_failures} request errors)"
-            )
-        } else {
-            format!("probed route {route_model}: {ok_count} ok, {failed_count} failed")
+        if current_route_id == Some(route_id) {
+            for outcome in outcomes {
+                self.push_probe_log(route_id, outcome);
+            }
+        }
+    }
+
+    fn push_probe_log(&mut self, route_id: i64, outcome: &ProbeChannelOutcome) {
+        let (http_status, error_message, error_kind) = match &outcome.result {
+            Ok(updated) if updated.state == "ready" => (Some(200), None, "probe".to_string()),
+            Ok(updated) => (
+                updated.last_status,
+                updated
+                    .last_error
+                    .clone()
+                    .or_else(|| Some(channel_state_badge(updated, false))),
+                updated
+                    .last_error_kind
+                    .clone()
+                    .unwrap_or_else(|| "probe_failed".to_string()),
+            ),
+            Err(error) => (None, Some(error.clone()), "transport_error".to_string()),
         };
+
+        let log = RequestLogSummary {
+            downstream_path: "[probe]".to_string(),
+            site_name: outcome.site_name.clone(),
+            upstream_model: outcome.upstream_model.clone(),
+            http_status,
+            latency_ms: 0,
+            error_message,
+            error_kind,
+            created_at: current_time_label(),
+            probe: true,
+        };
+
+        self.local_probe_logs.insert(
+            0,
+            LocalProbeLog {
+                route_id,
+                log: log.clone(),
+            },
+        );
+        self.local_probe_logs.truncate(40);
+
+        self.logs.insert(0, log);
+        self.logs.truncate(20);
     }
 
     fn copy_base_url(&mut self) {
@@ -1612,14 +1804,7 @@ impl App {
                         }
                     }
                     self.status = if deleted.deleted {
-                        if deleted.route_deleted {
-                            format!(
-                                "deleted {} @ {} and removed empty route {}",
-                                deleted.channel_label, deleted.site_name, deleted.route_model
-                            )
-                        } else {
-                            format!("deleted {} @ {}", deleted.channel_label, deleted.site_name)
-                        }
+                        format!("deleted {} @ {}", deleted.channel_label, deleted.site_name)
                     } else {
                         format!(
                             "delete returned unexpected state for {}",
@@ -1713,7 +1898,7 @@ impl App {
                 }
                 AppMode::Browse => false,
             },
-            KeyCode::Tab | KeyCode::Down => match &mut self.mode {
+            KeyCode::Down => match &mut self.mode {
                 AppMode::OnboardRoute(form) => {
                     form.next_field();
                     true
@@ -1725,7 +1910,7 @@ impl App {
                 AppMode::Search(_) | AppMode::Confirm(_) | AppMode::Detail(_) => false,
                 AppMode::Browse => false,
             },
-            KeyCode::BackTab | KeyCode::Up => match &mut self.mode {
+            KeyCode::Up => match &mut self.mode {
                 AppMode::OnboardRoute(form) => {
                     form.previous_field();
                     true
@@ -1824,14 +2009,6 @@ impl App {
         .await
     }
 
-    async fn probe_channel_request(&self, channel_id: i64) -> Result<ChannelSummary, String> {
-        self.post_empty(
-            &format!("/api/channels/{channel_id}/probe"),
-            "probe channel",
-        )
-        .await
-    }
-
     async fn delete_channel_request(
         &self,
         channel_id: i64,
@@ -1853,12 +2030,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let startup = load_tui_startup_config()?;
     let base_url = startup.base_url;
     let auth_key = startup.auth_key;
-    let mut app = App::new(base_url, auth_key);
+    let (probe_tx, mut probe_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(base_url, auth_key, probe_tx);
     app.refresh_all().await;
 
     let terminal = ratatui::init();
 
-    let result = run_app(terminal, app).await;
+    let result = run_app(terminal, app, &mut probe_rx).await;
 
     ratatui::restore();
 
@@ -1878,8 +2056,8 @@ struct SavedTuiEnv {
 }
 
 fn load_tui_startup_config() -> Result<TuiStartupConfig, Box<dyn Error>> {
-    let config_path = tui_env_file_path()
-        .ok_or("could not determine a local config path for llmrouter-tui")?;
+    let config_path =
+        tui_env_file_path().ok_or("could not determine a local config path for llmrouter-tui")?;
     let saved = load_tui_env_file(&config_path).unwrap_or_default();
 
     let base_url = env::var("LLMROUTER_BASE_URL")
@@ -2015,7 +2193,11 @@ fn tui_env_file_path() -> Option<PathBuf> {
     }
 }
 
-async fn run_app(mut terminal: DefaultTerminal, mut app: App) -> Result<(), Box<dyn Error>> {
+async fn run_app(
+    mut terminal: DefaultTerminal,
+    mut app: App,
+    probe_rx: &mut mpsc::UnboundedReceiver<ProbeEvent>,
+) -> Result<(), Box<dyn Error>> {
     let mut events = EventStream::new();
     let mut ticker = time::interval(Duration::from_secs(5));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -2058,7 +2240,6 @@ async fn run_app(mut terminal: DefaultTerminal, mut app: App) -> Result<(), Box<
                         KeyCode::Char('u') => app.copy_base_url(),
                         KeyCode::Char('K') => app.copy_auth_key(),
                         KeyCode::Char('?') => app.show_help = !app.show_help,
-                        KeyCode::Tab => app.toggle_focus(),
                         KeyCode::Left => app.move_focus_left(),
                         KeyCode::Right => app.move_focus_right(),
                         KeyCode::Down => app.move_down().await,
@@ -2068,8 +2249,13 @@ async fn run_app(mut terminal: DefaultTerminal, mut app: App) -> Result<(), Box<
                     }
                 }
             }
+            maybe_probe = probe_rx.recv() => {
+                if let Some(event) = maybe_probe {
+                    app.handle_probe_event(event).await;
+                }
+            }
             _ = ticker.tick() => {
-                app.refresh_all().await;
+                app.refresh_background().await;
             }
         }
     }
@@ -2078,7 +2264,7 @@ async fn run_app(mut terminal: DefaultTerminal, mut app: App) -> Result<(), Box<
 fn draw(frame: &mut Frame, app: &App) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(5)])
+        .constraints([Constraint::Min(8), Constraint::Length(6)])
         .split(frame.area());
 
     let columns = Layout::default()
@@ -2100,7 +2286,11 @@ fn draw(frame: &mut Frame, app: &App) {
     }
 
     match &app.mode {
-        AppMode::OnboardRoute(form) => draw_add_channel_modal(frame, form),
+        AppMode::OnboardRoute(form) => {
+            if matches!(form.mode, FormMode::AddChannel { .. }) {
+                draw_add_channel_modal(frame, form);
+            }
+        }
         AppMode::EditChannel(form) => draw_edit_channel_modal(frame, form),
         AppMode::Confirm(dialog) => draw_confirm_modal(frame, dialog),
         AppMode::Search(dialog) => draw_search_modal(frame, dialog),
@@ -2111,94 +2301,131 @@ fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_routes(frame: &mut Frame, area: Rect, app: &App) {
     let visible = app.filtered_route_indices();
-    let items: Vec<ListItem> = app
+    let mut items: Vec<ListItem> = app
         .filtered_route_indices()
         .into_iter()
         .map(|index| &app.routes[index])
         .map(|route| {
-            let (health_label, health_color) = route_health_badge(route);
-            let line1 = Line::from(vec![
+            let (icon, icon_color) = route_health_icon(route);
+            let summary = format!(
+                "[{}/{}]",
+                route.ready_channel_count.max(0),
+                route.channel_count.max(0)
+            );
+            let line = Line::from(vec![
                 Span::styled(
-                    route.model_pattern.clone(),
+                    icon,
+                    Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    truncate_text(&route.model_pattern, 20),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::styled(
-                    route_health_lane(route),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    health_label,
-                    Style::default()
-                        .fg(health_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(summary, Style::default().fg(Color::Gray)),
             ]);
-            let line2 = Line::from(format!(
-                "run {}/{}  stop {}  cool {}",
-                route.ready_channel_count,
-                route.enabled_channel_count,
-                route.manual_blocked_channel_count,
-                route.cooling_channel_count
-            ));
-            let line3 = Line::from(format!(
-                "{}  total {}  off {}",
-                route.routing_strategy,
-                route.channel_count,
-                route
-                    .channel_count
-                    .saturating_sub(route.enabled_channel_count)
-            ));
-            ListItem::new(vec![line1, line2, line3])
+            ListItem::new(line)
         })
         .collect();
 
-    let mut state = ListState::default().with_selected(app.selected_route_visible_index());
+    if let AppMode::OnboardRoute(form) = &app.mode {
+        if matches!(form.mode, FormMode::NewRoute) {
+            let route_model = if form.route_model.trim().is_empty() {
+                "<route model>".to_string()
+            } else {
+                form.route_model.clone()
+            };
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(
+                    "+",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    route_model,
+                    if form.route_model.trim().is_empty() {
+                        Style::default().fg(Color::Gray)
+                    } else {
+                        Style::default()
+                            .fg(Color::LightCyan)
+                            .add_modifier(Modifier::BOLD)
+                    },
+                ),
+            ])));
+        }
+    }
+
+    let selected_index = if matches!(
+        &app.mode,
+        AppMode::OnboardRoute(OnboardRouteForm {
+            mode: FormMode::NewRoute,
+            ..
+        })
+    ) {
+        Some(items.len().saturating_sub(1))
+    } else {
+        app.selected_route_visible_index()
+    };
+    let mut state = ListState::default().with_selected(selected_index);
 
     let route_title = pane_label("Routes", visible.len(), app.route_filter_query());
     let title = pane_title(&route_title, app.focus == FocusPane::Routes);
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(Style::default().bg(Color::Blue).fg(Color::Black))
-        .highlight_symbol(">> ");
+        .highlight_style(list_highlight_style())
+        .highlight_symbol("┃ ");
     frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_channels(frame: &mut Frame, area: Rect, app: &App) {
+    let channel_title = app
+        .selected_route_ref()
+        .map(|route| format!("Channels ({}) {}", app.channels.len(), route.model_pattern))
+        .unwrap_or_else(|| format!("Channels ({})", app.channels.len()));
+    let title = pane_title(&channel_title, app.focus == FocusPane::Channels);
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+
+    let header = Line::from(Span::styled(
+        channel_table_header(sections[0].width as usize),
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(header), sections[0]);
+
     let items: Vec<ListItem> = app
         .channels
         .iter()
         .map(|channel| {
-            let state_color = channel_state_color(channel);
-            let line1 = Line::from(vec![
+            let probing = app.probing_channels.contains(&channel.channel_id);
+            let (icon, icon_color) = channel_state_icon(channel, probing);
+            let row = channel_table_row(
+                channel,
+                probing,
+                sections[1].width.saturating_sub(2) as usize,
+            );
+            ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("{} @ {}", channel.channel_label, channel.site_name),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    icon,
+                    Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::styled(
-                    channel_state_badge(channel),
-                    Style::default()
-                        .fg(state_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]);
-            let health_hint = channel
-                .last_error_kind
-                .as_deref()
-                .map(short_error_label)
-                .unwrap_or("-");
-            let line2 = Line::from(format!(
-                "P{}  {}  {}",
-                channel.priority, channel.protocol, channel.upstream_model
-            ));
-            let line3 = Line::from(if channel.eligible {
-                truncate_text(&channel.site_base_url, 72)
-            } else {
-                format!("blocked by {health_hint}")
-            });
-            ListItem::new(vec![line1, line2, line3])
+                Span::raw(row),
+            ]))
         })
         .collect();
 
@@ -2208,19 +2435,45 @@ fn draw_channels(frame: &mut Frame, area: Rect, app: &App) {
         Some(app.selected_channel)
     });
 
-    let channel_title = app
-        .selected_route_ref()
-        .map(|route| format!("Channels ({}) {}", app.channels.len(), route.model_pattern))
-        .unwrap_or_else(|| format!("Channels ({})", app.channels.len()));
-    let title = pane_title(&channel_title, app.focus == FocusPane::Channels);
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(Style::default().bg(Color::Blue).fg(Color::Black))
-        .highlight_symbol(">> ");
-    frame.render_stateful_widget(list, area, &mut state);
+        .highlight_style(list_highlight_style())
+        .highlight_symbol("┃ ");
+    frame.render_stateful_widget(list, sections[1], &mut state);
 }
 
 fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
+    let logs_title = app
+        .selected_route_ref()
+        .map(|route| {
+            format!(
+                "Logs ({}) {}",
+                app.visible_logs().len(),
+                route.model_pattern
+            )
+        })
+        .unwrap_or_else(|| format!("Logs ({})", app.visible_logs().len()));
+    let title = pane_title(&logs_title, app.focus == FocusPane::Logs);
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+
+    let header = Line::from(Span::styled(
+        log_table_header(sections[0].width as usize),
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(header), sections[0]);
+
     let visible_logs = app.visible_logs();
 
     let items: Vec<ListItem> = if visible_logs.is_empty() {
@@ -2229,39 +2482,8 @@ fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
         visible_logs
             .iter()
             .map(|log| {
-                let status = log
-                    .http_status
-                    .map(|status| status.to_string())
-                    .unwrap_or_else(|| "-".to_string());
-                let status_color = log_status_color(log);
-                let summary = log
-                    .error_message
-                    .as_deref()
-                    .map(|message| {
-                        format!(
-                            "{}: {}",
-                            short_error_label(&log.error_kind),
-                            truncate_text(message, 72)
-                        )
-                    })
-                    .unwrap_or_else(|| "ok".to_string());
-                ListItem::new(vec![
-                    Line::from(vec![
-                        Span::raw(format!("{}  ", log.created_at)),
-                        Span::styled(
-                            status,
-                            Style::default()
-                                .fg(status_color)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(format!("  {}ms", log.latency_ms)),
-                    ]),
-                    Line::from(format!(
-                        "{} -> {} @ {}",
-                        log.downstream_path, log.upstream_model, log.site_name
-                    )),
-                    Line::from(summary),
-                ])
+                let row = log_table_row(log, sections[1].width.saturating_sub(2) as usize);
+                ListItem::new(Line::from(row))
             })
             .collect()
     };
@@ -2272,16 +2494,10 @@ fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
         Some(app.selected_log.min(visible_logs.len() - 1))
     });
 
-    let logs_title = app
-        .selected_route_ref()
-        .map(|route| format!("Logs ({}) {}", visible_logs.len(), route.model_pattern))
-        .unwrap_or_else(|| format!("Logs ({})", visible_logs.len()));
-    let title = pane_title(&logs_title, app.focus == FocusPane::Logs);
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(Style::default().bg(Color::Blue).fg(Color::Black))
-        .highlight_symbol(">> ");
-    frame.render_stateful_widget(list, area, &mut state);
+        .highlight_style(list_highlight_style())
+        .highlight_symbol("┃ ");
+    frame.render_stateful_widget(list, sections[1], &mut state);
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
@@ -2296,16 +2512,26 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 
     let lines = vec![
         Line::from(app.status.clone()),
-        Line::from(format!(
-            "endpoint={}  auth={}  route={}  channel={}  pane={}  filter={}",
-            app.base_url.trim_end_matches('/'),
-            if app.auth_key.is_some() { "ON" } else { "OFF" },
-            route_hint,
-            channel_hint,
-            focus_label(app.focus),
-            current_search_label(app)
-        )),
-        Line::from(shortcut_hint(app)),
+        Line::from(vec![
+            status_meta_label("Endpoint"),
+            Span::raw(app.base_url.trim_end_matches('/').to_string()),
+            Span::raw("  "),
+            status_meta_label("Auth"),
+            Span::raw(if app.auth_key.is_some() { "ON" } else { "OFF" }),
+            Span::raw("  "),
+            status_meta_label("Route"),
+            Span::raw(route_hint.to_string()),
+            Span::raw("  "),
+            status_meta_label("Channel"),
+            Span::raw(channel_hint.to_string()),
+            Span::raw("  "),
+            status_meta_label("Pane"),
+            Span::raw(focus_label(app.focus).to_string()),
+            Span::raw("  "),
+            status_meta_label("Filter"),
+            Span::raw(current_search_label(app)),
+        ]),
+        shortcut_hint_line(app),
     ];
 
     let paragraph = Paragraph::new(lines)
@@ -2324,7 +2550,6 @@ fn draw_help_modal(frame: &mut Frame) {
         )),
         Line::from(""),
         Line::from("Navigation"),
-        Line::from("Tab     cycle focus between routes, channels and logs"),
         Line::from("/       filter routes"),
         Line::from("Left/Right move between panes"),
         Line::from("Home/End jump to top / bottom"),
@@ -2341,8 +2566,8 @@ fn draw_help_modal(frame: &mut Frame) {
         Line::from("e       enable selected channel"),
         Line::from("d       disable selected channel"),
         Line::from("c       recover selected channel (clear cooldown/block)"),
-        Line::from("u       copy downstream base url"),
-        Line::from("K       copy configured auth key"),
+        Line::from("u       copy downstream base url (global)"),
+        Line::from("K       copy configured auth key (global)"),
         Line::from("Enter   drill in or open detail"),
         Line::from("Enter/y confirm current action"),
         Line::from("Esc/n   cancel current action"),
@@ -2373,8 +2598,10 @@ fn pane_title<'a>(label: &'a str, focused: bool) -> Line<'a> {
 fn detail_line(label: &str, value: String) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            format!("{label}: "),
-            Style::default().add_modifier(Modifier::BOLD),
+            format!("{label:>14} "),
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(value),
     ])
@@ -2382,59 +2609,30 @@ fn detail_line(label: &str, value: String) -> Line<'static> {
 
 fn detail_section_header(label: &str) -> Line<'static> {
     Line::from(Span::styled(
-        label.to_string(),
+        format!("[ {label} ]"),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(Color::LightCyan)
             .add_modifier(Modifier::BOLD),
     ))
 }
 
-fn route_health_badge(route: &RouteSummary) -> (&'static str, Color) {
+fn route_health_icon(route: &RouteSummary) -> (&'static str, Color) {
     if !route.enabled {
-        return ("OFF", Color::DarkGray);
+        return ("○", Color::DarkGray);
     }
     if route.ready_channel_count > 0 {
-        return ("RUN", Color::Green);
-    }
-    if route.manual_blocked_channel_count > 0 {
-        return ("UNAVAIL", Color::Red);
+        return ("●", Color::Green);
     }
     if route.cooling_channel_count > 0 {
-        return ("COOL", Color::Yellow);
+        return ("⚠", Color::Yellow);
     }
-    ("UNAVAIL", Color::LightRed)
+    ("✖", Color::Red)
 }
 
-fn route_health_lane(route: &RouteSummary) -> String {
-    let total = route.channel_count.max(0) as usize;
-    if total == 0 {
-        return "[empty]".to_string();
+fn channel_state_badge(channel: &ChannelSummary, probing: bool) -> String {
+    if probing {
+        return "PROBING".to_string();
     }
-
-    let run = route.ready_channel_count.max(0) as usize;
-    let cool = route.cooling_channel_count.max(0) as usize;
-    let stop = route.manual_blocked_channel_count.max(0) as usize;
-    let off = total.saturating_sub(route.enabled_channel_count.max(0) as usize);
-    let other = total.saturating_sub(run + cool + stop + off);
-
-    let mut lane = String::from("[");
-    lane.push_str(&"#".repeat(run.min(8)));
-    lane.push_str(&"~".repeat(cool.min(8)));
-    lane.push_str(&"!".repeat(stop.min(8)));
-    lane.push_str(&"x".repeat(other.min(8)));
-    lane.push_str(&".".repeat(off.min(8)));
-
-    let visible = lane.chars().count().saturating_sub(1);
-    if visible > 8 {
-        lane = lane.chars().take(9).collect();
-        lane.push('+');
-    }
-
-    lane.push(']');
-    lane
-}
-
-fn channel_state_badge(channel: &ChannelSummary) -> String {
     match channel.state.as_str() {
         "ready" => "RUN".to_string(),
         "cooling_down" => channel
@@ -2449,19 +2647,48 @@ fn channel_state_badge(channel: &ChannelSummary) -> String {
     }
 }
 
-fn channel_state_color(channel: &ChannelSummary) -> Color {
-    match channel.state.as_str() {
-        "ready" => Color::Green,
-        "cooling_down" => Color::Yellow,
-        "manual_intervention_required" => Color::Red,
-        "disabled" => Color::DarkGray,
-        "account_inactive" | "site_inactive" => Color::LightRed,
-        _ => Color::Cyan,
+fn channel_state_icon(channel: &ChannelSummary, probing: bool) -> (&'static str, Color) {
+    if probing {
+        return ("↺", Color::LightCyan);
     }
+    match channel.state.as_str() {
+        "ready" => ("●", Color::Green),
+        "cooling_down" => ("⚠", Color::Yellow),
+        "manual_intervention_required" => ("✖", Color::Red),
+        "disabled" => ("○", Color::DarkGray),
+        "account_inactive" | "site_inactive" => ("✖", Color::LightRed),
+        _ => ("•", Color::Cyan),
+    }
+}
+
+fn channel_table_header(max_width: usize) -> String {
+    truncate_text(
+        &format!(
+            "    {:<10}  {:<12}  {:<14}  {:<4}  {}",
+            "STATUS", "NAME", "UPSTREAM", "PRIO", "MODEL"
+        ),
+        max_width,
+    )
+}
+
+fn channel_table_row(channel: &ChannelSummary, probing: bool, max_width: usize) -> String {
+    let status = truncate_text(&channel_state_badge(channel, probing), 8);
+    truncate_text(
+        &format!(
+            "{:<10}  {:<12}  {:<14}  {:<4}  {}",
+            status,
+            truncate_text(&channel.channel_label, 12),
+            truncate_text(channel_upstream_label(channel).as_str(), 14),
+            format!("P{}", channel.priority),
+            truncate_text(&channel.upstream_model, 18),
+        ),
+        max_width,
+    )
 }
 
 fn short_error_label(kind: &str) -> &str {
     match kind {
+        "first_token_timeout" => "ttfb-timeout",
         "auth_error" => "auth",
         "rate_limited" => "rate-limit",
         "upstream_server_error" => "upstream-5xx",
@@ -2473,14 +2700,51 @@ fn short_error_label(kind: &str) -> &str {
     }
 }
 
-fn log_status_color(log: &RequestLogSummary) -> Color {
-    match log.http_status {
-        Some(status) if (200..300).contains(&status) => Color::Green,
-        Some(429) => Color::Yellow,
-        Some(status) if status >= 400 => Color::Red,
-        None => Color::LightRed,
-        _ => Color::Cyan,
-    }
+fn log_table_header(max_width: usize) -> String {
+    truncate_text(
+        &format!(
+            "  {:<8}  {:<4}  {:<8}  {}",
+            "TIME", "CODE", "LATENCY", "FLOW"
+        ),
+        max_width,
+    )
+}
+
+fn log_table_row(log: &RequestLogSummary, max_width: usize) -> String {
+    let status = log
+        .http_status
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let flow = if log.probe {
+        format!(
+            "{} -> {} [PROBE]",
+            truncate_text(&log.upstream_model, 18),
+            truncate_text(&log.site_name, 16)
+        )
+    } else if log.error_message.is_some() {
+        format!(
+            "{} -> {} ({})",
+            truncate_text(&log.upstream_model, 18),
+            truncate_text(&log.site_name, 16),
+            truncate_text(short_error_label(&log.error_kind), 12)
+        )
+    } else {
+        format!(
+            "{} -> {}",
+            truncate_text(&log.upstream_model, 18),
+            truncate_text(&log.site_name, 16)
+        )
+    };
+    truncate_text(
+        &format!(
+            "{:<8}  {:<4}  {:<8}  {}",
+            compact_time_label(&log.created_at),
+            status,
+            format!("{}ms", log.latency_ms),
+            flow
+        ),
+        max_width,
+    )
 }
 
 fn focus_label(focus: FocusPane) -> &'static str {
@@ -2504,29 +2768,105 @@ fn pane_label(base: &str, count: usize, query: Option<&str>) -> String {
     }
 }
 
-fn shortcut_hint(app: &App) -> &'static str {
-    match app.mode {
-        AppMode::OnboardRoute(_) => {
-            "Actions: Tab next field  Shift-Tab prev  Enter submit  Esc cancel"
-        }
-        AppMode::EditChannel(_) => {
-            "Actions: Tab next field  Shift-Tab prev  Enter save  Esc cancel"
-        }
-        AppMode::Confirm(_) => "Actions: Enter or Y confirm  Esc or N cancel",
-        AppMode::Search(_) => "Actions: type filter  Enter apply  empty + Enter clears  Esc cancel",
-        AppMode::Detail(_) => "Actions: Enter or Esc close",
+fn shortcut_hint_line(app: &App) -> Line<'static> {
+    let groups: &[(&str, &[(&str, &str)])] = match app.mode {
+        AppMode::OnboardRoute(_) | AppMode::EditChannel(_) => &[(
+            "Form",
+            &[("Up/Down", "field"), ("Enter", "submit"), ("Esc", "cancel")],
+        )],
+        AppMode::Confirm(_) => &[("Confirm", &[("Enter / Y", "yes"), ("Esc / N", "no")])],
+        AppMode::Search(_) => &[(
+            "Search",
+            &[
+                ("Type", "filter"),
+                ("Enter", "apply"),
+                ("Empty+Enter", "clear"),
+                ("Esc", "cancel"),
+            ],
+        )],
+        AppMode::Detail(_) => &[("Detail", &[("Enter / Esc", "close")])],
         AppMode::Browse => match app.focus {
-            FocusPane::Routes => {
-                "Actions: Up/Down move  Enter select  Right channels  a add route  T probe route  x delete empty  / filter"
-            }
-            FocusPane::Channels => {
-                "Actions: Up/Down move  Enter detail  Left routes  Right logs  t probe  T probe route  Space toggle  c recover  i edit  a add"
-            }
-            FocusPane::Logs => {
-                "Actions: Up/Down move  Enter detail  Left channels  T probe route  u copy URL  K copy key  r refresh"
-            }
+            FocusPane::Routes => &[
+                (
+                    "Nav",
+                    &[
+                        ("Up/Down", "move"),
+                        ("Enter", "select"),
+                        ("Right", "channels"),
+                    ],
+                ),
+                (
+                    "Action",
+                    &[
+                        ("a", "add"),
+                        ("T", "probe"),
+                        ("x", "delete"),
+                        ("/", "filter"),
+                    ],
+                ),
+                ("Info", &[("u", "URL"), ("K", "key")]),
+            ],
+            FocusPane::Channels => &[
+                (
+                    "Nav",
+                    &[("Up/Down", "move"), ("Left", "routes"), ("Right", "logs")],
+                ),
+                (
+                    "Action",
+                    &[
+                        ("Space", "toggle"),
+                        ("t", "probe"),
+                        ("T", "route"),
+                        ("c", "recover"),
+                    ],
+                ),
+                ("Edit", &[("a", "add"), ("i", "edit"), ("x", "delete")]),
+                ("Info", &[("u", "URL"), ("K", "key")]),
+            ],
+            FocusPane::Logs => &[
+                (
+                    "Nav",
+                    &[
+                        ("Up/Down", "move"),
+                        ("Left", "channels"),
+                        ("Enter", "detail"),
+                    ],
+                ),
+                ("Action", &[("T", "probe"), ("r", "refresh")]),
+                ("Info", &[("u", "URL"), ("K", "key")]),
+            ],
         },
+    };
+
+    let mut spans = Vec::new();
+    for (group_index, (group, items)) in groups.iter().enumerate() {
+        if group_index > 0 {
+            spans.push(Span::styled("  |  ", Style::default().fg(Color::Gray)));
+        }
+        spans.push(Span::styled(
+            format!("[{group}] "),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        for (item_index, (key, description)) in items.iter().enumerate() {
+            if item_index > 0 {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                (*key).to_string(),
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!(":{description}"),
+                Style::default().fg(Color::White),
+            ));
+        }
     }
+
+    Line::from(spans)
 }
 
 fn route_search_text(route: &RouteSummary) -> String {
@@ -2562,6 +2902,66 @@ fn masked_secret(value: Option<&str>) -> String {
         .rev()
         .collect::<String>();
     format!("{head}...{tail}")
+}
+
+async fn probe_channel_request(
+    client: Client,
+    base_url: String,
+    auth_key: Option<String>,
+    channel_id: i64,
+) -> Result<ChannelSummary, String> {
+    let mut request = client.post(format!("{base_url}/api/channels/{channel_id}/probe"));
+    if let Some(auth_key) = auth_key {
+        request = request.bearer_auth(auth_key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("failed to probe channel: {error}"))?;
+    App::decode_api_response(response, "probe channel").await
+}
+
+fn current_time_label() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let day_seconds = seconds % 86_400;
+    let hour = day_seconds / 3_600;
+    let minute = (day_seconds % 3_600) / 60;
+    let second = day_seconds % 60;
+    format!("{hour:02}:{minute:02}:{second:02}")
+}
+
+fn compact_time_label(value: &str) -> String {
+    if value.len() >= 8 {
+        value[value.len().saturating_sub(8)..].to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn list_highlight_style() -> Style {
+    Style::default()
+        .fg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn status_meta_label(label: &str) -> Span<'static> {
+    Span::styled(
+        format!("{label}:"),
+        Style::default()
+            .fg(Color::LightYellow)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn channel_upstream_label(channel: &ChannelSummary) -> String {
+    if !channel.site_name.trim().is_empty() {
+        channel.site_name.clone()
+    } else {
+        truncate_text(&channel.site_base_url, 24)
+    }
 }
 
 fn copy_to_clipboard(value: &str) -> Result<(), String> {
@@ -2625,7 +3025,7 @@ fn draw_detail_modal(frame: &mut Frame, dialog: &DetailDialog, app: &App) {
     frame.render_widget(Clear, area);
 
     let mut lines = vec![
-        detail_section_header("Downstream Access"),
+        detail_section_header("Access"),
         detail_line(
             "Client Base URL",
             format!("{}/v1", app.base_url.trim_end_matches('/')),
@@ -2638,13 +3038,11 @@ fn draw_detail_modal(frame: &mut Frame, dialog: &DetailDialog, app: &App) {
 
     let title = match dialog {
         DetailDialog::Channel(channel) => {
-            lines.push(detail_section_header("Channel"));
+            lines.push(detail_section_header("Config"));
             lines.push(detail_line(
                 "Name",
                 format!("{} (#{} )", channel.channel_label, channel.channel_id),
             ));
-            lines.push(detail_line("State", channel_state_badge(channel)));
-            lines.push(detail_line("Why", channel.reason.clone()));
             lines.push(detail_line("Model", channel.upstream_model.clone()));
             lines.push(detail_line("Protocol", channel.protocol.clone()));
             lines.push(detail_line("Priority", format!("P{}", channel.priority)));
@@ -2655,6 +3053,17 @@ fn draw_detail_modal(frame: &mut Frame, dialog: &DetailDialog, app: &App) {
             lines.push(detail_line(
                 "Account",
                 format!("{} (#{} )", channel.account_label, channel.account_id),
+            ));
+            lines.push(Line::from(""));
+            lines.push(detail_section_header("Runtime"));
+            lines.push(detail_line("State", channel_state_badge(channel, false)));
+            lines.push(detail_line("Why", channel.reason.clone()));
+            lines.push(detail_line(
+                "Latency",
+                channel
+                    .avg_latency_ms
+                    .map(|value| format!("{value}ms EWMA"))
+                    .unwrap_or_else(|| "-".to_string()),
             ));
             lines.push(detail_line(
                 "Health",
@@ -2701,10 +3110,26 @@ fn draw_detail_modal(frame: &mut Frame, dialog: &DetailDialog, app: &App) {
                 "Manual Block",
                 channel.manual_blocked.to_string(),
             ));
+            lines.push(Line::from(""));
+            lines.push(detail_section_header("24h"));
+            lines.push(detail_line("Requests", channel.requests_24h.to_string()));
+            lines.push(detail_line(
+                "Success",
+                channel.success_requests_24h.to_string(),
+            ));
+            lines.push(detail_line("Tokens", channel.total_tokens_24h.to_string()));
+            lines.push(detail_line(
+                "Input Tokens",
+                channel.input_tokens_24h.to_string(),
+            ));
+            lines.push(detail_line(
+                "Output Tokens",
+                channel.output_tokens_24h.to_string(),
+            ));
             "Channel Detail"
         }
         DetailDialog::Log(log) => {
-            lines.push(detail_section_header("Log"));
+            lines.push(detail_section_header("Request"));
             lines.push(detail_line("When", log.created_at.clone()));
             lines.push(detail_line(
                 "Flow",
@@ -2713,6 +3138,8 @@ fn draw_detail_modal(frame: &mut Frame, dialog: &DetailDialog, app: &App) {
                     log.downstream_path, log.upstream_model, log.site_name
                 ),
             ));
+            lines.push(Line::from(""));
+            lines.push(detail_section_header("Result"));
             lines.push(detail_line(
                 "Status",
                 log.http_status
@@ -2782,11 +3209,7 @@ fn draw_add_channel_modal(frame: &mut Frame, form: &OnboardRouteForm) {
     let area = centered_rect(78, 68, frame.area());
     frame.render_widget(Clear, area);
     let masked_api_key = mask_api_key(&form.api_key);
-    let mode = match form.mode {
-        FormMode::NewRoute => "create route + add first channel",
-        FormMode::AddChannel { .. } => "append channel to current route",
-    };
-    let submit_ready = form.to_request().is_ok();
+    let submit_ready = form.to_add_channel_request().is_ok();
     let preview_upstream = if form.upstream_model.trim().is_empty() {
         "<same as route model>"
     } else {
@@ -2806,10 +3229,6 @@ fn draw_add_channel_modal(frame: &mut Frame, form: &OnboardRouteForm) {
     ];
 
     let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Mode: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(mode),
-        ]),
         Line::from(vec![
             Span::styled("Preview: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(format!(
@@ -2885,7 +3304,7 @@ fn draw_add_channel_modal(frame: &mut Frame, form: &OnboardRouteForm) {
         }),
     ]));
     lines.push(Line::from(
-        "Type to edit. Tab/Shift-Tab switch fields. Enter submit. Esc cancel.",
+        "Type to edit. Up/Down switch fields. Enter submit. Esc cancel.",
     ));
 
     let widget = Paragraph::new(lines)
@@ -2983,7 +3402,7 @@ fn draw_edit_channel_modal(frame: &mut Frame, form: &EditChannelForm) {
         }),
     ]));
     lines.push(Line::from(
-        "Type to edit. Tab/Shift-Tab switch fields. Enter submit. Esc cancel.",
+        "Type to edit. Up/Down switch fields. Enter submit. Esc cancel.",
     ));
 
     let widget = Paragraph::new(lines)
@@ -3080,6 +3499,7 @@ mod tests {
             upstream_model: "gpt-5.4".to_string(),
             protocol: "responses".to_string(),
             priority: 0,
+            avg_latency_ms: None,
             manual_blocked: false,
             cooldown_remaining_seconds: None,
             consecutive_fail_count: 0,
@@ -3090,6 +3510,11 @@ mod tests {
             eligible: true,
             state: "ready".to_string(),
             reason: "ok".to_string(),
+            requests_24h: 0,
+            success_requests_24h: 0,
+            input_tokens_24h: 0,
+            output_tokens_24h: 0,
+            total_tokens_24h: 0,
         };
 
         assert_eq!(toggle_action_for_channel(&channel), ChannelAction::Disable);

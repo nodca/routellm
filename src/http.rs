@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -13,20 +13,24 @@ use axum::{
     },
     response::Response,
 };
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use crate::{
     app::AppState,
     config::{CooldownPolicy, ManualInterventionPolicy},
-    domain::{AdminRouteRow, ChannelRow, ModelRouteRow, RequestLogRow, RequestLogWrite},
+    domain::{
+        AdminRouteRow, ChannelRow, ChannelRuntimeStats, ModelRouteRow, RequestLogRow,
+        RequestLogWrite,
+    },
     error::AppError,
     protocol::Protocol,
-    routing, store,
+    routing,
 };
 
 #[derive(Debug, Deserialize)]
@@ -50,13 +54,8 @@ pub struct CreateRouteChannelRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct OnboardRouteRequest {
+pub struct CreateRouteRequest {
     route_model: String,
-    base_url: String,
-    api_key: String,
-    upstream_model: Option<String>,
-    protocol: String,
-    priority: Option<i64>,
     cooldown_seconds: Option<i64>,
 }
 
@@ -87,6 +86,17 @@ struct ProbeOutcome {
     http_status: Option<u16>,
     error_message: Option<String>,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct TokenUsage {
+    input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+}
+
+const FIRST_TOKEN_TIMEOUT_SECS: u64 = 50;
+const FIRST_TOKEN_TIMEOUT_INITIAL_COOLDOWN_SECS: i64 = 120;
+const FIRST_TOKEN_TIMEOUT_MAX_COOLDOWN_SECS: i64 = 1920;
 
 pub async fn healthz() -> Json<Value> {
     Json(json!({ "ok": true }))
@@ -133,9 +143,16 @@ pub async fn list_route_channels(
     let route = state.store.get_route(route_id).await?;
     let now = now_ts();
     let channels = state.store.load_channels(route_id).await?;
+    let runtime_stats = state.store.list_channel_runtime_stats(route_id).await?;
     let candidates = routing::inspect_candidates(channels, None, now)
         .into_iter()
-        .map(|candidate| channel_admin_view(&candidate, now))
+        .map(|candidate| {
+            channel_admin_view(
+                &candidate,
+                now,
+                runtime_stats.get(&candidate.channel.channel_id),
+            )
+        })
         .collect::<Vec<_>>();
 
     Ok(Json(json!({
@@ -216,21 +233,15 @@ pub async fn probe_channel(
         Ok(http_status) => {
             state
                 .store
-                .mark_channel_success(channel_id, http_status)
+                .mark_channel_success(channel_id, http_status, None)
                 .await?;
             let updated = state.store.load_channel(channel_id).await?;
             let now = now_ts();
-            let candidate = routing::inspect_candidates(vec![updated], None, now)
-                .into_iter()
-                .next()
-                .ok_or_else(|| {
-                    AppError::Internal("failed to evaluate probed channel".to_string())
-                })?;
 
             build_json_response(
                 StatusCode::OK,
                 &json!({
-                    "data": channel_admin_view(&candidate, now),
+                    "data": channel_admin_json(&state, updated, now).await?,
                     "meta": {
                         "probe": {
                             "ok": true,
@@ -254,17 +265,11 @@ pub async fn probe_channel(
                 .await?;
             let updated = state.store.load_channel(channel_id).await?;
             let now = now_ts();
-            let candidate = routing::inspect_candidates(vec![updated], None, now)
-                .into_iter()
-                .next()
-                .ok_or_else(|| {
-                    AppError::Internal("failed to evaluate probed channel".to_string())
-                })?;
 
             build_json_response(
                 StatusCode::OK,
                 &json!({
-                    "data": channel_admin_view(&candidate, now),
+                    "data": channel_admin_json(&state, updated, now).await?,
                     "meta": {
                         "probe": {
                             "ok": false,
@@ -298,52 +303,37 @@ pub async fn create_route_channel(
         )
         .await?;
     let now = now_ts();
-    let candidate = routing::inspect_candidates(vec![channel], None, now)
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::Internal("failed to evaluate created channel".to_string()))?;
 
     build_json_response(
         StatusCode::CREATED,
         &json!({
-            "data": channel_admin_view(&candidate, now)
+            "data": channel_admin_json(&state, channel, now).await?
         }),
     )
 }
 
-pub async fn onboard_route(
+pub async fn create_route(
     State(state): State<AppState>,
-    Json(payload): Json<OnboardRouteRequest>,
+    Json(payload): Json<CreateRouteRequest>,
 ) -> Result<Response<Body>, AppError> {
-    probe_onboarding_channel(&state, &payload).await?;
-    let protocol = parse_required_protocol(&payload.protocol)?;
-
-    let (route, channel, route_created) = state
+    let (route, created) = state
         .store
-        .onboard_route_channel(
+        .create_or_get_route(
             &payload.route_model,
-            &payload.base_url,
-            &payload.api_key,
-            payload.upstream_model.as_deref(),
-            protocol.as_str(),
-            payload.priority.unwrap_or(0),
             payload.cooldown_seconds.unwrap_or(300),
         )
         .await?;
 
-    let now = now_ts();
-    let candidate = routing::inspect_candidates(vec![channel], None, now)
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::Internal("failed to evaluate created channel".to_string()))?;
-
     build_json_response(
-        StatusCode::CREATED,
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
         &json!({
             "data": {
-                "route_created": route_created,
-                "route": route_detail_view(&route),
-                "channel": channel_admin_view(&candidate, now)
+                "created": created,
+                "route": route_detail_view(&route)
             }
         }),
     )
@@ -354,9 +344,11 @@ pub async fn enable_channel(
     Path(channel_id): Path<i64>,
 ) -> Result<Response<Body>, AppError> {
     update_channel_state_response(
+        &state,
         state.store.set_channel_enabled(channel_id, true).await?,
         now_ts(),
     )
+    .await
 }
 
 pub async fn disable_channel(
@@ -364,9 +356,11 @@ pub async fn disable_channel(
     Path(channel_id): Path<i64>,
 ) -> Result<Response<Body>, AppError> {
     update_channel_state_response(
+        &state,
         state.store.set_channel_enabled(channel_id, false).await?,
         now_ts(),
     )
+    .await
 }
 
 pub async fn reset_channel_cooldown(
@@ -374,9 +368,11 @@ pub async fn reset_channel_cooldown(
     Path(channel_id): Path<i64>,
 ) -> Result<Response<Body>, AppError> {
     update_channel_state_response(
+        &state,
         state.store.reset_channel_cooldown(channel_id).await?,
         now_ts(),
     )
+    .await
 }
 
 pub async fn update_channel(
@@ -386,6 +382,7 @@ pub async fn update_channel(
 ) -> Result<Response<Body>, AppError> {
     let protocol = parse_required_protocol(&payload.protocol)?;
     update_channel_state_response(
+        &state,
         state
             .store
             .update_channel(
@@ -399,6 +396,7 @@ pub async fn update_channel(
             .await?,
         now_ts(),
     )
+    .await
 }
 
 pub async fn delete_channel(
@@ -417,7 +415,7 @@ pub async fn delete_channel(
                 "route_model": outcome.route_model,
                 "channel_label": channel.channel_label,
                 "site_name": channel.site_name,
-                "route_deleted": outcome.route_deleted,
+                "route_deleted": false,
                 "deleted": true
             }
         }),
@@ -470,17 +468,49 @@ async fn proxy_request(
 ) -> Result<Response<Body>, AppError> {
     let route = state.store.find_route(&requested_model).await?;
     let channels = state.store.load_channels(route.id).await?;
-    let decision = routing::decide_route(
-        &requested_model,
-        &route,
-        channels,
-        downstream_protocol,
-        now_ts(),
-    )?;
-    let selected = decision.selected;
+    let request_id = Uuid::new_v4().to_string();
+    let candidates = routing::inspect_candidates(channels, Some(downstream_protocol), now_ts());
+    let ordered_channels = routing::ordered_eligible_channels(&candidates);
+    if ordered_channels.is_empty() {
+        return Err(AppError::NoRoute(format!(
+            "no eligible channel for model: {requested_model}"
+        )));
+    }
+
+    let mut last_error: Option<AppError> = None;
+    for selected in ordered_channels {
+        match attempt_proxy_request(
+            state.clone(),
+            route.clone(),
+            selected,
+            &request_id,
+            &requested_model,
+            payload.clone(),
+            downstream_protocol,
+        )
+        .await
+        {
+            Ok(response) => return Ok(response),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        AppError::NoRoute(format!("no eligible channel for model: {requested_model}"))
+    }))
+}
+
+async fn attempt_proxy_request(
+    state: AppState,
+    route: ModelRouteRow,
+    selected: ChannelRow,
+    request_id: &str,
+    requested_model: &str,
+    payload: Value,
+    downstream_protocol: Protocol,
+) -> Result<Response<Body>, AppError> {
     let channel_protocol = Protocol::parse(&selected.protocol)?;
     let dispatch = build_upstream_dispatch(payload, downstream_protocol, channel_protocol)?;
-    let request_id = Uuid::new_v4().to_string();
     let started_at = Instant::now();
 
     let upstream_url = format!(
@@ -488,15 +518,23 @@ async fn proxy_request(
         selected.site_base_url.trim_end_matches('/'),
         dispatch.upstream_protocol.path()
     );
-    let upstream_response = apply_upstream_auth(
-        state.upstream_client.post(&upstream_url),
-        dispatch.upstream_protocol,
-        &selected.account_api_key,
+    let upstream_response = timeout(
+        Duration::from_secs(FIRST_TOKEN_TIMEOUT_SECS),
+        apply_upstream_auth(
+            state.upstream_client.post(&upstream_url),
+            dispatch.upstream_protocol,
+            &selected.account_api_key,
+        )
+        .json(&dispatch.payload)
+        .send(),
     )
-    .json(&dispatch.payload)
-    .send()
     .await
-    .map_err(|error| AppError::UpstreamTransport(format!("upstream transport error: {error}")));
+    .map_err(|_| AppError::UpstreamTransport(first_token_timeout_message("response headers")))
+    .and_then(|response| {
+        response.map_err(|error| {
+            AppError::UpstreamTransport(format!("upstream transport error: {error}"))
+        })
+    });
 
     let upstream_response = match upstream_response {
         Ok(response) => response,
@@ -505,8 +543,8 @@ async fn proxy_request(
                 &state,
                 &route,
                 &selected,
-                &request_id,
-                &requested_model,
+                request_id,
+                requested_model,
                 downstream_protocol,
                 dispatch.upstream_protocol,
                 None,
@@ -533,8 +571,8 @@ async fn proxy_request(
             &state,
             &route,
             &selected,
-            &request_id,
-            &requested_model,
+            request_id,
+            requested_model,
             downstream_protocol,
             dispatch.upstream_protocol,
             Some(status.as_u16()),
@@ -551,8 +589,8 @@ async fn proxy_request(
                 state,
                 route,
                 selected,
-                request_id,
-                requested_model,
+                request_id.to_string(),
+                requested_model.to_string(),
                 status,
                 headers,
                 upstream_response,
@@ -563,18 +601,22 @@ async fn proxy_request(
             .await;
         }
 
-        let body = upstream_response.bytes().await.map_err(|error| {
-            AppError::UpstreamTransport(format!("failed to read upstream body: {error}"))
-        })?;
+        let body = read_response_body(upstream_response)
+            .await
+            .map_err(|error| {
+                AppError::UpstreamTransport(format!("failed to read upstream body: {error}"))
+            })?;
+        let token_usage = extract_usage_from_body(dispatch.upstream_protocol, &body);
         record_success(
             &state,
             &selected,
-            &request_id,
-            &requested_model,
+            request_id,
+            requested_model,
             downstream_protocol,
             dispatch.upstream_protocol,
             status.as_u16(),
             started_at.elapsed().as_millis() as i64,
+            token_usage,
         )
         .await?;
         return build_response(status, &headers, Body::from(body));
@@ -585,8 +627,8 @@ async fn proxy_request(
             state,
             route,
             selected,
-            request_id,
-            requested_model,
+            request_id.to_string(),
+            requested_model.to_string(),
             upstream_response,
             started_at,
             dispatch.upstream_protocol,
@@ -594,26 +636,76 @@ async fn proxy_request(
         .await;
     }
 
-    let body = upstream_response.bytes().await.map_err(|error| {
-        AppError::UpstreamTransport(format!("failed to read upstream body: {error}"))
-    })?;
+    let body = read_response_body(upstream_response)
+        .await
+        .map_err(|error| {
+            AppError::UpstreamTransport(format!("failed to read upstream body: {error}"))
+        })?;
     let response_value: Value = serde_json::from_slice(&body).map_err(|error| {
         AppError::UpstreamTransport(format!("invalid upstream json body: {error}"))
     })?;
+    let token_usage = extract_usage_from_value(dispatch.upstream_protocol, &response_value);
     let chat_response =
-        responses_json_to_chat_completion(&response_value, &requested_model, &request_id);
+        responses_json_to_chat_completion(&response_value, requested_model, request_id);
     record_success(
         &state,
         &selected,
-        &request_id,
-        &requested_model,
+        request_id,
+        requested_model,
         downstream_protocol,
         dispatch.upstream_protocol,
         status.as_u16(),
         started_at.elapsed().as_millis() as i64,
+        token_usage,
     )
     .await?;
     build_json_response(StatusCode::OK, &chat_response)
+}
+
+async fn read_response_body(upstream_response: reqwest::Response) -> Result<Vec<u8>, String> {
+    let mut upstream_stream = upstream_response.bytes_stream();
+    let first_chunk = await_first_upstream_chunk(&mut upstream_stream).await?;
+    let mut body = Vec::new();
+    if let Some(chunk) = first_chunk {
+        body.extend_from_slice(&chunk);
+    }
+
+    while let Some(next_chunk) = upstream_stream.next().await {
+        let chunk =
+            next_chunk.map_err(|error| format!("failed to read upstream body chunk: {error}"))?;
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
+}
+
+async fn await_first_upstream_chunk<S>(upstream_stream: &mut S) -> Result<Option<Bytes>, String>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
+    let first_chunk = timeout(
+        Duration::from_secs(FIRST_TOKEN_TIMEOUT_SECS),
+        upstream_stream.next(),
+    )
+    .await
+    .map_err(|_| first_token_timeout_message("first response chunk"))?;
+
+    match first_chunk {
+        Some(Ok(chunk)) => Ok(Some(chunk)),
+        Some(Err(error)) => Err(format!("upstream stream error: {error}")),
+        None => Ok(None),
+    }
+}
+
+fn first_token_timeout_message(stage: &str) -> String {
+    format!("first token timeout after {FIRST_TOKEN_TIMEOUT_SECS}s while waiting for {stage}")
+}
+
+fn first_token_timeout_cooldown_seconds(consecutive_fail_count: i64) -> i64 {
+    let attempts = consecutive_fail_count.max(1);
+    let multiplier = 2_i64.saturating_pow((attempts - 1) as u32);
+    (FIRST_TOKEN_TIMEOUT_INITIAL_COOLDOWN_SECS * multiplier)
+        .min(FIRST_TOKEN_TIMEOUT_MAX_COOLDOWN_SECS)
 }
 
 async fn proxy_passthrough_stream(
@@ -629,6 +721,27 @@ async fn proxy_passthrough_stream(
     downstream_protocol: Protocol,
     upstream_protocol: Protocol,
 ) -> Result<Response<Body>, AppError> {
+    let mut upstream_stream = upstream_response.bytes_stream();
+    let first_chunk = match await_first_upstream_chunk(&mut upstream_stream).await {
+        Ok(chunk) => chunk,
+        Err(message) => {
+            record_failure(
+                &state,
+                &route,
+                &selected,
+                &request_id,
+                &requested_model,
+                downstream_protocol,
+                upstream_protocol,
+                Some(status.as_u16()),
+                started_at.elapsed().as_millis() as i64,
+                message.clone(),
+            )
+            .await?;
+            return Err(AppError::UpstreamTransport(message));
+        }
+    };
+
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     let state_for_task = state.clone();
     let selected_for_task = selected.clone();
@@ -636,23 +749,30 @@ async fn proxy_passthrough_stream(
     let requested_model_for_task = requested_model.clone();
 
     tokio::spawn(async move {
-        let mut upstream_stream = upstream_response.bytes_stream();
         let mut stream_error: Option<String> = None;
         let mut downstream_disconnected = false;
 
-        while let Some(next_chunk) = upstream_stream.next().await {
-            match next_chunk {
-                Ok(chunk) => {
-                    if tx.send(Ok(chunk)).await.is_err() {
-                        downstream_disconnected = true;
+        if let Some(chunk) = first_chunk {
+            if tx.send(Ok(chunk)).await.is_err() {
+                downstream_disconnected = true;
+            }
+        }
+
+        if !downstream_disconnected {
+            while let Some(next_chunk) = upstream_stream.next().await {
+                match next_chunk {
+                    Ok(chunk) => {
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            downstream_disconnected = true;
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let message = format!("upstream stream error: {error}");
+                        let _ = tx.send(Err(std::io::Error::other(message.clone()))).await;
+                        stream_error = Some(message);
                         break;
                     }
-                }
-                Err(error) => {
-                    let message = format!("upstream stream error: {error}");
-                    let _ = tx.send(Err(std::io::Error::other(message.clone()))).await;
-                    stream_error = Some(message);
-                    break;
                 }
             }
         }
@@ -693,6 +813,7 @@ async fn proxy_passthrough_stream(
             status.as_u16(),
             latency_ms,
             success_note,
+            None,
         )
         .await
         {
@@ -713,6 +834,27 @@ async fn proxy_chat_completions_stream(
     started_at: Instant,
     upstream_protocol: Protocol,
 ) -> Result<Response<Body>, AppError> {
+    let mut upstream_stream = upstream_response.bytes_stream();
+    let first_chunk = match await_first_upstream_chunk(&mut upstream_stream).await {
+        Ok(chunk) => chunk,
+        Err(message) => {
+            record_failure(
+                &state,
+                &route,
+                &selected,
+                &request_id,
+                &requested_model,
+                Protocol::ChatCompletions,
+                upstream_protocol,
+                Some(StatusCode::OK.as_u16()),
+                started_at.elapsed().as_millis() as i64,
+                message.clone(),
+            )
+            .await?;
+            return Err(AppError::UpstreamTransport(message));
+        }
+    };
+
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     let state_for_task = state.clone();
     let selected_for_task = selected.clone();
@@ -721,7 +863,6 @@ async fn proxy_chat_completions_stream(
     let chat_id = format!("chatcmpl-{request_id}");
 
     tokio::spawn(async move {
-        let mut upstream_stream = upstream_response.bytes_stream();
         let mut buffer = String::new();
         let mut sent_role = false;
         let mut sent_done = false;
@@ -732,44 +873,79 @@ async fn proxy_chat_completions_stream(
         let mut stream_error: Option<String> = None;
         let mut downstream_disconnected = false;
 
-        'outer: while let Some(next_chunk) = upstream_stream.next().await {
-            match next_chunk {
-                Ok(chunk) => {
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
-                    let frames = drain_sse_frames(&mut buffer);
-                    for frame in frames {
-                        match transform_responses_frame_to_chat_sse(
-                            &frame,
-                            &chat_id,
-                            &requested_model_for_task,
-                            &mut sent_role,
-                            &mut sent_done,
-                            &mut saw_tool_call,
-                            &mut tool_call_indices,
-                            &mut tool_call_argument_emitted,
-                            &mut next_tool_call_index,
-                        ) {
-                            Ok(lines) => {
-                                for line in lines {
-                                    if tx.send(Ok(Bytes::from(line))).await.is_err() {
-                                        downstream_disconnected = true;
-                                        break 'outer;
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                let _ = tx.send(Err(std::io::Error::other(error.clone()))).await;
-                                stream_error = Some(error);
-                                break 'outer;
+        if let Some(chunk) = first_chunk {
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            let frames = drain_sse_frames(&mut buffer);
+            'first_chunk: for frame in frames {
+                match transform_responses_frame_to_chat_sse(
+                    &frame,
+                    &chat_id,
+                    &requested_model_for_task,
+                    &mut sent_role,
+                    &mut sent_done,
+                    &mut saw_tool_call,
+                    &mut tool_call_indices,
+                    &mut tool_call_argument_emitted,
+                    &mut next_tool_call_index,
+                ) {
+                    Ok(lines) => {
+                        for line in lines {
+                            if tx.send(Ok(Bytes::from(line))).await.is_err() {
+                                downstream_disconnected = true;
+                                break 'first_chunk;
                             }
                         }
                     }
+                    Err(error) => {
+                        let _ = tx.send(Err(std::io::Error::other(error.clone()))).await;
+                        stream_error = Some(error);
+                        break 'first_chunk;
+                    }
                 }
-                Err(error) => {
-                    let message = format!("upstream stream error: {error}");
-                    let _ = tx.send(Err(std::io::Error::other(message.clone()))).await;
-                    stream_error = Some(message);
-                    break;
+            }
+        }
+
+        if !downstream_disconnected && stream_error.is_none() {
+            'outer: while let Some(next_chunk) = upstream_stream.next().await {
+                match next_chunk {
+                    Ok(chunk) => {
+                        buffer.push_str(&String::from_utf8_lossy(&chunk));
+                        let frames = drain_sse_frames(&mut buffer);
+                        for frame in frames {
+                            match transform_responses_frame_to_chat_sse(
+                                &frame,
+                                &chat_id,
+                                &requested_model_for_task,
+                                &mut sent_role,
+                                &mut sent_done,
+                                &mut saw_tool_call,
+                                &mut tool_call_indices,
+                                &mut tool_call_argument_emitted,
+                                &mut next_tool_call_index,
+                            ) {
+                                Ok(lines) => {
+                                    for line in lines {
+                                        if tx.send(Ok(Bytes::from(line))).await.is_err() {
+                                            downstream_disconnected = true;
+                                            break 'outer;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ =
+                                        tx.send(Err(std::io::Error::other(error.clone()))).await;
+                                    stream_error = Some(error);
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let message = format!("upstream stream error: {error}");
+                        let _ = tx.send(Err(std::io::Error::other(message.clone()))).await;
+                        stream_error = Some(message);
+                        break;
+                    }
                 }
             }
         }
@@ -827,6 +1003,7 @@ async fn proxy_chat_completions_stream(
             StatusCode::OK.as_u16(),
             latency_ms,
             success_note,
+            None,
         )
         .await
         {
@@ -889,7 +1066,11 @@ fn route_detail_view(route: &ModelRouteRow) -> Value {
     })
 }
 
-fn channel_admin_view(candidate: &routing::CandidateEvaluation, now_ts: i64) -> Value {
+fn channel_admin_view(
+    candidate: &routing::CandidateEvaluation,
+    now_ts: i64,
+    runtime_stats: Option<&ChannelRuntimeStats>,
+) -> Value {
     let channel = &candidate.channel;
     let cooldown_remaining_seconds = channel
         .cooldown_until
@@ -897,6 +1078,24 @@ fn channel_admin_view(candidate: &routing::CandidateEvaluation, now_ts: i64) -> 
         .map(|until| until - now_ts);
     let (last_error_kind, last_error_hint) =
         classify_upstream_error(channel.last_status, channel.last_error.as_deref());
+    let avg_latency_ms = runtime_stats
+        .and_then(|stats| stats.avg_latency_ms)
+        .or(channel.avg_latency_ms);
+    let requests_24h = runtime_stats
+        .map(|stats| stats.requests_24h)
+        .unwrap_or_default();
+    let success_requests_24h = runtime_stats
+        .map(|stats| stats.success_requests_24h)
+        .unwrap_or_default();
+    let input_tokens_24h = runtime_stats
+        .map(|stats| stats.input_tokens_24h)
+        .unwrap_or_default();
+    let output_tokens_24h = runtime_stats
+        .map(|stats| stats.output_tokens_24h)
+        .unwrap_or_default();
+    let total_tokens_24h = runtime_stats
+        .map(|stats| stats.total_tokens_24h)
+        .unwrap_or_default();
 
     json!({
         "channel_id": channel.channel_id,
@@ -912,6 +1111,7 @@ fn channel_admin_view(candidate: &routing::CandidateEvaluation, now_ts: i64) -> 
         "protocol": channel.protocol,
         "enabled": channel.enabled != 0,
         "priority": channel.priority,
+        "avg_latency_ms": avg_latency_ms,
         "cooldown_until": channel.cooldown_until,
         "manual_blocked": channel.manual_blocked != 0,
         "cooldown_remaining_seconds": cooldown_remaining_seconds,
@@ -922,7 +1122,12 @@ fn channel_admin_view(candidate: &routing::CandidateEvaluation, now_ts: i64) -> 
         "last_error_hint": last_error_hint,
         "eligible": candidate.eligible,
         "state": channel_state(channel, now_ts),
-        "reason": candidate.reason
+        "reason": candidate.reason,
+        "requests_24h": requests_24h,
+        "success_requests_24h": success_requests_24h,
+        "input_tokens_24h": input_tokens_24h,
+        "output_tokens_24h": output_tokens_24h,
+        "total_tokens_24h": total_tokens_24h
     })
 }
 
@@ -949,19 +1154,32 @@ fn request_log_admin_view(log: RequestLogRow) -> Value {
     })
 }
 
-fn update_channel_state_response(
+async fn channel_admin_json(
+    state: &AppState,
     channel: ChannelRow,
     now_ts: i64,
-) -> Result<Response<Body>, AppError> {
+) -> Result<Value, AppError> {
+    let stats = state
+        .store
+        .load_channel_runtime_stats(channel.channel_id)
+        .await?;
     let candidate = routing::inspect_candidates(vec![channel], None, now_ts)
         .into_iter()
         .next()
         .ok_or_else(|| AppError::Internal("failed to evaluate updated channel".to_string()))?;
 
+    Ok(channel_admin_view(&candidate, now_ts, Some(&stats)))
+}
+
+async fn update_channel_state_response(
+    state: &AppState,
+    channel: ChannelRow,
+    now_ts: i64,
+) -> Result<Response<Body>, AppError> {
     build_json_response(
         StatusCode::OK,
         &json!({
-            "data": channel_admin_view(&candidate, now_ts)
+            "data": channel_admin_json(state, channel, now_ts).await?
         }),
     )
 }
@@ -1039,6 +1257,7 @@ async fn record_success(
     upstream_protocol: Protocol,
     http_status: u16,
     latency_ms: i64,
+    token_usage: Option<TokenUsage>,
 ) -> Result<(), AppError> {
     record_success_with_note(
         state,
@@ -1050,6 +1269,7 @@ async fn record_success(
         http_status,
         latency_ms,
         None,
+        token_usage,
     )
     .await
 }
@@ -1064,6 +1284,7 @@ async fn record_success_with_note(
     http_status: u16,
     latency_ms: i64,
     error_message: Option<String>,
+    token_usage: Option<TokenUsage>,
 ) -> Result<(), AppError> {
     let log = RequestLogWrite {
         request_id: request_id.to_string(),
@@ -1074,11 +1295,14 @@ async fn record_success_with_note(
         http_status: Some(i64::from(http_status)),
         latency_ms,
         error_message,
+        input_tokens: token_usage.map(|usage| usage.input_tokens),
+        output_tokens: token_usage.map(|usage| usage.output_tokens),
+        total_tokens: token_usage.map(|usage| usage.total_tokens),
     };
     state.store.record_request(&log).await?;
     state
         .store
-        .mark_channel_success(selected.channel_id, http_status)
+        .mark_channel_success(selected.channel_id, http_status, Some(latency_ms))
         .await?;
     Ok(())
 }
@@ -1096,11 +1320,17 @@ async fn record_failure(
     error_message: String,
 ) -> Result<(), AppError> {
     let (error_kind, _) = classify_upstream_error(http_status.map(i64::from), Some(&error_message));
+    let next_fail_count = selected.consecutive_fail_count + 1;
     let manual_intervention_required =
         requires_manual_intervention(&state.manual_intervention_policy, error_kind);
     let cooldown_until = (!manual_intervention_required).then(|| {
         now_ts()
-            + resolve_cooldown_seconds(&state.cooldown_policy, route.cooldown_seconds, error_kind)
+            + resolve_cooldown_seconds(
+                &state.cooldown_policy,
+                route.cooldown_seconds,
+                error_kind,
+                next_fail_count,
+            )
     });
     let log = RequestLogWrite {
         request_id: request_id.to_string(),
@@ -1111,6 +1341,9 @@ async fn record_failure(
         http_status: http_status.map(i64::from),
         latency_ms,
         error_message: Some(error_message.clone()),
+        input_tokens: None,
+        output_tokens: None,
+        total_tokens: None,
     };
     state.store.record_request(&log).await?;
     state
@@ -1124,43 +1357,6 @@ async fn record_failure(
         )
         .await?;
     Ok(())
-}
-
-async fn probe_onboarding_channel(
-    state: &AppState,
-    payload: &OnboardRouteRequest,
-) -> Result<(), AppError> {
-    let route_model = payload.route_model.trim();
-    if route_model.is_empty() {
-        return Err(AppError::BadRequest(
-            "field `route_model` is required".to_string(),
-        ));
-    }
-
-    let base_url = store::normalize_base_url(&payload.base_url)?;
-    let api_key = payload.api_key.trim();
-    if api_key.is_empty() {
-        return Err(AppError::BadRequest(
-            "field `api_key` is required".to_string(),
-        ));
-    }
-
-    let upstream_model = payload
-        .upstream_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(route_model);
-    let protocol = parse_required_protocol(&payload.protocol)?;
-    match run_upstream_probe(state, &base_url, api_key, upstream_model, protocol).await {
-        Ok(_) => Ok(()),
-        Err(outcome) => Err(AppError::BadRequest(format!(
-            "onboarding probe failed: {}",
-            outcome
-                .error_message
-                .unwrap_or_else(|| "unknown probe error".to_string())
-        ))),
-    }
 }
 
 async fn execute_channel_probe(
@@ -1263,6 +1459,15 @@ fn classify_upstream_error(
     let message = last_error.unwrap_or_default();
     let normalized = message.to_ascii_lowercase();
 
+    if normalized.contains("first token timeout") {
+        return (
+            "first_token_timeout",
+            Some(format!(
+                "upstream produced no response bytes within {FIRST_TOKEN_TIMEOUT_SECS}s"
+            )),
+        );
+    }
+
     if last_status == Some(403) && normalized.contains("1010") {
         return (
             "edge_blocked",
@@ -1319,8 +1524,10 @@ fn resolve_cooldown_seconds(
     policy: &CooldownPolicy,
     route_default_seconds: i64,
     error_kind: &str,
+    consecutive_fail_count: i64,
 ) -> i64 {
     match error_kind {
+        "first_token_timeout" => Some(first_token_timeout_cooldown_seconds(consecutive_fail_count)),
         "auth_error" => policy.auth_error_seconds,
         "rate_limited" => policy.rate_limited_seconds,
         "upstream_server_error" => policy.upstream_server_error_seconds,
@@ -1335,6 +1542,7 @@ fn resolve_cooldown_seconds(
 
 fn requires_manual_intervention(policy: &ManualInterventionPolicy, error_kind: &str) -> bool {
     match error_kind {
+        "first_token_timeout" => false,
         "auth_error" => policy.auth_error,
         "rate_limited" => policy.rate_limited,
         "upstream_server_error" => policy.upstream_server_error,
@@ -1736,6 +1944,41 @@ fn map_usage_to_chat(usage: Option<&Value>) -> Value {
         "prompt_tokens": usage.get("input_tokens").and_then(Value::as_i64).unwrap_or(0),
         "completion_tokens": usage.get("output_tokens").and_then(Value::as_i64).unwrap_or(0),
         "total_tokens": usage.get("total_tokens").and_then(Value::as_i64).unwrap_or(0)
+    })
+}
+
+fn extract_usage_from_body(protocol: Protocol, body: &[u8]) -> Option<TokenUsage> {
+    let response: Value = serde_json::from_slice(body).ok()?;
+    extract_usage_from_value(protocol, &response)
+}
+
+fn extract_usage_from_value(protocol: Protocol, response: &Value) -> Option<TokenUsage> {
+    let usage = response.get("usage")?;
+    let (input_tokens, output_tokens, total_tokens) = match protocol {
+        Protocol::Responses | Protocol::Claude => {
+            let input_tokens = usage.get("input_tokens").and_then(Value::as_i64)?;
+            let output_tokens = usage.get("output_tokens").and_then(Value::as_i64)?;
+            let total_tokens = usage
+                .get("total_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or(input_tokens + output_tokens);
+            (input_tokens, output_tokens, total_tokens)
+        }
+        Protocol::ChatCompletions => {
+            let input_tokens = usage.get("prompt_tokens").and_then(Value::as_i64)?;
+            let output_tokens = usage.get("completion_tokens").and_then(Value::as_i64)?;
+            let total_tokens = usage
+                .get("total_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or(input_tokens + output_tokens);
+            (input_tokens, output_tokens, total_tokens)
+        }
+    };
+
+    Some(TokenUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
     })
 }
 
@@ -2501,6 +2744,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_request_persists_usage_and_latency_metrics() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_json_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        seed_database(&config.database_url, upstream_addr).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.4",
+                    "input": "ping"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+        let usage_row = sqlx::query_as::<_, (Option<i64>, Option<i64>, Option<i64>)>(
+            r#"
+            select input_tokens, output_tokens, total_tokens
+            from request_logs
+            order by id desc
+            limit 1
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(usage_row.0, Some(11));
+        assert_eq!(usage_row.1, Some(7));
+        assert_eq!(usage_row.2, Some(18));
+
+        let avg_latency_ms = sqlx::query_scalar::<_, Option<i64>>(
+            "select avg_latency_ms from channels where id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(avg_latency_ms.is_some_and(|value| value > 0));
+    }
+
+    #[tokio::test]
     async fn chat_completions_stream_maps_from_responses_sse() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
@@ -2544,6 +2845,81 @@ mod tests {
         assert!(text.contains("\"content\":\"hel\""));
         assert!(text.contains("\"content\":\"lo\""));
         assert!(text.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn request_retries_next_channel_within_same_call_before_returning_error() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let failing_upstream = spawn_auth_error_upstream().await;
+        let healthy_upstream = spawn_json_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        seed_database(&config.database_url, failing_upstream).await;
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+        sqlx::query("insert into sites (name, base_url, status) values (?, ?, 'active')")
+            .bind("backup-site")
+            .bind(format!("http://{healthy_upstream}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "insert into accounts (site_id, label, api_key, status) values (2, 'backup-account', 'test-key', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "insert into channels (route_id, account_id, label, upstream_model, supports_responses, enabled, weight, priority, protocol) values (1, 2, 'backup', 'gpt-5.4', 1, 1, 10, 0, 'responses')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.4",
+                    "input": "ping"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["output"][0]["content"][0]["text"],
+            "hello from upstream"
+        );
+
+        let log_count =
+            sqlx::query_scalar::<_, i64>("select count(*) from request_logs where request_id = (select request_id from request_logs order by id desc limit 1)")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(log_count, 2);
+
+        let first_status =
+            sqlx::query_scalar::<_, Option<i64>>("select last_status from channels where id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(first_status, Some(401));
     }
 
     #[tokio::test]
@@ -2812,17 +3188,58 @@ mod tests {
         };
 
         assert_eq!(
-            super::resolve_cooldown_seconds(&policy, 300, "rate_limited"),
+            super::resolve_cooldown_seconds(&policy, 300, "rate_limited", 1),
             45
         );
         assert_eq!(
-            super::resolve_cooldown_seconds(&policy, 300, "auth_error"),
+            super::resolve_cooldown_seconds(&policy, 300, "auth_error", 1),
             1800
         );
         assert_eq!(
-            super::resolve_cooldown_seconds(&policy, 300, "unknown_error"),
+            super::resolve_cooldown_seconds(&policy, 300, "unknown_error", 1),
             300
         );
+    }
+
+    #[test]
+    fn first_token_timeout_uses_exponential_cooldown_with_cap() {
+        let policy = CooldownPolicy::default();
+
+        assert_eq!(
+            super::resolve_cooldown_seconds(&policy, 300, "first_token_timeout", 1),
+            120
+        );
+        assert_eq!(
+            super::resolve_cooldown_seconds(&policy, 300, "first_token_timeout", 2),
+            240
+        );
+        assert_eq!(
+            super::resolve_cooldown_seconds(&policy, 300, "first_token_timeout", 3),
+            480
+        );
+        assert_eq!(
+            super::resolve_cooldown_seconds(&policy, 300, "first_token_timeout", 4),
+            960
+        );
+        assert_eq!(
+            super::resolve_cooldown_seconds(&policy, 300, "first_token_timeout", 5),
+            1920
+        );
+        assert_eq!(
+            super::resolve_cooldown_seconds(&policy, 300, "first_token_timeout", 9),
+            1920
+        );
+    }
+
+    #[test]
+    fn classify_upstream_error_detects_first_token_timeout() {
+        let (kind, hint) = super::classify_upstream_error(
+            Some(200),
+            Some("first token timeout after 50s while waiting for first response chunk"),
+        );
+
+        assert_eq!(kind, "first_token_timeout");
+        assert!(hint.unwrap().contains("50s"));
     }
 
     #[tokio::test]
@@ -2979,7 +3396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleting_last_channel_also_removes_empty_route() {
+    async fn deleting_last_channel_keeps_empty_route() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_json_upstream().await;
@@ -3007,7 +3424,7 @@ mod tests {
             .await
             .unwrap();
         let deleted: Value = serde_json::from_slice(&delete_body).unwrap();
-        assert_eq!(deleted["data"]["route_deleted"], true);
+        assert_eq!(deleted["data"]["route_deleted"], false);
         assert_eq!(deleted["data"]["route_model"], "gpt-5.4");
 
         let routes_request = Request::builder()
@@ -3022,7 +3439,9 @@ mod tests {
             .await
             .unwrap();
         let routes: Value = serde_json::from_slice(&routes_body).unwrap();
-        assert_eq!(routes["data"].as_array().unwrap().len(), 0);
+        assert_eq!(routes["data"].as_array().unwrap().len(), 1);
+        assert_eq!(routes["data"][0]["model_pattern"], "gpt-5.4");
+        assert_eq!(routes["data"][0]["channel_count"], 0);
     }
 
     #[tokio::test]
@@ -3215,13 +3634,12 @@ mod tests {
             .await
             .unwrap();
 
-        let create_request = Request::builder()
+        let create_channel_request = Request::builder()
             .method("POST")
-            .uri("/api/routes")
+            .uri("/api/routes/1/channels")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(
                 serde_json::to_vec(&json!({
-                    "route_model": "gpt-5.4",
                     "base_url": format!("http://{upstream_addr}/v1"),
                     "api_key": "test-key",
                     "upstream_model": "gpt-5.4",
@@ -3231,7 +3649,7 @@ mod tests {
             ))
             .unwrap();
 
-        let create_response = app.clone().oneshot(create_request).await.unwrap();
+        let create_response = app.clone().oneshot(create_channel_request).await.unwrap();
         assert_eq!(create_response.status(), StatusCode::CREATED);
 
         let proxy_request = Request::builder()
@@ -3260,7 +3678,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn onboard_route_keeps_one_route_and_adds_multiple_channels() {
+    async fn create_route_then_add_channels_keeps_one_route() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_a = spawn_json_upstream().await;
@@ -3276,13 +3694,34 @@ mod tests {
         };
         let app = app::build_app(&config).await.unwrap();
 
-        let create_first = Request::builder()
+        let create_route = Request::builder()
             .method("POST")
             .uri("/api/routes")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(
                 serde_json::to_vec(&json!({
                     "route_model": "gpt-5.4",
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let first_response = app.clone().oneshot(create_route).await.unwrap();
+        assert_eq!(first_response.status(), StatusCode::CREATED);
+        let first_body = to_bytes(first_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first_value: Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_value["data"]["created"], true);
+        assert_eq!(first_value["data"]["route"]["model_pattern"], "gpt-5.4");
+        let route_id = first_value["data"]["route"]["id"].as_i64().unwrap();
+
+        let create_first_channel = Request::builder()
+            .method("POST")
+            .uri(format!("/api/routes/{route_id}/channels"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
                     "base_url": format!("http://{upstream_a}/v1"),
                     "api_key": "key-a",
                     "upstream_model": "gpt-5.4",
@@ -3292,23 +3731,15 @@ mod tests {
             ))
             .unwrap();
 
-        let first_response = app.clone().oneshot(create_first).await.unwrap();
-        assert_eq!(first_response.status(), StatusCode::CREATED);
-        let first_body = to_bytes(first_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let first_value: Value = serde_json::from_slice(&first_body).unwrap();
-        assert_eq!(first_value["data"]["route_created"], true);
-        assert_eq!(first_value["data"]["route"]["model_pattern"], "gpt-5.4");
-        let route_id = first_value["data"]["route"]["id"].as_i64().unwrap();
+        let first_channel_response = app.clone().oneshot(create_first_channel).await.unwrap();
+        assert_eq!(first_channel_response.status(), StatusCode::CREATED);
 
-        let create_second = Request::builder()
+        let create_second_channel = Request::builder()
             .method("POST")
-            .uri("/api/routes")
+            .uri(format!("/api/routes/{route_id}/channels"))
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(
                 serde_json::to_vec(&json!({
-                    "route_model": "gpt-5.4",
                     "base_url": format!("http://{upstream_b}/v1"),
                     "api_key": "key-b",
                     "upstream_model": "gpt-5-4",
@@ -3319,16 +3750,15 @@ mod tests {
             ))
             .unwrap();
 
-        let second_response = app.clone().oneshot(create_second).await.unwrap();
+        let second_response = app.clone().oneshot(create_second_channel).await.unwrap();
         assert_eq!(second_response.status(), StatusCode::CREATED);
         let second_body = to_bytes(second_response.into_body(), usize::MAX)
             .await
             .unwrap();
         let second_value: Value = serde_json::from_slice(&second_body).unwrap();
-        assert_eq!(second_value["data"]["route_created"], false);
-        assert_eq!(second_value["data"]["route"]["id"], route_id);
-        assert_eq!(second_value["data"]["channel"]["protocol"], "responses");
-        assert_eq!(second_value["data"]["channel"]["upstream_model"], "gpt-5-4");
+        assert_eq!(second_value["data"]["route_id"], route_id);
+        assert_eq!(second_value["data"]["protocol"], "responses");
+        assert_eq!(second_value["data"]["upstream_model"], "gpt-5-4");
 
         let routes_request = Request::builder()
             .method("GET")
@@ -3374,10 +3804,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn onboarding_probe_rejects_edge_blocked_channel() {
+    async fn create_route_without_channel_succeeds() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
-        let upstream_addr = spawn_edge_blocked_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             database_url: database_url(db_path),
@@ -3395,25 +3824,20 @@ mod tests {
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(
                 serde_json::to_vec(&json!({
-                    "route_model": "gpt-5.4",
-                    "base_url": format!("http://{upstream_addr}/v1"),
-                    "api_key": "test-key",
-                    "upstream_model": "gpt-5.4",
-                    "protocol": "responses"
+                    "route_model": "gpt-5.4"
                 }))
                 .unwrap(),
             ))
             .unwrap();
 
         let create_response = app.clone().oneshot(create_request).await.unwrap();
-        assert_eq!(create_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(create_response.status(), StatusCode::CREATED);
         let create_body = to_bytes(create_response.into_body(), usize::MAX)
             .await
             .unwrap();
         let create_value: Value = serde_json::from_slice(&create_body).unwrap();
-        let message = create_value["error"]["message"].as_str().unwrap();
-        assert!(message.contains("onboarding probe failed"));
-        assert!(message.contains("edge_blocked"));
+        assert_eq!(create_value["data"]["created"], true);
+        assert_eq!(create_value["data"]["route"]["model_pattern"], "gpt-5.4");
 
         let routes_request = Request::builder()
             .method("GET")
@@ -3427,7 +3851,7 @@ mod tests {
             .await
             .unwrap();
         let routes_value: Value = serde_json::from_slice(&routes_body).unwrap();
-        assert_eq!(routes_value["data"].as_array().unwrap().len(), 0);
+        assert_eq!(routes_value["data"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -3446,13 +3870,32 @@ mod tests {
         };
         let app = app::build_app(&config).await.unwrap();
 
-        let create_request = Request::builder()
+        let create_route_request = Request::builder()
             .method("POST")
             .uri("/api/routes")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(
                 serde_json::to_vec(&json!({
-                    "route_model": "claude-4-sonnet",
+                    "route_model": "claude-4-sonnet"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let create_response = app.clone().oneshot(create_route_request).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_value: Value = serde_json::from_slice(&create_body).unwrap();
+        let route_id = create_value["data"]["route"]["id"].as_i64().unwrap();
+
+        let create_channel_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/routes/{route_id}/channels"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
                     "base_url": format!("http://{upstream_addr}/v1"),
                     "api_key": "test-key",
                     "upstream_model": "claude-sonnet-4",
@@ -3462,8 +3905,8 @@ mod tests {
             ))
             .unwrap();
 
-        let create_response = app.clone().oneshot(create_request).await.unwrap();
-        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_channel_response = app.clone().oneshot(create_channel_request).await.unwrap();
+        assert_eq!(create_channel_response.status(), StatusCode::CREATED);
 
         let proxy_request = Request::builder()
             .method("POST")

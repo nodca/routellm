@@ -3,7 +3,7 @@ param(
     [string]$Tag = $(if ($env:LLMROUTER_TAG) { $env:LLMROUTER_TAG } else { "latest" }),
     [string]$AssetUrl = $env:LLMROUTER_ASSET_URL,
     [string]$InstallDir = $(if ($env:LLMROUTER_INSTALL_DIR) { $env:LLMROUTER_INSTALL_DIR } else { (Join-Path $env:LOCALAPPDATA "llmrouter") }),
-    [string]$Bind = $(if ($env:LLMROUTER_BIND_ADDR) { $env:LLMROUTER_BIND_ADDR } else { "0.0.0.0:8080" }),
+    [string]$Bind = $(if ($env:LLMROUTER_BIND_ADDR) { $env:LLMROUTER_BIND_ADDR } else { "0.0.0.0:1290" }),
     [string]$MasterKey = $env:LLMROUTER_MASTER_KEY,
     [string]$RequestTimeout = $(if ($env:LLMROUTER_REQUEST_TIMEOUT_SECS) { $env:LLMROUTER_REQUEST_TIMEOUT_SECS } else { "90" }),
     [string]$ConfigFile = "",

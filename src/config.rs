@@ -187,8 +187,9 @@ impl Config {
             .unwrap_or_default();
 
         Ok(Self {
-            bind_addr: SocketAddr::from_str(&bind_addr)
-                .map_err(|error| AppError::Config(format!("invalid LLMROUTER_BIND_ADDR: {error}")))?,
+            bind_addr: SocketAddr::from_str(&bind_addr).map_err(|error| {
+                AppError::Config(format!("invalid LLMROUTER_BIND_ADDR: {error}"))
+            })?,
             database_url,
             request_timeout_secs,
             master_key,
@@ -211,8 +212,9 @@ impl Config {
             .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
 
         Ok(Self {
-            bind_addr: SocketAddr::from_str(&bind_addr)
-                .map_err(|error| AppError::Config(format!("invalid LLMROUTER_BIND_ADDR: {error}")))?,
+            bind_addr: SocketAddr::from_str(&bind_addr).map_err(|error| {
+                AppError::Config(format!("invalid LLMROUTER_BIND_ADDR: {error}"))
+            })?,
             database_url,
             request_timeout_secs,
             master_key: file_config.master_key(),

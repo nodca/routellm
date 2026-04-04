@@ -175,28 +175,35 @@ TUI 与管理面主要展示四种状态：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-local.sh | \
-  sudo bash -s -- --repo nodca/routellm --tag v1.0
+  sudo bash -s -- --repo nodca/routellm --tag v1.1.0
 ```
 
 脚本会自动：
 
 - 安装 `llmrouter` server
 - 配置 systemd 开机自启
-- 为当前登录用户安装 `llmrouter-tui`
+- 为当前登录用户安装 `llmrouter-tui` 和 `lrtui`
 - 把本机地址和同一把管理 `KEY` 写进 TUI 配置
+
+一键卸载：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/uninstall-local.sh | \
+  sudo bash
+```
 
 #### Linux Server
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh | \
-  sudo bash -s -- --repo nodca/routellm --tag v1.0
+  sudo bash -s -- --repo nodca/routellm --tag v1.1.0
 ```
 
 默认安装到 `/opt/llmrouter`，适合 root 管理的服务端部署。非 root 安装建议改成：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh | \
-  bash -s -- --repo nodca/routellm --tag v1.0 \
+  bash -s -- --repo nodca/routellm --tag v1.1.0 \
     --install-dir "$HOME/.local/share/llmrouter" \
     --env-file "$HOME/.config/llmrouter/server.env" \
     --skip-systemd
@@ -206,8 +213,10 @@ curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.sh | \
-  bash -s -- --repo nodca/routellm --tag v1.0 --server http://127.0.0.1:1290
+  bash -s -- --repo nodca/routellm --tag v1.1.0 --server http://127.0.0.1:1290
 ```
+
+安装后可直接运行 `lrtui`。
 
 `llmrouter-tui` 会优先读取本地保存的连接配置；如果没有配置，首次启动会引导你填写一次 `Server URL` 和管理 `KEY`，之后自动复用。
 
@@ -215,7 +224,7 @@ curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install
 
 ```powershell
 powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.ps1 -OutFile install-server.ps1"
-powershell -ExecutionPolicy Bypass -File .\install-server.ps1 -Repo nodca/routellm -Tag v1.0
+powershell -ExecutionPolicy Bypass -File .\install-server.ps1 -Repo nodca/routellm -Tag v1.1.0
 ```
 
 Windows 默认安装到 `%LOCALAPPDATA%\llmrouter`。
@@ -224,11 +233,18 @@ Windows 默认安装到 `%LOCALAPPDATA%\llmrouter`。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.ps1 -OutFile install-tui.ps1"
-powershell -ExecutionPolicy Bypass -File .\install-tui.ps1 -Repo nodca/routellm -Tag v1.0 -Server http://127.0.0.1:1290 -AuthKey sk-llmrouter-your-key
+powershell -ExecutionPolicy Bypass -File .\install-tui.ps1 -Repo nodca/routellm -Tag v1.1.0 -Server http://127.0.0.1:1290 -AuthKey sk-llmrouter-your-key
 ```
 
 Windows TUI 默认也放在 `%LOCALAPPDATA%\llmrouter`。
-首次启动同样只需要配置一次，之后会直接读取本地保存的连接信息。
+安装脚本会写入本地配置，并创建 `lrtui.cmd`，同时把安装目录加入用户 `PATH`。新开一个终端后可直接运行 `lrtui`。
+
+Windows 一键卸载：
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/nodca/routellm/main/scripts/uninstall-local.ps1 -OutFile uninstall-local.ps1"
+powershell -ExecutionPolicy Bypass -File .\uninstall-local.ps1
+```
 
 ## 启动方式
 
@@ -288,9 +304,9 @@ LLMROUTER_AUTH_KEY=sk-llmrouter-local \
 示例：
 
 ```bash
-LLMROUTER_BASE_URL=http://your-server-ip:8080 \
+LLMROUTER_BASE_URL=http://your-server-ip:1290 \
 LLMROUTER_AUTH_KEY=sk-llmrouter-your-key \
-llmrouter-tui
+lrtui
 ```
 
 ## TUI 是什么，不是什么

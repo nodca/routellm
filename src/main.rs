@@ -2,17 +2,13 @@ use std::path::PathBuf;
 
 use llmrouter::{app, bootstrap, config::Config};
 use tokio::net::TcpListener;
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::fmt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
-    fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    fmt().init();
 
     match parse_command(std::env::args().skip(1).collect::<Vec<_>>())? {
         Command::Serve => {
