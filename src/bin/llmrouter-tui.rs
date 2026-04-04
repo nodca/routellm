@@ -2861,16 +2861,7 @@ fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
-    let route_hint = app
-        .selected_route_ref()
-        .map(|route| route.model_pattern.as_str())
-        .unwrap_or("-");
-    let channel_hint = app
-        .selected_channel_ref()
-        .map(|channel| channel.channel_label.as_str())
-        .unwrap_or("-");
-
-    let lines = vec![
+    let mut lines = vec![
         Line::from(app.status.clone()),
         Line::from(vec![
             status_meta_label("Endpoint"),
@@ -2879,20 +2870,11 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             status_meta_label("Auth"),
             Span::raw(if app.auth_key.is_some() { "ON" } else { "OFF" }),
             Span::raw("  "),
-            status_meta_label("Route"),
-            Span::raw(route_hint.to_string()),
-            Span::raw("  "),
-            status_meta_label("Channel"),
-            Span::raw(channel_hint.to_string()),
-            Span::raw("  "),
-            status_meta_label("Pane"),
-            Span::raw(focus_label(app.focus).to_string()),
-            Span::raw("  "),
             status_meta_label("Filter"),
             Span::raw(current_search_label(app)),
         ]),
-        shortcut_hint_line(app),
     ];
+    lines.extend(shortcut_hint_lines(app));
 
     let paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("Status"))
@@ -3107,14 +3089,6 @@ fn log_table_row(log: &RequestLogSummary, max_width: usize) -> String {
     )
 }
 
-fn focus_label(focus: FocusPane) -> &'static str {
-    match focus {
-        FocusPane::Routes => "routes",
-        FocusPane::Channels => "channels",
-        FocusPane::Logs => "logs",
-    }
-}
-
 fn current_search_label(app: &App) -> String {
     app.route_filter_query()
         .map(|query| format!("/{query}"))
@@ -3128,80 +3102,101 @@ fn pane_label(base: &str, count: usize, query: Option<&str>) -> String {
     }
 }
 
-fn shortcut_hint_line(app: &App) -> Line<'static> {
-    let groups: &[(&str, &[(&str, &str)])] = match app.mode {
-        AppMode::SelectProvider(_) | AppMode::SelectProtocol(_) => &[(
-            "选择",
-            &[("Up/Down", "选择"), ("Enter", "确认"), ("Esc", "取消")],
-        )],
-        AppMode::OnboardRoute(_) | AppMode::EditChannel(_) => &[(
-            "表单",
-            &[("Up/Down", "字段"), ("Enter", "提交"), ("Esc", "取消")],
-        )],
-        AppMode::Confirm(_) => &[("确认", &[("Enter / Y", "是"), ("Esc / N", "否")])],
-        AppMode::Search(_) => &[(
-            "搜索",
-            &[
-                ("输入", "过滤"),
-                ("Enter", "应用"),
-                ("空内容+Enter", "清空"),
-                ("Esc", "取消"),
-            ],
-        )],
-        AppMode::Detail(_) => &[("详情", &[("Enter / Esc", "关闭")])],
-        AppMode::Browse => match app.focus {
-            FocusPane::Routes => &[
-                (
-                    "导航",
+fn shortcut_hint_lines(app: &App) -> Vec<Line<'static>> {
+    let (primary_groups, info_group): (&[(&str, &[(&str, &str)])], Option<(&str, &[(&str, &str)])>) =
+        match app.mode {
+            AppMode::SelectProvider(_) | AppMode::SelectProtocol(_) => (
+                &[("选择", &[("Up/Down", "选择"), ("Enter", "确认"), ("Esc", "取消")])],
+                None,
+            ),
+            AppMode::OnboardRoute(_) | AppMode::EditChannel(_) => (
+                &[("表单", &[("Up/Down", "字段"), ("Enter", "提交"), ("Esc", "取消")])],
+                None,
+            ),
+            AppMode::Confirm(_) => (
+                &[("确认", &[("Enter / Y", "是"), ("Esc / N", "否")])],
+                None,
+            ),
+            AppMode::Search(_) => (
+                &[(
+                    "搜索",
                     &[
-                        ("Up/Down", "移动"),
-                        ("Enter", "进入"),
-                        ("Right", "Channels"),
+                        ("输入", "过滤"),
+                        ("Enter", "应用"),
+                        ("空内容+Enter", "清空"),
+                        ("Esc", "取消"),
                     ],
-                ),
-                (
-                    "操作",
+                )],
+                None,
+            ),
+            AppMode::Detail(_) => (&[("详情", &[("Enter / Esc", "关闭")])], None),
+            AppMode::Browse => match app.focus {
+                FocusPane::Routes => (
                     &[
-                        ("a", "新增"),
-                        ("T", "测活"),
-                        ("x", "删除"),
-                        ("/", "过滤"),
+                        (
+                            "导航",
+                            &[
+                                ("Up/Down", "移动"),
+                                ("Enter", "进入"),
+                                ("Right", "Channels"),
+                            ],
+                        ),
+                        (
+                            "操作",
+                            &[
+                                ("a", "新增"),
+                                ("T", "测活"),
+                                ("x", "删除"),
+                                ("/", "过滤"),
+                            ],
+                        ),
                     ],
+                    Some(("信息", &[("u", "URL"), ("K", "Key")])),
                 ),
-                ("信息", &[("u", "URL"), ("K", "Key")]),
-            ],
-            FocusPane::Channels => &[
-                (
-                    "导航",
-                    &[("Up/Down", "移动"), ("Left", "Routes"), ("Right", "Logs")],
-                ),
-                (
-                    "操作",
+                FocusPane::Channels => (
                     &[
-                        ("Space", "切换"),
-                        ("t", "测活"),
-                        ("T", "整组"),
-                        ("c", "恢复"),
+                        (
+                            "导航",
+                            &[("Up/Down", "移动"), ("Left", "Routes"), ("Right", "Logs")],
+                        ),
+                        (
+                            "操作",
+                            &[
+                                ("Space", "切换"),
+                                ("t", "测活"),
+                                ("T", "整组"),
+                                ("c", "恢复"),
+                            ],
+                        ),
+                        ("编辑", &[("a", "新增"), ("i", "编辑"), ("x", "删除")]),
                     ],
+                    Some(("信息", &[("u", "URL"), ("K", "Key")])),
                 ),
-                ("编辑", &[("a", "新增"), ("i", "编辑"), ("x", "删除")]),
-                ("信息", &[("u", "URL"), ("K", "Key")]),
-            ],
-            FocusPane::Logs => &[
-                (
-                    "导航",
+                FocusPane::Logs => (
                     &[
-                        ("Up/Down", "移动"),
-                        ("Left", "Channels"),
-                        ("Enter", "详情"),
+                        (
+                            "导航",
+                            &[
+                                ("Up/Down", "移动"),
+                                ("Left", "Channels"),
+                                ("Enter", "详情"),
+                            ],
+                        ),
+                        ("操作", &[("T", "测活"), ("r", "刷新")]),
                     ],
+                    Some(("信息", &[("u", "URL"), ("K", "Key")])),
                 ),
-                ("操作", &[("T", "测活"), ("r", "刷新")]),
-                ("信息", &[("u", "URL"), ("K", "Key")]),
-            ],
-        },
-    };
+            },
+        };
 
+    let mut lines = vec![shortcut_hint_line(primary_groups)];
+    if let Some(info_group) = info_group {
+        lines.push(shortcut_hint_line(std::slice::from_ref(&info_group)));
+    }
+    lines
+}
+
+fn shortcut_hint_line(groups: &[(&str, &[(&str, &str)])]) -> Line<'static> {
     let mut spans = Vec::new();
     for (group_index, (group, items)) in groups.iter().enumerate() {
         if group_index > 0 {
