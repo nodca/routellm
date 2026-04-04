@@ -173,28 +173,28 @@ TUI 与管理面主要展示四种状态：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh | \
-  bash -s -- --repo nodca/routellm --tag v0.2.0
+  bash -s -- --repo nodca/routellm --tag v0.2.1
 ```
 
 #### Linux TUI
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.sh | \
-  bash -s -- --repo nodca/routellm --tag v0.2.0 --server http://127.0.0.1:8080
+  bash -s -- --repo nodca/routellm --tag v0.2.1 --server http://127.0.0.1:8080
 ```
 
 #### Windows Server
 
 ```powershell
 powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.ps1 -OutFile install-server.ps1"
-powershell -ExecutionPolicy Bypass -File .\install-server.ps1 -Repo nodca/routellm -Tag v0.2.0
+powershell -ExecutionPolicy Bypass -File .\install-server.ps1 -Repo nodca/routellm -Tag v0.2.1
 ```
 
 #### Windows TUI
 
 ```powershell
 powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.ps1 -OutFile install-tui.ps1"
-powershell -ExecutionPolicy Bypass -File .\install-tui.ps1 -Repo nodca/routellm -Tag v0.2.0 -Server http://127.0.0.1:8080 -AuthKey sk-metapi-your-key
+powershell -ExecutionPolicy Bypass -File .\install-tui.ps1 -Repo nodca/routellm -Tag v0.2.1 -Server http://127.0.0.1:8080 -AuthKey sk-metapi-your-key
 ```
 
 ## 启动方式

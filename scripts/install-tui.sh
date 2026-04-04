@@ -7,7 +7,7 @@ Usage: install-tui.sh [options]
 
 Options:
   --repo owner/repo         GitHub repository, default nodca/routellm unless --asset-url is set
-  --tag v0.2.0              Release tag, defaults to latest
+  --tag v0.2.1              Release tag, defaults to latest
   --asset-url URL           Direct asset URL override
   --bin-dir DIR             Binary install directory, default ~/.local/bin
   --config-dir DIR          Config directory, default ~/.config/metapi

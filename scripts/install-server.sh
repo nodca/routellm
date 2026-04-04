@@ -7,7 +7,7 @@ Usage: install-server.sh [options]
 
 Options:
   --repo owner/repo         GitHub repository, default nodca/routellm unless --asset-url is set
-  --tag v0.2.0              Release tag, defaults to latest
+  --tag v0.2.1              Release tag, defaults to latest
   --asset-url URL           Direct asset URL override
   --install-dir DIR         Install directory, default /opt/metapi
   --bin-path PATH           Binary install path, default <install-dir>/metapi-rs
