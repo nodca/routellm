@@ -7,7 +7,7 @@ use crate::error::AppError;
 pub enum Protocol {
     Responses,
     ChatCompletions,
-    Claude,
+    Messages,
 }
 
 impl Protocol {
@@ -15,7 +15,7 @@ impl Protocol {
         match self {
             Self::Responses => "responses",
             Self::ChatCompletions => "chat_completions",
-            Self::Claude => "claude",
+            Self::Messages => "messages",
         }
     }
 
@@ -23,7 +23,7 @@ impl Protocol {
         match self {
             Self::Responses => "/v1/responses",
             Self::ChatCompletions => "/v1/chat/completions",
-            Self::Claude => "/v1/messages",
+            Self::Messages => "/v1/messages",
         }
     }
 
@@ -31,9 +31,9 @@ impl Protocol {
         match value.trim() {
             "responses" => Ok(Self::Responses),
             "chat_completions" => Ok(Self::ChatCompletions),
-            "claude" | "messages" => Ok(Self::Claude),
+            "claude" | "messages" => Ok(Self::Messages),
             other => Err(AppError::BadRequest(format!(
-                "field `protocol` must be one of responses, chat_completions, claude; got `{other}`"
+                "field `protocol` must be one of responses, chat_completions, messages; got `{other}`"
             ))),
         }
     }
@@ -42,7 +42,7 @@ impl Protocol {
 pub fn compatibility_cost(channel_protocol: Protocol, request_protocol: Protocol) -> Option<u8> {
     match (request_protocol, channel_protocol) {
         (Protocol::Responses, Protocol::Responses) => Some(0),
-        (Protocol::Claude, Protocol::Claude) => Some(0),
+        (Protocol::Messages, Protocol::Messages) => Some(0),
         (Protocol::ChatCompletions, Protocol::ChatCompletions) => Some(0),
         (Protocol::ChatCompletions, Protocol::Responses) => Some(1),
         _ => None,

@@ -38,7 +38,7 @@
 | --- | --- |
 | Route | 稳定的下游模型名，例如 `gpt-5.4`。客户端始终请求它。 |
 | Channel | Route 下的一条具体上游通道，包含 `base_url`、`api_key`、`upstream_model`、`protocol`、`priority`。 |
-| Protocol | 显式指定的上游协议类型，只能是 `responses`、`chat_completions`、`claude`。 |
+| Protocol | 显式指定的上游协议类型，只能是 `responses`、`chat_completions`、`messages`。 |
 | Priority | 选路优先级，数值越小越优先。只在最小 `priority` 组内继续选路。 |
 | Cooldown | 自动冷却机制。运行时请求失败后进入倒计时，时间到后自动恢复。 |
 
@@ -51,10 +51,10 @@
 - 支持上游协议：
   - `responses`
   - `chat_completions`
-  - `claude`
+  - `messages`
 - 支持流式与非流式转发
 - 支持 `chat/completions` 的 `tools / tool_calls`
-- 支持 Claude `messages`
+- 支持 Anthropic `messages`
 - 支持最小管理 API
 - 支持 SSH/TUI 运维
 - 支持 `t / T` 主动测活
@@ -82,7 +82,7 @@
 
 - `responses`
 - `chat_completions`
-- `claude`
+- `messages`
 
 添加 channel 时，`protocol` 是必填项，不再默认 `responses`。
 
@@ -92,15 +92,15 @@
 | --- | --- |
 | `responses` | `responses` |
 | `chat_completions` | `chat_completions` |
-| `claude` | `claude` |
+| `messages` | `messages` |
 | `chat_completions` | `responses`，通过薄适配层兼容 |
 
 当前不支持：
 
 - `responses -> chat_completions`
-- `responses -> claude`
-- `claude -> responses`
-- `claude -> chat_completions`
+- `responses -> messages`
+- `messages -> responses`
+- `messages -> chat_completions`
 
 ### 选路规则
 
@@ -474,7 +474,7 @@ enabled = true
 | `base_url` | 上游站点根地址，可直接填写带 `/v1` 的兼容地址 |
 | `api_key` | 上游 key |
 | `upstream_model` | 实际发给上游的模型名 |
-| `protocol` | 必填，只能是 `responses` / `chat_completions` / `claude` |
+| `protocol` | 必填，只能是 `responses` / `chat_completions` / `messages` |
 | `priority` | 必须 `>= 0`，越小越优先 |
 | `enabled` | 是否启用 |
 
@@ -556,7 +556,7 @@ export LLMROUTER_BASE_URL=http://127.0.0.1:1290
 
 - OpenAI `responses`
 - OpenAI `chat/completions`
-- Claude `messages`
+- Anthropic `messages`
 
 ### 上游能力
 
@@ -565,7 +565,7 @@ export LLMROUTER_BASE_URL=http://127.0.0.1:1290
 - `chat_completions`
   - 支持原生直连
   - 也支持通过薄兼容层适配到 `responses`
-- `claude`
+- `messages`
   - 上游走 `/v1/messages`
   - 使用 `x-api-key`
   - 自动带 `anthropic-version: 2023-06-01`
@@ -622,7 +622,7 @@ cargo test
 - 配置解析
 - 协议校验
 - 路由选择
-- responses / chat / claude 转发
+- responses / chat / messages 转发
 - tools / tool_calls 映射
 - 冷却与人工阻断
 - 主动 probe 成功 / 失败

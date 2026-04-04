@@ -457,7 +457,7 @@ pub async fn create_message(
         .ok_or_else(|| AppError::BadRequest("field `model` is required".to_string()))?
         .to_string();
 
-    proxy_request(state, requested_model, payload, Protocol::Claude).await
+    proxy_request(state, requested_model, payload, Protocol::Messages).await
 }
 
 async fn proxy_request(
@@ -1208,7 +1208,7 @@ fn build_upstream_dispatch(
     match (downstream_protocol, channel_protocol) {
         (Protocol::Responses, Protocol::Responses)
         | (Protocol::ChatCompletions, Protocol::ChatCompletions)
-        | (Protocol::Claude, Protocol::Claude) => Ok(UpstreamDispatch {
+        | (Protocol::Messages, Protocol::Messages) => Ok(UpstreamDispatch {
             upstream_protocol: channel_protocol,
             payload,
             response_adapter: ResponseAdapter::Passthrough,
@@ -1241,7 +1241,7 @@ fn apply_upstream_auth(
     api_key: &str,
 ) -> reqwest::RequestBuilder {
     match protocol {
-        Protocol::Claude => request
+        Protocol::Messages => request
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01"),
         Protocol::Responses | Protocol::ChatCompletions => request.bearer_auth(api_key),
@@ -1434,7 +1434,7 @@ fn build_probe_payload(protocol: Protocol, upstream_model: &str) -> Value {
             "messages": [{ "role": "user", "content": "ping" }],
             "max_tokens": 1
         }),
-        Protocol::Claude => json!({
+        Protocol::Messages => json!({
             "model": upstream_model,
             "messages": [{ "role": "user", "content": "ping" }],
             "max_tokens": 1
@@ -1955,7 +1955,7 @@ fn extract_usage_from_body(protocol: Protocol, body: &[u8]) -> Option<TokenUsage
 fn extract_usage_from_value(protocol: Protocol, response: &Value) -> Option<TokenUsage> {
     let usage = response.get("usage")?;
     let (input_tokens, output_tokens, total_tokens) = match protocol {
-        Protocol::Responses | Protocol::Claude => {
+        Protocol::Responses | Protocol::Messages => {
             let input_tokens = usage.get("input_tokens").and_then(Value::as_i64)?;
             let output_tokens = usage.get("output_tokens").and_then(Value::as_i64)?;
             let total_tokens = usage
@@ -3140,7 +3140,7 @@ mod tests {
                     "base_url": format!("http://{replacement_upstream_addr}/v1"),
                     "api_key": "replacement-key",
                     "upstream_model": "gpt-5.4-mini",
-                    "protocol": "claude",
+                    "protocol": "messages",
                     "priority": 2,
                 }))
                 .unwrap(),
@@ -3157,7 +3157,7 @@ mod tests {
             format!("http://{replacement_upstream_addr}")
         );
         assert_eq!(value["data"]["upstream_model"], "gpt-5.4-mini");
-        assert_eq!(value["data"]["protocol"], "claude");
+        assert_eq!(value["data"]["protocol"], "messages");
         assert_eq!(value["data"]["priority"], 2);
 
         let prefill_request = Request::builder()
@@ -3855,7 +3855,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_protocol_proxies_messages_with_anthropic_headers() {
+    async fn messages_protocol_proxies_messages_with_anthropic_headers() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_claude_upstream().await;
@@ -3899,7 +3899,7 @@ mod tests {
                     "base_url": format!("http://{upstream_addr}/v1"),
                     "api_key": "test-key",
                     "upstream_model": "claude-sonnet-4",
-                    "protocol": "claude"
+                    "protocol": "messages"
                 }))
                 .unwrap(),
             ))

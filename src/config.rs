@@ -432,9 +432,9 @@ fn validate_priority(value: i64, field: &str) -> Result<i64, AppError> {
 fn normalize_protocol(value: &str, field: &str) -> Result<String, AppError> {
     match value.trim() {
         "responses" | "chat_completions" => Ok(value.trim().to_string()),
-        "claude" | "messages" => Ok("claude".to_string()),
+        "claude" | "messages" => Ok("messages".to_string()),
         _ => Err(AppError::Config(format!(
-            "{field} must be one of responses, chat_completions, claude"
+            "{field} must be one of responses, chat_completions, messages"
         ))),
     }
 }

@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn admin_inspection_ignores_protocol_mismatch() {
-        let candidates = inspect_candidates(vec![channel(1, 0, "claude", None)], None, 100);
+        let candidates = inspect_candidates(vec![channel(1, 0, "messages", None)], None, 100);
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].eligible);
     }

@@ -336,7 +336,7 @@ impl OnboardRouteField {
             Self::BaseUrl => "上游站点根地址。可直接填带 /v1 的兼容地址。",
             Self::ApiKey => "上游 Bearer Key。界面里会掩码显示，提交时原值会发送。",
             Self::UpstreamModel => "可留空时默认跟 route model 一样，用于适配上游不同模型名。",
-            Self::Protocol => "上游协议：responses / chat_completions / claude。",
+            Self::Protocol => "上游协议：responses / chat_completions / messages。",
             Self::Priority => "越小越优先。只会在最低 priority 可用组内选路。",
         }
     }
@@ -354,7 +354,7 @@ impl OnboardRouteField {
             Self::BaseUrl => "例如: https://api.example.com/v1",
             Self::ApiKey => "例如: sk-...",
             Self::UpstreamModel => "留空则使用 route model",
-            Self::Protocol => "填写: responses / chat_completions / claude",
+            Self::Protocol => "填写: responses / chat_completions / messages",
             Self::Priority => "默认 0",
         }
     }
@@ -642,7 +642,7 @@ impl EditChannelField {
             Self::BaseUrl => "上游站点根地址。可直接填带 /v1 的兼容地址。",
             Self::ApiKey => "上游 Bearer Key。界面里会掩码显示，提交时原值会发送。",
             Self::UpstreamModel => "真实发给上游的模型名。",
-            Self::Protocol => "上游协议：responses / chat_completions / claude。",
+            Self::Protocol => "上游协议：responses / chat_completions / messages。",
             Self::Priority => "越小越优先，必须 >= 0。",
         }
     }
@@ -3293,7 +3293,7 @@ fn draw_add_channel_modal(frame: &mut Frame, form: &OnboardRouteForm) {
     ]));
     lines.push(Line::from(vec![
         Span::styled("Defaults: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("priority=0；protocol 必填，必须是 responses / chat_completions / claude。"),
+        Span::raw("priority=0；protocol 必填，必须是 responses / chat_completions / messages。"),
     ]));
     lines.push(Line::from(vec![
         Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -3436,8 +3436,8 @@ fn normalize_protocol_input(value: &str) -> Result<String, String> {
     }
     match trimmed {
         "responses" | "chat_completions" => Ok(trimmed.to_string()),
-        "claude" | "messages" => Ok("claude".to_string()),
-        _ => Err("protocol must be one of responses, chat_completions, claude".to_string()),
+        "claude" | "messages" => Ok("messages".to_string()),
+        _ => Err("protocol must be one of responses, chat_completions, messages".to_string()),
     }
 }
 
@@ -3531,7 +3531,7 @@ mod tests {
 
     #[test]
     fn normalize_protocol_input_requires_known_value() {
-        assert_eq!(normalize_protocol_input("messages").unwrap(), "claude");
+        assert_eq!(normalize_protocol_input("messages").unwrap(), "messages");
         assert!(normalize_protocol_input("").is_err());
         assert!(normalize_protocol_input("invalid").is_err());
     }

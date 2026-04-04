@@ -106,7 +106,7 @@ mod tests {
                     base_url: "https://api.example.com".to_string(),
                     api_key: "sk-1".to_string(),
                     upstream_model: "gpt-5.4".to_string(),
-                    protocol: "claude".to_string(),
+                    protocol: "messages".to_string(),
                     priority: 2,
                     enabled: false,
                 }],
@@ -122,7 +122,7 @@ mod tests {
 
         let channel = store.load_channel(1).await.unwrap();
         assert_eq!(channel.priority, 2);
-        assert_eq!(channel.protocol, "claude");
+        assert_eq!(channel.protocol, "messages");
         assert_eq!(channel.enabled, 0);
     }
 }
