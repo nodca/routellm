@@ -2078,7 +2078,7 @@ async fn run_app(mut terminal: DefaultTerminal, mut app: App) -> Result<(), Box<
 fn draw(frame: &mut Frame, app: &App) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(4)])
+        .constraints([Constraint::Min(8), Constraint::Length(5)])
         .split(frame.area());
 
     let columns = Layout::default()
