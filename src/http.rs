@@ -25,12 +25,14 @@ use crate::{
     config::{CooldownPolicy, ManualInterventionPolicy},
     domain::{AdminRouteRow, ChannelRow, ModelRouteRow, RequestLogRow, RequestLogWrite},
     error::AppError,
+    protocol::Protocol,
     routing, store,
 };
 
 #[derive(Debug, Deserialize)]
 pub struct RouteDecisionQuery {
     model: String,
+    protocol: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,8 +45,8 @@ pub struct CreateRouteChannelRequest {
     base_url: String,
     api_key: String,
     upstream_model: Option<String>,
+    protocol: String,
     priority: Option<i64>,
-    weight: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -53,8 +55,8 @@ pub struct OnboardRouteRequest {
     base_url: String,
     api_key: String,
     upstream_model: Option<String>,
+    protocol: String,
     priority: Option<i64>,
-    weight: Option<i64>,
     cooldown_seconds: Option<i64>,
 }
 
@@ -63,23 +65,21 @@ pub struct UpdateChannelRequest {
     base_url: String,
     api_key: String,
     upstream_model: String,
+    protocol: String,
     priority: i64,
-    weight: i64,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum DownstreamKind {
-    Responses,
-    ChatCompletions,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseAdapter {
+    Passthrough,
+    ResponsesToChatCompletions,
 }
 
-impl DownstreamKind {
-    fn path(self) -> &'static str {
-        match self {
-            Self::Responses => "/v1/responses",
-            Self::ChatCompletions => "/v1/chat/completions",
-        }
-    }
+#[derive(Debug)]
+struct UpstreamDispatch {
+    upstream_protocol: Protocol,
+    payload: Value,
+    response_adapter: ResponseAdapter,
 }
 
 pub async fn healthz() -> Json<Value> {
@@ -90,9 +90,16 @@ pub async fn route_decision(
     State(state): State<AppState>,
     Query(query): Query<RouteDecisionQuery>,
 ) -> Result<Json<Value>, AppError> {
+    let request_protocol = query
+        .protocol
+        .as_deref()
+        .map(Protocol::parse)
+        .transpose()?
+        .unwrap_or(Protocol::Responses);
     let route = state.store.find_route(&query.model).await?;
     let channels = state.store.load_channels(route.id).await?;
-    let decision = routing::decide_route(&query.model, &route, channels, now_ts())?;
+    let decision =
+        routing::decide_route(&query.model, &route, channels, request_protocol, now_ts())?;
     let view = routing::to_decision_view(&query.model, &route, &decision);
 
     Ok(Json(json!({
@@ -120,7 +127,7 @@ pub async fn list_route_channels(
     let route = state.store.get_route(route_id).await?;
     let now = now_ts();
     let channels = state.store.load_channels(route_id).await?;
-    let candidates = routing::inspect_candidates(channels, now)
+    let candidates = routing::inspect_candidates(channels, None, now)
         .into_iter()
         .map(|candidate| channel_admin_view(&candidate, now))
         .collect::<Vec<_>>();
@@ -184,7 +191,8 @@ pub async fn get_channel_prefill(
         "data": {
             "base_url": channel.site_base_url,
             "api_key": channel.account_api_key,
-            "upstream_model": channel.upstream_model
+            "upstream_model": channel.upstream_model,
+            "protocol": channel.protocol
         }
     })))
 }
@@ -195,6 +203,7 @@ pub async fn create_route_channel(
     Json(payload): Json<CreateRouteChannelRequest>,
 ) -> Result<Response<Body>, AppError> {
     let route = state.store.get_route(route_id).await?;
+    let protocol = parse_required_protocol(&payload.protocol)?;
     let channel = state
         .store
         .create_channel_for_route(
@@ -202,12 +211,12 @@ pub async fn create_route_channel(
             &payload.base_url,
             &payload.api_key,
             payload.upstream_model.as_deref(),
+            protocol.as_str(),
             payload.priority.unwrap_or(0),
-            payload.weight.unwrap_or(10),
         )
         .await?;
     let now = now_ts();
-    let candidate = routing::inspect_candidates(vec![channel], now)
+    let candidate = routing::inspect_candidates(vec![channel], None, now)
         .into_iter()
         .next()
         .ok_or_else(|| AppError::Internal("failed to evaluate created channel".to_string()))?;
@@ -225,6 +234,7 @@ pub async fn onboard_route(
     Json(payload): Json<OnboardRouteRequest>,
 ) -> Result<Response<Body>, AppError> {
     probe_onboarding_channel(&state, &payload).await?;
+    let protocol = parse_required_protocol(&payload.protocol)?;
 
     let (route, channel, route_created) = state
         .store
@@ -233,14 +243,14 @@ pub async fn onboard_route(
             &payload.base_url,
             &payload.api_key,
             payload.upstream_model.as_deref(),
+            protocol.as_str(),
             payload.priority.unwrap_or(0),
-            payload.weight.unwrap_or(10),
             payload.cooldown_seconds.unwrap_or(300),
         )
         .await?;
 
     let now = now_ts();
-    let candidate = routing::inspect_candidates(vec![channel], now)
+    let candidate = routing::inspect_candidates(vec![channel], None, now)
         .into_iter()
         .next()
         .ok_or_else(|| AppError::Internal("failed to evaluate created channel".to_string()))?;
@@ -292,6 +302,7 @@ pub async fn update_channel(
     Path(channel_id): Path<i64>,
     Json(payload): Json<UpdateChannelRequest>,
 ) -> Result<Response<Body>, AppError> {
+    let protocol = parse_required_protocol(&payload.protocol)?;
     update_channel_state_response(
         state
             .store
@@ -300,8 +311,8 @@ pub async fn update_channel(
                 &payload.base_url,
                 &payload.api_key,
                 &payload.upstream_model,
+                protocol.as_str(),
                 payload.priority,
-                payload.weight,
             )
             .await?,
         now_ts(),
@@ -341,14 +352,7 @@ pub async fn create_response(
         .ok_or_else(|| AppError::BadRequest("field `model` is required".to_string()))?
         .to_string();
 
-    proxy_via_responses(
-        state,
-        requested_model,
-        payload,
-        DownstreamKind::Responses,
-        false,
-    )
-    .await
+    proxy_request(state, requested_model, payload, Protocol::Responses).await
 }
 
 pub async fn create_chat_completion(
@@ -360,51 +364,57 @@ pub async fn create_chat_completion(
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::BadRequest("field `model` is required".to_string()))?
         .to_string();
-    let responses_payload = chat_completions_to_responses_payload(&payload)?;
-
-    proxy_via_responses(
-        state,
-        requested_model,
-        responses_payload,
-        DownstreamKind::ChatCompletions,
-        true,
-    )
-    .await
+    proxy_request(state, requested_model, payload, Protocol::ChatCompletions).await
 }
 
-async fn proxy_via_responses(
+pub async fn create_message(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> Result<Response<Body>, AppError> {
+    let requested_model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest("field `model` is required".to_string()))?
+        .to_string();
+
+    proxy_request(state, requested_model, payload, Protocol::Claude).await
+}
+
+async fn proxy_request(
     state: AppState,
     requested_model: String,
-    mut upstream_payload: Value,
-    downstream_kind: DownstreamKind,
-    convert_to_chat: bool,
+    payload: Value,
+    downstream_protocol: Protocol,
 ) -> Result<Response<Body>, AppError> {
     let route = state.store.find_route(&requested_model).await?;
     let channels = state.store.load_channels(route.id).await?;
-    let decision = routing::decide_route(&requested_model, &route, channels, now_ts())?;
+    let decision = routing::decide_route(
+        &requested_model,
+        &route,
+        channels,
+        downstream_protocol,
+        now_ts(),
+    )?;
     let selected = decision.selected;
+    let channel_protocol = Protocol::parse(&selected.protocol)?;
+    let dispatch = build_upstream_dispatch(payload, downstream_protocol, channel_protocol)?;
     let request_id = Uuid::new_v4().to_string();
     let started_at = Instant::now();
 
-    if let Some(body) = upstream_payload.as_object_mut() {
-        body.insert(
-            "model".to_string(),
-            Value::String(selected.upstream_model.clone()),
-        );
-    }
-
     let upstream_url = format!(
-        "{}/v1/responses",
-        selected.site_base_url.trim_end_matches('/')
+        "{}{}",
+        selected.site_base_url.trim_end_matches('/'),
+        dispatch.upstream_protocol.path()
     );
-    let upstream_response = state
-        .upstream_client
-        .post(&upstream_url)
-        .bearer_auth(&selected.account_api_key)
-        .json(&upstream_payload)
-        .send()
-        .await
-        .map_err(|error| AppError::UpstreamTransport(format!("upstream transport error: {error}")));
+    let upstream_response = apply_upstream_auth(
+        state.upstream_client.post(&upstream_url),
+        dispatch.upstream_protocol,
+        &selected.account_api_key,
+    )
+    .json(&dispatch.payload)
+    .send()
+    .await
+    .map_err(|error| AppError::UpstreamTransport(format!("upstream transport error: {error}")));
 
     let upstream_response = match upstream_response {
         Ok(response) => response,
@@ -415,7 +425,8 @@ async fn proxy_via_responses(
                 &selected,
                 &request_id,
                 &requested_model,
-                downstream_kind,
+                downstream_protocol,
+                dispatch.upstream_protocol,
                 None,
                 started_at.elapsed().as_millis() as i64,
                 error.to_string(),
@@ -427,7 +438,8 @@ async fn proxy_via_responses(
 
     let status = upstream_response.status();
     let headers = upstream_response.headers().clone();
-    let is_stream = upstream_payload
+    let is_stream = dispatch
+        .payload
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
@@ -441,7 +453,8 @@ async fn proxy_via_responses(
             &selected,
             &request_id,
             &requested_model,
-            downstream_kind,
+            downstream_protocol,
+            dispatch.upstream_protocol,
             Some(status.as_u16()),
             started_at.elapsed().as_millis() as i64,
             message.clone(),
@@ -450,9 +463,9 @@ async fn proxy_via_responses(
         return Err(AppError::UpstreamStatus(message, status));
     }
 
-    if !convert_to_chat {
+    if dispatch.response_adapter == ResponseAdapter::Passthrough {
         if is_stream {
-            return proxy_responses_stream(
+            return proxy_passthrough_stream(
                 state,
                 route,
                 selected,
@@ -462,7 +475,8 @@ async fn proxy_via_responses(
                 headers,
                 upstream_response,
                 started_at,
-                downstream_kind,
+                downstream_protocol,
+                dispatch.upstream_protocol,
             )
             .await;
         }
@@ -475,7 +489,8 @@ async fn proxy_via_responses(
             &selected,
             &request_id,
             &requested_model,
-            downstream_kind,
+            downstream_protocol,
+            dispatch.upstream_protocol,
             status.as_u16(),
             started_at.elapsed().as_millis() as i64,
         )
@@ -492,6 +507,7 @@ async fn proxy_via_responses(
             requested_model,
             upstream_response,
             started_at,
+            dispatch.upstream_protocol,
         )
         .await;
     }
@@ -509,7 +525,8 @@ async fn proxy_via_responses(
         &selected,
         &request_id,
         &requested_model,
-        downstream_kind,
+        downstream_protocol,
+        dispatch.upstream_protocol,
         status.as_u16(),
         started_at.elapsed().as_millis() as i64,
     )
@@ -517,7 +534,7 @@ async fn proxy_via_responses(
     build_json_response(StatusCode::OK, &chat_response)
 }
 
-async fn proxy_responses_stream(
+async fn proxy_passthrough_stream(
     state: AppState,
     route: ModelRouteRow,
     selected: ChannelRow,
@@ -527,7 +544,8 @@ async fn proxy_responses_stream(
     headers: HeaderMap,
     upstream_response: reqwest::Response,
     started_at: Instant,
-    downstream_kind: DownstreamKind,
+    downstream_protocol: Protocol,
+    upstream_protocol: Protocol,
 ) -> Result<Response<Body>, AppError> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     let state_for_task = state.clone();
@@ -567,7 +585,8 @@ async fn proxy_responses_stream(
                 &selected_for_task,
                 &request_id_for_task,
                 &requested_model_for_task,
-                downstream_kind,
+                downstream_protocol,
+                upstream_protocol,
                 Some(status.as_u16()),
                 latency_ms,
                 message,
@@ -587,7 +606,8 @@ async fn proxy_responses_stream(
             &selected_for_task,
             &request_id_for_task,
             &requested_model_for_task,
-            downstream_kind,
+            downstream_protocol,
+            upstream_protocol,
             status.as_u16(),
             latency_ms,
             success_note,
@@ -609,6 +629,7 @@ async fn proxy_chat_completions_stream(
     requested_model: String,
     upstream_response: reqwest::Response,
     started_at: Instant,
+    upstream_protocol: Protocol,
 ) -> Result<Response<Body>, AppError> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     let state_for_task = state.clone();
@@ -698,7 +719,8 @@ async fn proxy_chat_completions_stream(
                 &selected_for_task,
                 &request_id_for_task,
                 &requested_model_for_task,
-                DownstreamKind::ChatCompletions,
+                Protocol::ChatCompletions,
+                upstream_protocol,
                 Some(StatusCode::OK.as_u16()),
                 latency_ms,
                 message,
@@ -718,7 +740,8 @@ async fn proxy_chat_completions_stream(
             &selected_for_task,
             &request_id_for_task,
             &requested_model_for_task,
-            DownstreamKind::ChatCompletions,
+            Protocol::ChatCompletions,
+            upstream_protocol,
             StatusCode::OK.as_u16(),
             latency_ms,
             success_note,
@@ -804,10 +827,9 @@ fn channel_admin_view(candidate: &routing::CandidateEvaluation, now_ts: i64) -> 
         "channel_label": channel.channel_label,
         "site_status": channel.site_status,
         "upstream_model": channel.upstream_model,
-        "supports_responses": channel.supports_responses != 0,
+        "protocol": channel.protocol,
         "enabled": channel.enabled != 0,
         "priority": channel.priority,
-        "weight": channel.weight,
         "cooldown_until": channel.cooldown_until,
         "manual_blocked": channel.manual_blocked != 0,
         "cooldown_remaining_seconds": cooldown_remaining_seconds,
@@ -849,7 +871,7 @@ fn update_channel_state_response(
     channel: ChannelRow,
     now_ts: i64,
 ) -> Result<Response<Body>, AppError> {
-    let candidate = routing::inspect_candidates(vec![channel], now_ts)
+    let candidate = routing::inspect_candidates(vec![channel], None, now_ts)
         .into_iter()
         .next()
         .ok_or_else(|| AppError::Internal("failed to evaluate updated channel".to_string()))?;
@@ -869,14 +891,38 @@ fn channel_state(channel: &ChannelRow, now_ts: i64) -> &'static str {
         "account_inactive"
     } else if channel.site_status != "active" {
         "site_inactive"
-    } else if channel.supports_responses == 0 {
-        "responses_unsupported"
     } else if channel.manual_blocked != 0 {
         "manual_intervention_required"
     } else if channel.cooldown_until.is_some_and(|until| until > now_ts) {
         "cooling_down"
     } else {
         "ready"
+    }
+}
+
+fn build_upstream_dispatch(
+    payload: Value,
+    downstream_protocol: Protocol,
+    channel_protocol: Protocol,
+) -> Result<UpstreamDispatch, AppError> {
+    match (downstream_protocol, channel_protocol) {
+        (Protocol::Responses, Protocol::Responses)
+        | (Protocol::ChatCompletions, Protocol::ChatCompletions)
+        | (Protocol::Claude, Protocol::Claude) => Ok(UpstreamDispatch {
+            upstream_protocol: channel_protocol,
+            payload,
+            response_adapter: ResponseAdapter::Passthrough,
+        }),
+        (Protocol::ChatCompletions, Protocol::Responses) => Ok(UpstreamDispatch {
+            upstream_protocol: Protocol::Responses,
+            payload: chat_completions_to_responses_payload(&payload)?,
+            response_adapter: ResponseAdapter::ResponsesToChatCompletions,
+        }),
+        _ => Err(AppError::NoRoute(format!(
+            "protocol mismatch: request={} channel={}",
+            downstream_protocol.as_str(),
+            channel_protocol.as_str()
+        ))),
     }
 }
 
@@ -889,12 +935,26 @@ fn build_json_response(status: StatusCode, body: &Value) -> Result<Response<Body
     build_response(status, &headers, Body::from(bytes))
 }
 
+fn apply_upstream_auth(
+    request: reqwest::RequestBuilder,
+    protocol: Protocol,
+    api_key: &str,
+) -> reqwest::RequestBuilder {
+    match protocol {
+        Protocol::Claude => request
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01"),
+        Protocol::Responses | Protocol::ChatCompletions => request.bearer_auth(api_key),
+    }
+}
+
 async fn record_success(
     state: &AppState,
     selected: &ChannelRow,
     request_id: &str,
     requested_model: &str,
-    downstream_kind: DownstreamKind,
+    downstream_protocol: Protocol,
+    upstream_protocol: Protocol,
     http_status: u16,
     latency_ms: i64,
 ) -> Result<(), AppError> {
@@ -903,7 +963,8 @@ async fn record_success(
         selected,
         request_id,
         requested_model,
-        downstream_kind,
+        downstream_protocol,
+        upstream_protocol,
         http_status,
         latency_ms,
         None,
@@ -916,15 +977,16 @@ async fn record_success_with_note(
     selected: &ChannelRow,
     request_id: &str,
     requested_model: &str,
-    downstream_kind: DownstreamKind,
+    downstream_protocol: Protocol,
+    upstream_protocol: Protocol,
     http_status: u16,
     latency_ms: i64,
     error_message: Option<String>,
 ) -> Result<(), AppError> {
     let log = RequestLogWrite {
         request_id: request_id.to_string(),
-        downstream_path: downstream_kind.path().to_string(),
-        upstream_path: "/v1/responses".to_string(),
+        downstream_path: downstream_protocol.path().to_string(),
+        upstream_path: upstream_protocol.path().to_string(),
         model_requested: requested_model.to_string(),
         channel_id: selected.channel_id,
         http_status: Some(i64::from(http_status)),
@@ -945,7 +1007,8 @@ async fn record_failure(
     selected: &ChannelRow,
     request_id: &str,
     requested_model: &str,
-    downstream_kind: DownstreamKind,
+    downstream_protocol: Protocol,
+    upstream_protocol: Protocol,
     http_status: Option<u16>,
     latency_ms: i64,
     error_message: String,
@@ -959,8 +1022,8 @@ async fn record_failure(
     });
     let log = RequestLogWrite {
         request_id: request_id.to_string(),
-        downstream_path: downstream_kind.path().to_string(),
-        upstream_path: "/v1/responses".to_string(),
+        downstream_path: downstream_protocol.path().to_string(),
+        upstream_path: upstream_protocol.path().to_string(),
         model_requested: requested_model.to_string(),
         channel_id: selected.channel_id,
         http_status: http_status.map(i64::from),
@@ -1006,18 +1069,28 @@ async fn probe_onboarding_channel(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(route_model);
+    let protocol = parse_required_protocol(&payload.protocol)?;
 
-    let probe_url = format!("{base_url}/v1/responses");
-    let probe_payload = json!({
-        "model": upstream_model,
-        "input": "ping",
-        "max_output_tokens": 1
-    });
+    let probe_url = format!("{base_url}{}", protocol.path());
+    let probe_payload = match protocol {
+        Protocol::Responses => json!({
+            "model": upstream_model,
+            "input": "ping",
+            "max_output_tokens": 1
+        }),
+        Protocol::ChatCompletions => json!({
+            "model": upstream_model,
+            "messages": [{ "role": "user", "content": "ping" }],
+            "max_tokens": 1
+        }),
+        Protocol::Claude => json!({
+            "model": upstream_model,
+            "messages": [{ "role": "user", "content": "ping" }],
+            "max_tokens": 1
+        }),
+    };
 
-    let response = state
-        .upstream_client
-        .post(&probe_url)
-        .bearer_auth(api_key)
+    let response = apply_upstream_auth(state.upstream_client.post(&probe_url), protocol, api_key)
         .json(&probe_payload)
         .send()
         .await
@@ -1045,6 +1118,16 @@ async fn probe_onboarding_channel(
         message,
         hint_suffix
     )))
+}
+
+fn parse_required_protocol(value: &str) -> Result<Protocol, AppError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::BadRequest(
+            "field `protocol` is required".to_string(),
+        ));
+    }
+    Protocol::parse(trimmed)
 }
 
 fn classify_upstream_error(
@@ -1883,7 +1966,7 @@ mod tests {
     use axum::{
         Json, Router,
         body::{Body, Bytes, to_bytes},
-        http::{Request, StatusCode, header::CONTENT_TYPE},
+        http::{HeaderMap, Request, StatusCode, header::CONTENT_TYPE},
         response::Response,
         routing::post,
     };
@@ -2049,6 +2132,56 @@ mod tests {
         }
 
         let app = Router::new().route("/v1/responses", post(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    async fn spawn_claude_upstream() -> SocketAddr {
+        async fn handler(headers: HeaderMap) -> Response<Body> {
+            let api_key_ok = headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                == Some("test-key");
+            let version_ok = headers
+                .get("anthropic-version")
+                .and_then(|value| value.to_str().ok())
+                == Some("2023-06-01");
+
+            if !api_key_ok || !version_ok {
+                return Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"error":{"message":"missing anthropic auth headers"}}"#,
+                    ))
+                    .unwrap();
+            }
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "id": "msg_123",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-sonnet-4",
+                        "content": [{
+                            "type": "text",
+                            "text": "hello from claude upstream"
+                        }],
+                        "stop_reason": "end_turn"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap()
+        }
+
+        let app = Router::new().route("/v1/messages", post(handler));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2505,8 +2638,8 @@ mod tests {
                     "base_url": format!("http://{replacement_upstream_addr}/v1"),
                     "api_key": "replacement-key",
                     "upstream_model": "gpt-5.4-mini",
+                    "protocol": "claude",
                     "priority": 2,
-                    "weight": 7
                 }))
                 .unwrap(),
             ))
@@ -2522,8 +2655,8 @@ mod tests {
             format!("http://{replacement_upstream_addr}")
         );
         assert_eq!(value["data"]["upstream_model"], "gpt-5.4-mini");
+        assert_eq!(value["data"]["protocol"], "claude");
         assert_eq!(value["data"]["priority"], 2);
-        assert_eq!(value["data"]["weight"], 7);
 
         let prefill_request = Request::builder()
             .method("GET")
@@ -2857,7 +2990,8 @@ mod tests {
             .body(Body::from(
                 serde_json::to_vec(&json!({
                     "base_url": "https://provider.example.com/v1",
-                    "api_key": "new-key"
+                    "api_key": "new-key",
+                    "protocol": "responses"
                 }))
                 .unwrap(),
             ))
@@ -2900,6 +3034,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_route_channel_requires_protocol() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("metapi.db");
+        let upstream_addr = spawn_json_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        seed_database(&config.database_url, upstream_addr).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/routes/1/channels")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "base_url": "https://provider.example.com/v1",
+                    "api_key": "new-key"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
     async fn create_route_channel_accepts_base_url_with_v1_suffix_for_proxying() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("metapi.db");
@@ -2930,7 +3098,8 @@ mod tests {
                     "route_model": "gpt-5.4",
                     "base_url": format!("http://{upstream_addr}/v1"),
                     "api_key": "test-key",
-                    "upstream_model": "gpt-5.4"
+                    "upstream_model": "gpt-5.4",
+                    "protocol": "responses"
                 }))
                 .unwrap(),
             ))
@@ -2990,7 +3159,8 @@ mod tests {
                     "route_model": "gpt-5.4",
                     "base_url": format!("http://{upstream_a}/v1"),
                     "api_key": "key-a",
-                    "upstream_model": "gpt-5.4"
+                    "upstream_model": "gpt-5.4",
+                    "protocol": "responses"
                 }))
                 .unwrap(),
             ))
@@ -3016,8 +3186,8 @@ mod tests {
                     "base_url": format!("http://{upstream_b}/v1"),
                     "api_key": "key-b",
                     "upstream_model": "gpt-5-4",
-                    "priority": 1,
-                    "weight": 5
+                    "protocol": "responses",
+                    "priority": 1
                 }))
                 .unwrap(),
             ))
@@ -3031,6 +3201,7 @@ mod tests {
         let second_value: Value = serde_json::from_slice(&second_body).unwrap();
         assert_eq!(second_value["data"]["route_created"], false);
         assert_eq!(second_value["data"]["route"]["id"], route_id);
+        assert_eq!(second_value["data"]["channel"]["protocol"], "responses");
         assert_eq!(second_value["data"]["channel"]["upstream_model"], "gpt-5-4");
 
         let routes_request = Request::builder()
@@ -3101,7 +3272,8 @@ mod tests {
                     "route_model": "gpt-5.4",
                     "base_url": format!("http://{upstream_addr}/v1"),
                     "api_key": "test-key",
-                    "upstream_model": "gpt-5.4"
+                    "upstream_model": "gpt-5.4",
+                    "protocol": "responses"
                 }))
                 .unwrap(),
             ))
@@ -3130,6 +3302,68 @@ mod tests {
             .unwrap();
         let routes_value: Value = serde_json::from_slice(&routes_body).unwrap();
         assert_eq!(routes_value["data"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn claude_protocol_proxies_messages_with_anthropic_headers() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("metapi.db");
+        let upstream_addr = spawn_claude_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let create_request = Request::builder()
+            .method("POST")
+            .uri("/api/routes")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "route_model": "claude-4-sonnet",
+                    "base_url": format!("http://{upstream_addr}/v1"),
+                    "api_key": "test-key",
+                    "upstream_model": "claude-sonnet-4",
+                    "protocol": "claude"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let create_response = app.clone().oneshot(create_request).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+
+        let proxy_request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "claude-4-sonnet",
+                    "messages": [{ "role": "user", "content": "ping" }],
+                    "max_tokens": 8
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let proxy_response = app.oneshot(proxy_request).await.unwrap();
+        assert_eq!(proxy_response.status(), StatusCode::OK);
+        let proxy_body = to_bytes(proxy_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let proxy_value: Value = serde_json::from_slice(&proxy_body).unwrap();
+        assert_eq!(proxy_value["type"], "message");
+        assert_eq!(
+            proxy_value["content"][0]["text"],
+            "hello from claude upstream"
+        );
     }
 
     #[tokio::test]

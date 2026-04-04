@@ -6,8 +6,8 @@ usage() {
 Usage: install-tui.sh [options]
 
 Options:
-  --repo owner/repo         GitHub repository, required unless --asset-url is set
-  --tag v0.1.0              Release tag, defaults to latest
+  --repo owner/repo         GitHub repository, default nodca/routellm unless --asset-url is set
+  --tag v0.2.0              Release tag, defaults to latest
   --asset-url URL           Direct asset URL override
   --bin-dir DIR             Binary install directory, default ~/.local/bin
   --config-dir DIR          Config directory, default ~/.config/metapi
@@ -54,11 +54,6 @@ download_url() {
     return
   fi
 
-  if [[ -z "$REPO" ]]; then
-    echo "--repo is required unless --asset-url is provided" >&2
-    exit 1
-  fi
-
   if [[ "$TAG" == "latest" ]]; then
     echo "https://github.com/${REPO}/releases/latest/download/${asset}"
   else
@@ -66,7 +61,7 @@ download_url() {
   fi
 }
 
-REPO="${METAPI_REPO:-}"
+REPO="${METAPI_REPO:-nodca/routellm}"
 TAG="${METAPI_TAG:-latest}"
 ASSET_URL="${METAPI_ASSET_URL:-}"
 BIN_DIR="${METAPI_TUI_BIN_DIR:-${HOME}/.local/bin}"

@@ -31,8 +31,8 @@ pub async fn sync_config(
                     &channel.base_url,
                     &channel.api_key,
                     &channel.upstream_model,
+                    &channel.protocol,
                     channel.priority,
-                    channel.weight,
                     channel.enabled,
                 )
                 .await?;
@@ -86,8 +86,8 @@ mod tests {
                     base_url: "https://api.example.com/v1".to_string(),
                     api_key: "sk-1".to_string(),
                     upstream_model: "gpt-5.4".to_string(),
+                    protocol: "responses".to_string(),
                     priority: 0,
-                    weight: 10,
                     enabled: true,
                 }],
             }],
@@ -106,8 +106,8 @@ mod tests {
                     base_url: "https://api.example.com".to_string(),
                     api_key: "sk-1".to_string(),
                     upstream_model: "gpt-5.4".to_string(),
+                    protocol: "claude".to_string(),
                     priority: 2,
-                    weight: 5,
                     enabled: false,
                 }],
             }],
@@ -122,7 +122,7 @@ mod tests {
 
         let channel = store.load_channel(1).await.unwrap();
         assert_eq!(channel.priority, 2);
-        assert_eq!(channel.weight, 5);
+        assert_eq!(channel.protocol, "claude");
         assert_eq!(channel.enabled, 0);
     }
 }

@@ -65,8 +65,8 @@ pub struct ConfiguredChannel {
     pub base_url: String,
     pub api_key: String,
     pub upstream_model: String,
+    pub protocol: String,
     pub priority: i64,
-    pub weight: i64,
     pub enabled: bool,
 }
 
@@ -128,8 +128,8 @@ struct RawChannelConfig {
     base_url: String,
     api_key: String,
     upstream_model: String,
+    protocol: String,
     priority: Option<i64>,
-    weight: Option<i64>,
     enabled: Option<bool>,
 }
 
@@ -310,11 +310,11 @@ fn parse_config_file(raw: &str) -> Result<LoadedConfigFile, AppError> {
                     channel.upstream_model,
                     &format!("{prefix}.upstream_model"),
                 )?,
+                protocol: normalize_protocol(&channel.protocol, &format!("{prefix}.protocol"))?,
                 priority: validate_priority(
                     channel.priority.unwrap_or(0),
                     &format!("{prefix}.priority"),
                 )?,
-                weight: validate_weight(channel.weight.unwrap_or(10), &format!("{prefix}.weight"))?,
                 enabled: channel.enabled.unwrap_or(true),
             });
         }
@@ -427,11 +427,14 @@ fn validate_priority(value: i64, field: &str) -> Result<i64, AppError> {
     Ok(value)
 }
 
-fn validate_weight(value: i64, field: &str) -> Result<i64, AppError> {
-    if value <= 0 {
-        return Err(AppError::Config(format!("{field} must be > 0")));
+fn normalize_protocol(value: &str, field: &str) -> Result<String, AppError> {
+    match value.trim() {
+        "responses" | "chat_completions" => Ok(value.trim().to_string()),
+        "claude" | "messages" => Ok("claude".to_string()),
+        _ => Err(AppError::Config(format!(
+            "{field} must be one of responses, chat_completions, claude"
+        ))),
     }
-    Ok(value)
 }
 
 #[cfg(test)]
@@ -456,6 +459,7 @@ mod tests {
             base_url = "https://api.example.com/v1"
             api_key = "sk-1"
             upstream_model = "gpt-5-4"
+            protocol = "responses"
             "#,
         )
         .unwrap();
@@ -468,12 +472,12 @@ mod tests {
         assert_eq!(parsed.bootstrap.default_cooldown_seconds, 450);
         assert_eq!(parsed.bootstrap.routes.len(), 1);
         assert_eq!(parsed.bootstrap.routes[0].cooldown_seconds, 450);
-        assert_eq!(parsed.bootstrap.routes[0].channels[0].weight, 10);
+        assert_eq!(parsed.bootstrap.routes[0].channels[0].protocol, "responses");
         assert!(parsed.bootstrap.routes[0].channels[0].enabled);
     }
 
     #[test]
-    fn parse_config_file_rejects_invalid_channel_weight() {
+    fn parse_config_file_requires_channel_protocol() {
         let error = parse_config_file(
             r#"
             [[routes]]
@@ -483,12 +487,30 @@ mod tests {
             base_url = "https://api.example.com"
             api_key = "sk-1"
             upstream_model = "gpt-5.4"
-            weight = 0
             "#,
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("weight must be > 0"));
+        assert!(error.to_string().contains("missing field `protocol`"));
+    }
+
+    #[test]
+    fn parse_config_file_rejects_invalid_channel_protocol() {
+        let error = parse_config_file(
+            r#"
+            [[routes]]
+            model = "gpt-5.4"
+
+            [[routes.channels]]
+            base_url = "https://api.example.com"
+            api_key = "sk-1"
+            upstream_model = "gpt-5.4"
+            protocol = "invalid"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("protocol must be one of"));
     }
 
     #[test]
@@ -502,6 +524,7 @@ mod tests {
             base_url = "https://api.example.com"
             api_key = "sk-1"
             upstream_model = "gpt-5.4"
+            protocol = "responses"
             "#,
         )
         .unwrap();
@@ -528,6 +551,7 @@ mod tests {
             base_url = "https://api.example.com"
             api_key = "sk-1"
             upstream_model = "gpt-5.4"
+            protocol = "responses"
             "#,
         )
         .unwrap();
@@ -553,6 +577,7 @@ mod tests {
             base_url = "https://api.example.com"
             api_key = "sk-1"
             upstream_model = "gpt-5.4"
+            protocol = "responses"
             "#,
         )
         .unwrap();
@@ -576,6 +601,7 @@ mod tests {
             base_url = "https://api.example.com"
             api_key = "sk-1"
             upstream_model = "gpt-5.4"
+            protocol = "responses"
             "#,
         )
         .unwrap_err();

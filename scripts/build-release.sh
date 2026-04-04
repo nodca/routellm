@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/build-release.sh [--tag v0.1.0] [--output-dir dist]
+Usage: scripts/build-release.sh [--tag v0.2.0] [--output-dir dist]
 
 Build release binaries for the current host and package them into a GitHub Releases asset.
 EOF

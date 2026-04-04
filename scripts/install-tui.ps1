@@ -1,5 +1,5 @@
 param(
-    [string]$Repo = $env:METAPI_REPO,
+    [string]$Repo = $(if ($env:METAPI_REPO) { $env:METAPI_REPO } else { "nodca/routellm" }),
     [string]$Tag = $(if ($env:METAPI_TAG) { $env:METAPI_TAG } else { "latest" }),
     [string]$AssetUrl = $env:METAPI_ASSET_URL,
     [string]$InstallDir = $(if ($env:METAPI_TUI_INSTALL_DIR) { $env:METAPI_TUI_INSTALL_DIR } else { (Join-Path $env:LOCALAPPDATA "metapi") }),
@@ -20,9 +20,6 @@ function Get-ArchName {
 
 function Get-DownloadUrl([string]$AssetName) {
     if ($AssetUrl) { return $AssetUrl }
-    if (-not $Repo) {
-        throw "--Repo is required unless --AssetUrl is provided"
-    }
     if ($Tag -eq "latest") {
         return "https://github.com/$Repo/releases/latest/download/$AssetName"
     }

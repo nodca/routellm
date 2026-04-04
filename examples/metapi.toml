@@ -28,16 +28,16 @@ cooldown_seconds = 300
 base_url = "https://api.example.com/v1"
 api_key = "sk-example-primary"
 upstream_model = "gpt-5.4"
+protocol = "responses"
 priority = 0
-weight = 10
 enabled = true
 
 [[routes.channels]]
 base_url = "https://api-backup.example.com/v1"
 api_key = "sk-example-backup"
 upstream_model = "gpt-5-4"
+protocol = "chat_completions"
 priority = 1
-weight = 5
 enabled = true
 
 [[routes]]
@@ -47,6 +47,6 @@ model = "gpt-4.1"
 base_url = "https://api.example.com/v1"
 api_key = "sk-example-primary"
 upstream_model = "gpt-4.1"
+protocol = "responses"
 priority = 0
-weight = 10
 enabled = true

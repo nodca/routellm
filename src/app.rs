@@ -91,7 +91,8 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/chat/completions",
             axum::routing::post(http::create_chat_completion),
-        );
+        )
+        .route("/messages", axum::routing::post(http::create_message));
 
     Router::new()
         .route("/healthz", axum::routing::get(http::healthz))

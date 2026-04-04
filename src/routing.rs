@@ -1,8 +1,7 @@
-use rand::{Rng, distributions::WeightedIndex, prelude::Distribution};
-
 use crate::{
     domain::{CandidateView, ChannelRow, ModelRouteRow, RouteDecisionView},
     error::AppError,
+    protocol::{Protocol, compatibility_cost},
 };
 
 #[derive(Debug, Clone)]
@@ -10,6 +9,7 @@ pub struct CandidateEvaluation {
     pub channel: ChannelRow,
     pub eligible: bool,
     pub reason: String,
+    pub protocol_cost: Option<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -22,15 +22,13 @@ pub fn decide_route(
     requested_model: &str,
     _route: &ModelRouteRow,
     channels: Vec<ChannelRow>,
+    request_protocol: Protocol,
     now_ts: i64,
 ) -> Result<RouteDecision, AppError> {
-    let candidates = inspect_candidates(channels, now_ts);
-    let mut rng = rand::thread_rng();
-    let selected = choose_candidate_with_rng(&candidates, &mut rng)
-        .cloned()
-        .ok_or_else(|| {
-            AppError::NoRoute(format!("no eligible channel for model: {requested_model}"))
-        })?;
+    let candidates = inspect_candidates(channels, Some(request_protocol), now_ts);
+    let selected = choose_candidate(&candidates).cloned().ok_or_else(|| {
+        AppError::NoRoute(format!("no eligible channel for model: {requested_model}"))
+    })?;
 
     Ok(RouteDecision {
         selected,
@@ -38,20 +36,27 @@ pub fn decide_route(
     })
 }
 
-pub fn inspect_candidates(channels: Vec<ChannelRow>, now_ts: i64) -> Vec<CandidateEvaluation> {
+pub fn inspect_candidates(
+    channels: Vec<ChannelRow>,
+    request_protocol: Option<Protocol>,
+    now_ts: i64,
+) -> Vec<CandidateEvaluation> {
     channels
         .into_iter()
         .map(|channel| {
-            let (eligible, reason) = if channel.enabled == 0 {
-                (false, "channel disabled".to_string())
+            let parsed_protocol = Protocol::parse(&channel.protocol);
+            let (eligible, reason, protocol_cost) = if channel.enabled == 0 {
+                (false, "channel disabled".to_string(), None)
             } else if channel.account_status != "active" {
-                (false, format!("account status={}", channel.account_status))
+                (
+                    false,
+                    format!("account status={}", channel.account_status),
+                    None,
+                )
             } else if channel.site_status != "active" {
-                (false, format!("site status={}", channel.site_status))
-            } else if channel.supports_responses == 0 {
-                (false, "responses not supported".to_string())
+                (false, format!("site status={}", channel.site_status), None)
             } else if channel.manual_blocked != 0 {
-                (false, "manual intervention required".to_string())
+                (false, "manual intervention required".to_string(), None)
             } else if channel.cooldown_until.is_some_and(|until| until > now_ts) {
                 (
                     false,
@@ -59,43 +64,73 @@ pub fn inspect_candidates(channels: Vec<ChannelRow>, now_ts: i64) -> Vec<Candida
                         "cooling down until {}",
                         channel.cooldown_until.unwrap_or_default()
                     ),
+                    None,
                 )
+            } else if let Ok(channel_protocol) = parsed_protocol {
+                match request_protocol {
+                    Some(request_protocol) => {
+                        match compatibility_cost(channel_protocol, request_protocol) {
+                            Some(cost) => (
+                                true,
+                                if cost == 0 {
+                                    "eligible".to_string()
+                                } else {
+                                    "eligible via chat->responses adapter".to_string()
+                                },
+                                Some(cost),
+                            ),
+                            None => (
+                                false,
+                                format!(
+                                    "protocol mismatch: request={} channel={}",
+                                    request_protocol.as_str(),
+                                    channel_protocol.as_str()
+                                ),
+                                None,
+                            ),
+                        }
+                    }
+                    None => (true, "eligible".to_string(), Some(0)),
+                }
             } else {
-                (true, "eligible".to_string())
+                (
+                    false,
+                    format!("invalid channel protocol `{}`", channel.protocol),
+                    None,
+                )
             };
 
             CandidateEvaluation {
                 channel,
                 eligible,
                 reason,
+                protocol_cost,
             }
         })
         .collect()
 }
 
-fn choose_candidate_with_rng<'a, R: Rng + ?Sized>(
-    candidates: &'a [CandidateEvaluation],
-    rng: &mut R,
-) -> Option<&'a ChannelRow> {
+fn choose_candidate(candidates: &[CandidateEvaluation]) -> Option<&ChannelRow> {
     let best_priority = candidates
         .iter()
         .filter(|candidate| candidate.eligible)
         .map(|candidate| candidate.channel.priority)
         .min()?;
-
-    let pool: Vec<&CandidateEvaluation> = candidates
+    let best_protocol_cost = candidates
         .iter()
-        .filter(|candidate| candidate.eligible && candidate.channel.priority == best_priority)
-        .collect();
+        .filter(|candidate| candidate.eligible)
+        .filter(|candidate| candidate.channel.priority == best_priority)
+        .filter_map(|candidate| candidate.protocol_cost)
+        .min()?;
 
-    let weights: Vec<u64> = pool
+    candidates
         .iter()
-        .map(|candidate| candidate.channel.weight.max(1) as u64)
-        .collect();
-
-    let distribution = WeightedIndex::new(&weights).ok()?;
-    let selected_index = distribution.sample(rng);
-    Some(&pool[selected_index].channel)
+        .find(|candidate| {
+            candidate.eligible
+                && candidate.channel.priority == best_priority
+                && candidate.protocol_cost == Some(best_protocol_cost)
+        })
+        .map(|candidate| &candidate.channel)
 }
 
 pub fn to_decision_view(
@@ -123,8 +158,8 @@ pub fn to_decision_view(
                 account_id: candidate.channel.account_id,
                 site_name: candidate.channel.site_name.clone(),
                 label: candidate.channel.channel_label.clone(),
+                protocol: candidate.channel.protocol.clone(),
                 priority: candidate.channel.priority,
-                weight: candidate.channel.weight,
                 eligible: candidate.eligible,
                 reason: candidate.reason.clone(),
             })
@@ -134,12 +169,11 @@ pub fn to_decision_view(
 
 #[cfg(test)]
 mod tests {
-    use rand::{SeedableRng, rngs::StdRng};
-
-    use super::{choose_candidate_with_rng, inspect_candidates};
+    use super::{choose_candidate, inspect_candidates};
     use crate::domain::ChannelRow;
+    use crate::protocol::Protocol;
 
-    fn channel(id: i64, priority: i64, weight: i64, cooldown_until: Option<i64>) -> ChannelRow {
+    fn channel(id: i64, priority: i64, protocol: &str, cooldown_until: Option<i64>) -> ChannelRow {
         ChannelRow {
             channel_id: id,
             route_id: 1,
@@ -152,10 +186,9 @@ mod tests {
             site_status: "active".to_string(),
             channel_label: "default".to_string(),
             upstream_model: "gpt-5.4".to_string(),
-            supports_responses: 1,
+            protocol: protocol.to_string(),
             enabled: 1,
             priority,
-            weight,
             cooldown_until,
             manual_blocked: 0,
             consecutive_fail_count: 0,
@@ -167,7 +200,11 @@ mod tests {
     #[test]
     fn cooled_down_channels_are_filtered_out() {
         let candidates = inspect_candidates(
-            vec![channel(1, 0, 10, Some(200)), channel(2, 0, 10, None)],
+            vec![
+                channel(1, 0, "responses", Some(200)),
+                channel(2, 0, "responses", None),
+            ],
+            Some(Protocol::Responses),
             100,
         );
         let eligible: Vec<i64> = candidates
@@ -179,11 +216,37 @@ mod tests {
     }
 
     #[test]
-    fn selector_prefers_lower_priority_group() {
-        let candidates =
-            inspect_candidates(vec![channel(1, 0, 10, None), channel(2, 1, 999, None)], 100);
-        let mut rng = StdRng::seed_from_u64(7);
-        let selected = choose_candidate_with_rng(&candidates, &mut rng).unwrap();
+    fn selector_prefers_priority_before_protocol_cost() {
+        let candidates = inspect_candidates(
+            vec![
+                channel(1, 0, "responses", None),
+                channel(2, 1, "chat_completions", None),
+            ],
+            Some(Protocol::ChatCompletions),
+            100,
+        );
+        let selected = choose_candidate(&candidates).unwrap();
         assert_eq!(selected.channel_id, 1);
+    }
+
+    #[test]
+    fn selector_prefers_lower_priority_within_same_protocol_group() {
+        let candidates = inspect_candidates(
+            vec![
+                channel(1, 0, "responses", None),
+                channel(2, 1, "responses", None),
+            ],
+            Some(Protocol::Responses),
+            100,
+        );
+        let selected = choose_candidate(&candidates).unwrap();
+        assert_eq!(selected.channel_id, 1);
+    }
+
+    #[test]
+    fn admin_inspection_ignores_protocol_mismatch() {
+        let candidates = inspect_candidates(vec![channel(1, 0, "claude", None)], None, 100);
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].eligible);
     }
 }

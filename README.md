@@ -2,7 +2,7 @@
 
 一个从头收敛复杂度的 Rust 轻量 LLM 路由与管理工具。
 
-`v0.1` 的产品边界很明确：
+`v0.2.0` 的产品边界很明确：
 
 - 单二进制
 - 轻量化
@@ -15,7 +15,9 @@
 
 - 接收 OpenAI 兼容的 `POST /v1/responses`
 - 接收 OpenAI 兼容的 `POST /v1/chat/completions`
-- 把请求统一转发到上游 `/v1/responses`
+- 接收 Claude 兼容的 `POST /v1/messages`
+- 每个 channel 显式绑定 `responses / chat_completions / claude` 三种协议之一
+- 下游请求会按自身协议参与选路，优先走同协议直连 channel
 - 支持 `stream=true` 的流式 `responses`
 - 支持 `chat/completions` 到 `responses` 的兼容转换
 - 支持 `chat/completions` 的 `tools / tool_calls`
@@ -27,13 +29,13 @@
 - 支持按错误类型配置不同冷却秒数
 - 支持按错误类型要求人工处理并阻断 channel
 
-## v0.1 适合什么
+## v0.2.0 适合什么
 
 - 你手上有多个上游中转站，想统一成一个稳定下游模型名
 - 你想要一个小服务，配一个 sqlite 文件就能跑
 - 你希望在 SSH 里直接看 route、channel、冷却、最近日志
 
-## v0.1 不做什么
+## v0.2.0 不做什么
 
 - 不做重型 Web 后台
 - 不做桌面 GUI
@@ -104,12 +106,14 @@ DESIGN.md
    - `channel.enabled = false`
    - `account.status != active`
    - `site.status != active`
-   - `supports_responses = false`
    - `manual_blocked = true`
    - `cooldown_until > now`
-3. 只在最低 `priority` 的可用组里按 `weight` 加权随机
-4. 成功后清冷却
-5. 失败后按错误类型写 `cooldown_until = now + cooldown_seconds`，或者直接标记 `manual_blocked = true`
+3. 只在最低 `priority` 的可用组里继续选路
+4. 在同一个 `priority` 组内，优先选择和下游请求协议完全一致的 channel
+5. 如果该 `priority` 组内没有完全一致的 channel，才会使用允许的有限转换
+6. 当前只支持一种有限转换：`chat/completions -> responses`
+7. 成功后清冷却
+8. 失败后按错误类型写 `cooldown_until = now + cooldown_seconds`，或者直接标记 `manual_blocked = true`
 
 ## 快速开始
 
@@ -144,7 +148,7 @@ cargo build --release --bin metapi-rs --bin metapi-tui
 
 ```bash
 cd /home/wcn/metapi-rs
-./scripts/build-release.sh --tag v0.1.0
+./scripts/build-release.sh --tag v0.2.0
 ```
 
 这会生成：
@@ -163,7 +167,7 @@ Windows 打包：
 
 ```powershell
 cd C:\path\to\metapi-rs
-powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1 -Tag v0.1.0
+powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1 -Tag v0.2.0
 ```
 
 这会生成：
@@ -178,8 +182,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1 -Tag v0.1.0
 服务端安装：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/scripts/install-server.sh | \
-  bash -s -- --repo <owner>/<repo> --tag v0.1.0
+curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh | \
+  bash -s -- --repo nodca/routellm --tag v0.2.0
 ```
 
 这会：
@@ -192,10 +196,10 @@ curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/scripts/install
 常用参数：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/scripts/install-server.sh | \
+curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh | \
   bash -s -- \
-  --repo <owner>/<repo> \
-  --tag v0.1.0 \
+  --repo nodca/routellm \
+  --tag v0.2.0 \
   --bind 0.0.0.0:8080 \
   --master-key sk-metapi-your-key
 ```
@@ -203,10 +207,10 @@ curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/scripts/install
 TUI 安装：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/scripts/install-tui.sh | \
+curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.sh | \
   bash -s -- \
-  --repo <owner>/<repo> \
-  --tag v0.1.0 \
+  --repo nodca/routellm \
+  --tag v0.2.0 \
   --server http://127.0.0.1:8080 \
   --auth-key sk-metapi-your-key
 ```
@@ -214,22 +218,22 @@ curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/scripts/install
 如果你不想直接 `curl | bash`，也可以先下载脚本再执行：
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/<owner>/<repo>/main/scripts/install-server.sh
-bash install-server.sh --repo <owner>/<repo> --tag v0.1.0
+curl -fsSLO https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh
+bash install-server.sh --repo nodca/routellm --tag v0.2.0
 ```
 
 Windows 服务端安装：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/<owner>/<repo>/main/scripts/install-server.ps1 -OutFile install-server.ps1"
-powershell -ExecutionPolicy Bypass -File .\install-server.ps1 -Repo <owner>/<repo> -Tag v0.1.0
+powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.ps1 -OutFile install-server.ps1"
+powershell -ExecutionPolicy Bypass -File .\install-server.ps1 -Repo nodca/routellm -Tag v0.2.0
 ```
 
 Windows TUI 安装：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/<owner>/<repo>/main/scripts/install-tui.ps1 -OutFile install-tui.ps1"
-powershell -ExecutionPolicy Bypass -File .\install-tui.ps1 -Repo <owner>/<repo> -Tag v0.1.0 -Server http://127.0.0.1:8080 -AuthKey sk-metapi-your-key
+powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.ps1 -OutFile install-tui.ps1"
+powershell -ExecutionPolicy Bypass -File .\install-tui.ps1 -Repo nodca/routellm -Tag v0.2.0 -Server http://127.0.0.1:8080 -AuthKey sk-metapi-your-key
 ```
 
 说明：
@@ -410,7 +414,7 @@ METAPI_BASE_URL=http://127.0.0.1:8080 cargo run --bin metapi-tui
 - `K` 复制当前配置的下游 `API Key`
 - `r` 刷新
 - `a` 在 routes 面板新建 route + 首个 channel，在 channels / logs 面板为当前 route 新增 channel
-- `i` 编辑当前 channel 的 `base_url / api_key / upstream_model / priority / weight`
+- `i` 编辑当前 channel 的 `base_url / api_key / upstream_model / protocol / priority`
 - `x` 在 routes 面板删除空 route，在 channels 面板删除当前 channel，都会先确认
 - `Space` 一键切换当前 channel 状态
 - `e` 启用当前 channel，会先确认
@@ -465,8 +469,8 @@ model = "gpt-5.4"
 base_url = "https://api.example.com/v1"
 api_key = "sk-xxx"
 upstream_model = "gpt-5.4"
+protocol = "responses"
 priority = 0
-weight = 10
 enabled = true
 ```
 
@@ -481,7 +485,8 @@ METAPI_CONFIG_PATH=./examples/metapi.toml cargo run
 - `route.model` 作为 route 唯一键
 - `channel` 用 `route + account(base_url+api_key) + upstream_model` 识别
 - 配置里有、数据库里没有：创建
-- 配置里有、数据库里已有：更新 `cooldown_seconds`、`priority`、`weight`、`enabled`
+- `channel.protocol` 必填，只能是 `responses`、`chat_completions`、`claude`
+- 配置里有、数据库里已有：更新 `cooldown_seconds`、`protocol`、`priority`、`enabled`
 - 配置里没有、数据库里已有：当前版本不删除
 - 运行时冷却状态、失败计数、最近错误、请求日志都会保留
 
@@ -529,6 +534,7 @@ unknown_error = 300
 - `POST /api/channels/:id/reset-cooldown`
 - `POST /v1/responses`
 - `POST /v1/chat/completions`
+- `POST /v1/messages`
 
 ## 最小管理 API
 
@@ -543,8 +549,9 @@ unknown_error = 300
   - 如果 `route_model` 不存在就创建 route
   - 如果已存在就直接把新的 channel 加到该 route
   - 每个 channel 可以设置自己的 `upstream_model`
+  - `protocol` 必填，只能是 `responses` / `chat_completions` / `claude`
   - `base_url` 可以填写站点根地址，也可以直接填写带 `/v1` 的兼容地址
-  - 保存前会先做一次真实 `/v1/responses` 探测
+  - 保存前会按该 channel 的 `protocol` 做一次真实探测，失败不会保存
 - `GET /api/routes/:id/channels`
   - 列出该路由下全部渠道
   - 直接返回 `state`
@@ -564,13 +571,14 @@ unknown_error = 300
 - `POST /api/routes/:id/channels`
   - 向指定 route 新增 channel
   - 接收 `base_url` 和 `api_key`
-  - 可选传入 `upstream_model` / `priority` / `weight`
+  - 可选传入 `upstream_model` / `priority`
+  - `protocol` 必填，只能是 `responses` / `chat_completions` / `claude`
   - `base_url` 若带 `/v1` 会自动归一化
 - `GET /api/channels/:id/prefill`
   - 返回单个 channel 的 `base_url` / `api_key` / `upstream_model`
   - 只给 TUI 的“沿用当前 channel 新增 sibling channel”预填使用
 - `PATCH /api/channels/:id`
-  - 编辑单个 channel 的 `base_url` / `api_key` / `upstream_model` / `priority` / `weight`
+  - 编辑单个 channel 的 `base_url` / `api_key` / `upstream_model` / `protocol` / `priority`
   - 如果改了 `base_url` 或 `api_key`，会把 channel 重新绑定到对应账号，并清理无引用的旧账号 / 旧站点
 - `DELETE /api/channels/:id`
   - 直接删除单个 channel

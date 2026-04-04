@@ -68,8 +68,8 @@ struct ChannelSummary {
     channel_label: String,
     site_status: String,
     upstream_model: String,
+    protocol: String,
     priority: i64,
-    weight: i64,
     manual_blocked: bool,
     cooldown_remaining_seconds: Option<i64>,
     consecutive_fail_count: i64,
@@ -256,8 +256,8 @@ enum OnboardRouteField {
     BaseUrl,
     ApiKey,
     UpstreamModel,
+    Protocol,
     Priority,
-    Weight,
 }
 
 impl OnboardRouteField {
@@ -267,8 +267,8 @@ impl OnboardRouteField {
             Self::BaseUrl,
             Self::ApiKey,
             Self::UpstreamModel,
+            Self::Protocol,
             Self::Priority,
-            Self::Weight,
         ]
     }
 
@@ -278,8 +278,8 @@ impl OnboardRouteField {
             Self::BaseUrl => "Base URL",
             Self::ApiKey => "API Key",
             Self::UpstreamModel => "Upstream Model",
+            Self::Protocol => "Protocol",
             Self::Priority => "Priority",
-            Self::Weight => "Weight",
         }
     }
 
@@ -289,13 +289,16 @@ impl OnboardRouteField {
             Self::BaseUrl => "上游站点根地址。可直接填带 /v1 的兼容地址。",
             Self::ApiKey => "上游 Bearer Key。界面里会掩码显示，提交时原值会发送。",
             Self::UpstreamModel => "可留空时默认跟 route model 一样，用于适配上游不同模型名。",
+            Self::Protocol => "上游协议：responses / chat_completions / claude。",
             Self::Priority => "越小越优先。只会在最低 priority 可用组内选路。",
-            Self::Weight => "同一 priority 组内的加权随机权重，默认 10。",
         }
     }
 
     fn required(self) -> bool {
-        matches!(self, Self::RouteModel | Self::BaseUrl | Self::ApiKey)
+        matches!(
+            self,
+            Self::RouteModel | Self::BaseUrl | Self::ApiKey | Self::Protocol
+        )
     }
 
     fn placeholder(self) -> &'static str {
@@ -304,8 +307,8 @@ impl OnboardRouteField {
             Self::BaseUrl => "例如: https://api.example.com/v1",
             Self::ApiKey => "例如: sk-...",
             Self::UpstreamModel => "留空则使用 route model",
+            Self::Protocol => "填写: responses / chat_completions / claude",
             Self::Priority => "默认 0",
-            Self::Weight => "默认 10",
         }
     }
 }
@@ -351,8 +354,8 @@ struct OnboardRouteRequest {
     base_url: String,
     api_key: String,
     upstream_model: Option<String>,
+    protocol: String,
     priority: Option<i64>,
-    weight: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,8 +365,8 @@ struct OnboardRouteForm {
     base_url: String,
     api_key: String,
     upstream_model: String,
+    protocol: String,
     priority: String,
-    weight: String,
     active_field: OnboardRouteField,
 }
 
@@ -375,8 +378,8 @@ impl OnboardRouteForm {
             base_url: String::new(),
             api_key: String::new(),
             upstream_model: String::new(),
+            protocol: String::new(),
             priority: "0".to_string(),
-            weight: "10".to_string(),
             active_field: OnboardRouteField::RouteModel,
         }
     }
@@ -394,8 +397,8 @@ impl OnboardRouteForm {
             upstream_model: prefill
                 .map(|value| value.upstream_model.clone())
                 .unwrap_or_else(|| route.model_pattern.clone()),
+            protocol: String::new(),
             priority: "0".to_string(),
-            weight: "10".to_string(),
             active_field: OnboardRouteField::BaseUrl,
         }
     }
@@ -436,16 +439,16 @@ impl OnboardRouteForm {
         }
 
         let priority = parse_optional_i64(&self.priority, "priority")?;
-        let weight = parse_optional_i64(&self.weight, "weight")?;
         let upstream_model = self.upstream_model.trim();
+        let protocol = normalize_protocol_input(&self.protocol)?;
 
         Ok(OnboardRouteRequest {
             route_model,
             base_url,
             api_key,
             upstream_model: (!upstream_model.is_empty()).then(|| upstream_model.to_string()),
+            protocol,
             priority,
-            weight,
         })
     }
 
@@ -460,8 +463,8 @@ impl OnboardRouteForm {
                         base_url: request.base_url,
                         api_key: request.api_key,
                         upstream_model: request.upstream_model,
+                        protocol: request.protocol,
                         priority: request.priority,
-                        weight: request.weight,
                     },
                 })
             }
@@ -490,8 +493,8 @@ impl TextEditableForm for OnboardRouteForm {
             OnboardRouteField::BaseUrl => &mut self.base_url,
             OnboardRouteField::ApiKey => &mut self.api_key,
             OnboardRouteField::UpstreamModel => &mut self.upstream_model,
+            OnboardRouteField::Protocol => &mut self.protocol,
             OnboardRouteField::Priority => &mut self.priority,
-            OnboardRouteField::Weight => &mut self.weight,
         }
     }
 }
@@ -516,8 +519,8 @@ struct CreateRouteChannelRequest {
     base_url: String,
     api_key: String,
     upstream_model: Option<String>,
+    protocol: String,
     priority: Option<i64>,
-    weight: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -525,8 +528,8 @@ struct UpdateChannelRequest {
     base_url: String,
     api_key: String,
     upstream_model: String,
+    protocol: String,
     priority: i64,
-    weight: i64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -550,8 +553,8 @@ enum EditChannelField {
     BaseUrl,
     ApiKey,
     UpstreamModel,
+    Protocol,
     Priority,
-    Weight,
 }
 
 impl EditChannelField {
@@ -560,8 +563,8 @@ impl EditChannelField {
             Self::BaseUrl,
             Self::ApiKey,
             Self::UpstreamModel,
+            Self::Protocol,
             Self::Priority,
-            Self::Weight,
         ]
     }
 
@@ -570,8 +573,8 @@ impl EditChannelField {
             Self::BaseUrl => "Base URL",
             Self::ApiKey => "API Key",
             Self::UpstreamModel => "Upstream Model",
+            Self::Protocol => "Protocol",
             Self::Priority => "Priority",
-            Self::Weight => "Weight",
         }
     }
 
@@ -580,8 +583,8 @@ impl EditChannelField {
             Self::BaseUrl => "上游站点根地址。可直接填带 /v1 的兼容地址。",
             Self::ApiKey => "上游 Bearer Key。界面里会掩码显示，提交时原值会发送。",
             Self::UpstreamModel => "真实发给上游的模型名。",
+            Self::Protocol => "上游协议：responses / chat_completions / claude。",
             Self::Priority => "越小越优先，必须 >= 0。",
-            Self::Weight => "同优先级组里的权重，必须 > 0。",
         }
     }
 }
@@ -595,8 +598,8 @@ struct EditChannelForm {
     base_url: String,
     api_key: String,
     upstream_model: String,
+    protocol: String,
     priority: String,
-    weight: String,
     active_field: EditChannelField,
 }
 
@@ -610,8 +613,8 @@ impl EditChannelForm {
             base_url: prefill.base_url,
             api_key: prefill.api_key,
             upstream_model: channel.upstream_model.clone(),
+            protocol: channel.protocol.clone(),
             priority: channel.priority.to_string(),
-            weight: channel.weight.to_string(),
             active_field: EditChannelField::BaseUrl,
         }
     }
@@ -631,23 +634,19 @@ impl EditChannelForm {
         if upstream_model.is_empty() {
             return Err("upstream_model is required".to_string());
         }
+        let protocol = normalize_protocol_input(&self.protocol)?;
 
         let priority = parse_required_i64(&self.priority, "priority")?;
         if priority < 0 {
             return Err("priority must be >= 0".to_string());
         }
 
-        let weight = parse_required_i64(&self.weight, "weight")?;
-        if weight <= 0 {
-            return Err("weight must be > 0".to_string());
-        }
-
         Ok(UpdateChannelRequest {
             base_url,
             api_key,
             upstream_model,
+            protocol,
             priority,
-            weight,
         })
     }
 }
@@ -672,8 +671,8 @@ impl TextEditableForm for EditChannelForm {
             EditChannelField::BaseUrl => &mut self.base_url,
             EditChannelField::ApiKey => &mut self.api_key,
             EditChannelField::UpstreamModel => &mut self.upstream_model,
+            EditChannelField::Protocol => &mut self.protocol,
             EditChannelField::Priority => &mut self.priority,
-            EditChannelField::Weight => &mut self.weight,
         }
     }
 }
@@ -1918,8 +1917,8 @@ fn draw_channels(frame: &mut Frame, area: Rect, app: &App) {
                 .map(short_error_label)
                 .unwrap_or("-");
             let line2 = Line::from(format!(
-                "P{}  W{}  {}",
-                channel.priority, channel.weight, channel.upstream_model
+                "P{}  {}  {}",
+                channel.priority, channel.protocol, channel.upstream_model
             ));
             let line3 = Line::from(if channel.eligible {
                 truncate_text(&channel.site_base_url, 72)
@@ -2123,12 +2122,12 @@ fn route_health_badge(route: &RouteSummary) -> (&'static str, Color) {
         return ("RUN", Color::Green);
     }
     if route.manual_blocked_channel_count > 0 {
-        return ("STOP", Color::Red);
+        return ("UNAVAIL", Color::Red);
     }
     if route.cooling_channel_count > 0 {
         return ("COOL", Color::Yellow);
     }
-    ("STOP", Color::LightRed)
+    ("UNAVAIL", Color::LightRed)
 }
 
 fn route_health_lane(route: &RouteSummary) -> String {
@@ -2167,11 +2166,10 @@ fn channel_state_badge(channel: &ChannelSummary) -> String {
             .cooldown_remaining_seconds
             .map(|seconds| format!("COOL {seconds}s"))
             .unwrap_or_else(|| "COOL".to_string()),
-        "manual_intervention_required" => "STOP".to_string(),
+        "manual_intervention_required" => "UNAVAIL".to_string(),
         "disabled" => "OFF".to_string(),
-        "account_inactive" => "STOP".to_string(),
-        "site_inactive" => "STOP".to_string(),
-        "responses_unsupported" => "STOP".to_string(),
+        "account_inactive" => "UNAVAIL".to_string(),
+        "site_inactive" => "UNAVAIL".to_string(),
         other => other.to_ascii_uppercase(),
     }
 }
@@ -2183,7 +2181,6 @@ fn channel_state_color(channel: &ChannelSummary) -> Color {
         "manual_intervention_required" => Color::Red,
         "disabled" => Color::DarkGray,
         "account_inactive" | "site_inactive" => Color::LightRed,
-        "responses_unsupported" => Color::Magenta,
         _ => Color::Cyan,
     }
 }
@@ -2374,10 +2371,8 @@ fn draw_detail_modal(frame: &mut Frame, dialog: &DetailDialog, app: &App) {
             lines.push(detail_line("State", channel_state_badge(channel)));
             lines.push(detail_line("Why", channel.reason.clone()));
             lines.push(detail_line("Model", channel.upstream_model.clone()));
-            lines.push(detail_line(
-                "Route Weight",
-                format!("P{} / W{}", channel.priority, channel.weight),
-            ));
+            lines.push(detail_line("Protocol", channel.protocol.clone()));
+            lines.push(detail_line("Priority", format!("P{}", channel.priority)));
             lines.push(detail_line(
                 "Site",
                 format!("{}  {}", channel.site_name, channel.site_base_url),
@@ -2531,8 +2526,8 @@ fn draw_add_channel_modal(frame: &mut Frame, form: &OnboardRouteForm) {
             OnboardRouteField::UpstreamModel,
             form.upstream_model.as_str(),
         ),
+        (OnboardRouteField::Protocol, form.protocol.as_str()),
         (OnboardRouteField::Priority, form.priority.as_str()),
-        (OnboardRouteField::Weight, form.weight.as_str()),
     ];
 
     let mut lines = vec![
@@ -2551,7 +2546,7 @@ fn draw_add_channel_modal(frame: &mut Frame, form: &OnboardRouteForm) {
         ]),
         Line::from(vec![
             Span::styled("Probe: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("submit 前会真实请求一次 /v1/responses，失败不会保存。"),
+            Span::raw("submit 前会按 protocol 真实测活一次，失败不会保存。"),
         ]),
         Line::from(""),
     ];
@@ -2604,14 +2599,14 @@ fn draw_add_channel_modal(frame: &mut Frame, form: &OnboardRouteForm) {
     ]));
     lines.push(Line::from(vec![
         Span::styled("Defaults: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("priority=0, weight=10。"),
+        Span::raw("priority=0；protocol 必填，必须是 responses / chat_completions / claude。"),
     ]));
     lines.push(Line::from(vec![
         Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(if submit_ready {
             "required fields look ready"
         } else {
-            "route_model / base_url / api_key are required"
+            "route_model / base_url / api_key / protocol are required"
         }),
     ]));
     lines.push(Line::from(
@@ -2637,8 +2632,8 @@ fn draw_edit_channel_modal(frame: &mut Frame, form: &EditChannelForm) {
             EditChannelField::UpstreamModel,
             form.upstream_model.as_str(),
         ),
+        (EditChannelField::Protocol, form.protocol.as_str()),
         (EditChannelField::Priority, form.priority.as_str()),
-        (EditChannelField::Weight, form.weight.as_str()),
     ];
 
     let mut lines = vec![
@@ -2672,8 +2667,8 @@ fn draw_edit_channel_modal(frame: &mut Frame, form: &EditChannelForm) {
                 EditChannelField::BaseUrl => "<base url>".to_string(),
                 EditChannelField::ApiKey => "<api key>".to_string(),
                 EditChannelField::UpstreamModel => "<upstream model>".to_string(),
+                EditChannelField::Protocol => "<protocol>".to_string(),
                 EditChannelField::Priority => "<priority>".to_string(),
-                EditChannelField::Weight => "<weight>".to_string(),
             }
         } else {
             value.to_string()
@@ -2709,7 +2704,7 @@ fn draw_edit_channel_modal(frame: &mut Frame, form: &EditChannelForm) {
         Span::raw(if submit_ready {
             "ready to submit"
         } else {
-            "base_url / api_key / upstream_model required; priority >= 0; weight > 0"
+            "base_url / api_key / upstream_model / protocol required; priority >= 0"
         }),
     ]));
     lines.push(Line::from(
@@ -2738,6 +2733,18 @@ fn parse_required_i64(value: &str, field_name: &str) -> Result<i64, String> {
         .trim()
         .parse::<i64>()
         .map_err(|error| format!("invalid {field_name}: {error}"))
+}
+
+fn normalize_protocol_input(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("protocol is required".to_string());
+    }
+    match trimmed {
+        "responses" | "chat_completions" => Ok(trimmed.to_string()),
+        "claude" | "messages" => Ok("claude".to_string()),
+        _ => Err("protocol must be one of responses, chat_completions, claude".to_string()),
+    }
 }
 
 fn mask_api_key(value: &str) -> String {
@@ -2773,7 +2780,10 @@ fn centered_rect(horizontal_percent: u16, vertical_percent: u16, area: Rect) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{ChannelAction, ChannelSummary, masked_secret, toggle_action_for_channel};
+    use super::{
+        ChannelAction, ChannelSummary, masked_secret, normalize_protocol_input,
+        toggle_action_for_channel,
+    };
 
     #[test]
     fn masked_secret_keeps_head_and_tail() {
@@ -2793,8 +2803,8 @@ mod tests {
             channel_label: "chan".to_string(),
             site_status: "active".to_string(),
             upstream_model: "gpt-5.4".to_string(),
+            protocol: "responses".to_string(),
             priority: 0,
-            weight: 10,
             manual_blocked: false,
             cooldown_remaining_seconds: None,
             consecutive_fail_count: 0,
@@ -2817,5 +2827,12 @@ mod tests {
             toggle_action_for_channel(&channel),
             ChannelAction::ResetCooldown
         );
+    }
+
+    #[test]
+    fn normalize_protocol_input_requires_known_value() {
+        assert_eq!(normalize_protocol_input("messages").unwrap(), "claude");
+        assert!(normalize_protocol_input("").is_err());
+        assert!(normalize_protocol_input("invalid").is_err());
     }
 }

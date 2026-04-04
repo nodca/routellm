@@ -9,6 +9,7 @@ use crate::{
     config::Config,
     domain::{AdminRouteRow, ChannelRow, ModelRouteRow, RequestLogRow, RequestLogWrite},
     error::AppError,
+    protocol::Protocol,
 };
 
 #[derive(Debug, Clone)]
@@ -104,7 +105,7 @@ impl SqliteStore {
         let route_id = sqlx::query(
             r#"
             insert into model_routes (model_pattern, enabled, routing_strategy, cooldown_seconds)
-            values (?, 1, 'weighted', ?)
+            values (?, 1, 'priority', ?)
             "#,
         )
         .bind(&route_model)
@@ -171,7 +172,6 @@ impl SqliteStore {
                 when c.enabled = 1
                   and a.status = 'active'
                   and s.status = 'active'
-                  and c.supports_responses = 1
                   and c.manual_blocked = 0
                   and (c.cooldown_until is null or c.cooldown_until <= ?)
                 then 1 else 0 end), 0) as ready_channel_count,
@@ -227,14 +227,14 @@ impl SqliteStore {
         base_url: &str,
         api_key: &str,
         upstream_model: Option<&str>,
+        protocol: &str,
         priority: i64,
-        weight: i64,
     ) -> Result<ChannelRow, AppError> {
         let normalized_base_url = normalize_base_url(base_url)?;
         let api_key = normalize_api_key(api_key)?;
         let upstream_model = normalize_upstream_model(upstream_model, &route.model_pattern)?;
+        let protocol = normalize_protocol(protocol)?;
         let priority = normalize_priority(priority)?;
-        let weight = normalize_weight(weight)?;
 
         let mut tx = self.pool.begin().await?;
         let account_id = ensure_account(&mut tx, &normalized_base_url, api_key).await?;
@@ -243,8 +243,8 @@ impl SqliteStore {
             route.id,
             account_id,
             &upstream_model,
+            &protocol,
             true,
-            weight,
             priority,
         )
         .await?;
@@ -260,15 +260,15 @@ impl SqliteStore {
         base_url: &str,
         api_key: &str,
         upstream_model: &str,
+        protocol: &str,
         priority: i64,
-        weight: i64,
     ) -> Result<ChannelRow, AppError> {
         let existing = self.load_channel(channel_id).await?;
         let normalized_base_url = normalize_base_url(base_url)?;
         let api_key = normalize_api_key(api_key)?;
         let upstream_model = normalize_upstream_model(Some(upstream_model), "")?;
+        let protocol = normalize_protocol(protocol)?;
         let priority = normalize_priority(priority)?;
-        let weight = normalize_weight(weight)?;
 
         let mut tx = self.pool.begin().await?;
         let next_account_id = ensure_account(&mut tx, &normalized_base_url, api_key).await?;
@@ -278,16 +278,16 @@ impl SqliteStore {
             update channels
             set account_id = ?,
                 upstream_model = ?,
+                protocol = ?,
                 priority = ?,
-                weight = ?,
                 updated_at = current_timestamp
             where id = ?
             "#,
         )
         .bind(next_account_id)
         .bind(upstream_model)
+        .bind(protocol)
         .bind(priority)
-        .bind(weight)
         .bind(channel_id)
         .execute(&mut *tx)
         .await?;
@@ -304,15 +304,15 @@ impl SqliteStore {
         base_url: &str,
         api_key: &str,
         upstream_model: &str,
+        protocol: &str,
         priority: i64,
-        weight: i64,
         enabled: bool,
     ) -> Result<(ChannelRow, bool), AppError> {
         let normalized_base_url = normalize_base_url(base_url)?;
         let api_key = normalize_api_key(api_key)?;
         let upstream_model = normalize_upstream_model(Some(upstream_model), &route.model_pattern)?;
+        let protocol = normalize_protocol(protocol)?;
         let priority = normalize_priority(priority)?;
-        let weight = normalize_weight(weight)?;
 
         let mut tx = self.pool.begin().await?;
         let account_id = ensure_account(&mut tx, &normalized_base_url, api_key).await?;
@@ -337,15 +337,15 @@ impl SqliteStore {
                 r#"
                 update channels
                 set enabled = ?,
+                    protocol = ?,
                     priority = ?,
-                    weight = ?,
                     updated_at = current_timestamp
                 where id = ?
                 "#,
             )
             .bind(if enabled { 1_i64 } else { 0_i64 })
+            .bind(&protocol)
             .bind(priority)
-            .bind(weight)
             .bind(existing_channel_id)
             .execute(&mut *tx)
             .await?;
@@ -359,8 +359,8 @@ impl SqliteStore {
             route.id,
             account_id,
             &upstream_model,
+            &protocol,
             enabled,
-            weight,
             priority,
         )
         .await?;
@@ -450,8 +450,8 @@ impl SqliteStore {
         base_url: &str,
         api_key: &str,
         upstream_model: Option<&str>,
+        protocol: &str,
         priority: i64,
-        weight: i64,
         cooldown_seconds: i64,
     ) -> Result<(ModelRouteRow, ChannelRow, bool), AppError> {
         let cooldown_seconds = normalize_cooldown_seconds(cooldown_seconds)?;
@@ -459,7 +459,14 @@ impl SqliteStore {
             .create_or_get_route(route_model, cooldown_seconds)
             .await?;
         let channel = self
-            .create_channel_for_route(&route, base_url, api_key, upstream_model, priority, weight)
+            .create_channel_for_route(
+                &route,
+                base_url,
+                api_key,
+                upstream_model,
+                protocol,
+                priority,
+            )
             .await?;
 
         Ok((route, channel, route_created))
@@ -666,10 +673,9 @@ const CHANNEL_SELECT_BY_ROUTE_SQL: &str = r#"
       s.status as site_status,
       c.label as channel_label,
       c.upstream_model,
-      c.supports_responses,
+      c.protocol,
       c.enabled,
       c.priority,
-      c.weight,
       c.cooldown_until,
       c.manual_blocked,
       c.consecutive_fail_count,
@@ -695,10 +701,9 @@ const CHANNEL_SELECT_BY_ID_SQL: &str = r#"
       s.status as site_status,
       c.label as channel_label,
       c.upstream_model,
-      c.supports_responses,
+      c.protocol,
       c.enabled,
       c.priority,
-      c.weight,
       c.cooldown_until,
       c.manual_blocked,
       c.consecutive_fail_count,
@@ -772,13 +777,8 @@ fn normalize_priority(priority: i64) -> Result<i64, AppError> {
     Ok(priority)
 }
 
-fn normalize_weight(weight: i64) -> Result<i64, AppError> {
-    if weight <= 0 {
-        return Err(AppError::BadRequest(
-            "field `weight` must be > 0".to_string(),
-        ));
-    }
-    Ok(weight)
+fn normalize_protocol(protocol: &str) -> Result<String, AppError> {
+    Ok(Protocol::parse(protocol)?.as_str().to_string())
 }
 
 fn normalize_route_model(route_model: &str) -> Result<String, AppError> {
@@ -917,8 +917,8 @@ async fn insert_channel(
     route_id: i64,
     account_id: i64,
     upstream_model: &str,
+    protocol: &str,
     enabled: bool,
-    weight: i64,
     priority: i64,
 ) -> Result<i64, AppError> {
     let channel_label = next_channel_label(tx, route_id).await?;
@@ -929,19 +929,18 @@ async fn insert_channel(
           account_id,
           label,
           upstream_model,
-          supports_responses,
+          protocol,
           enabled,
-          weight,
           priority
-        ) values (?, ?, ?, ?, 1, ?, ?, ?)
+        ) values (?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(route_id)
     .bind(account_id)
     .bind(&channel_label)
     .bind(upstream_model)
+    .bind(protocol)
     .bind(if enabled { 1_i64 } else { 0_i64 })
-    .bind(weight)
     .bind(priority)
     .execute(&mut **tx)
     .await?
