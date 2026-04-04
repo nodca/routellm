@@ -2876,9 +2876,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     ];
     lines.extend(shortcut_hint_lines(app));
 
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title("Status"))
-        .wrap(Wrap { trim: true });
+    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Status"));
     frame.render_widget(paragraph, area);
 }
 
@@ -3103,97 +3101,65 @@ fn pane_label(base: &str, count: usize, query: Option<&str>) -> String {
 }
 
 fn shortcut_hint_lines(app: &App) -> Vec<Line<'static>> {
-    let (primary_groups, info_group): (&[(&str, &[(&str, &str)])], Option<(&str, &[(&str, &str)])>) =
-        match app.mode {
-            AppMode::SelectProvider(_) | AppMode::SelectProtocol(_) => (
-                &[("选择", &[("Up/Down", "选择"), ("Enter", "确认"), ("Esc", "取消")])],
-                None,
-            ),
-            AppMode::OnboardRoute(_) | AppMode::EditChannel(_) => (
-                &[("表单", &[("Up/Down", "字段"), ("Enter", "提交"), ("Esc", "取消")])],
-                None,
-            ),
-            AppMode::Confirm(_) => (
-                &[("确认", &[("Enter / Y", "是"), ("Esc / N", "否")])],
-                None,
-            ),
-            AppMode::Search(_) => (
-                &[(
-                    "搜索",
-                    &[
-                        ("输入", "过滤"),
-                        ("Enter", "应用"),
-                        ("空内容+Enter", "清空"),
-                        ("Esc", "取消"),
-                    ],
-                )],
-                None,
-            ),
-            AppMode::Detail(_) => (&[("详情", &[("Enter / Esc", "关闭")])], None),
-            AppMode::Browse => match app.focus {
-                FocusPane::Routes => (
-                    &[
-                        (
-                            "导航",
-                            &[
-                                ("Up/Down", "移动"),
-                                ("Enter", "进入"),
-                                ("Right", "Channels"),
-                            ],
-                        ),
-                        (
-                            "操作",
-                            &[
-                                ("a", "新增"),
-                                ("T", "测活"),
-                                ("x", "删除"),
-                                ("/", "过滤"),
-                            ],
-                        ),
-                    ],
-                    Some(("信息", &[("u", "URL"), ("K", "Key")])),
-                ),
-                FocusPane::Channels => (
-                    &[
-                        (
-                            "导航",
-                            &[("Up/Down", "移动"), ("Left", "Routes"), ("Right", "Logs")],
-                        ),
-                        (
-                            "操作",
-                            &[
-                                ("Space", "切换"),
-                                ("t", "测活"),
-                                ("T", "整组"),
-                                ("c", "恢复"),
-                            ],
-                        ),
-                        ("编辑", &[("a", "新增"), ("i", "编辑"), ("x", "删除")]),
-                    ],
-                    Some(("信息", &[("u", "URL"), ("K", "Key")])),
-                ),
-                FocusPane::Logs => (
-                    &[
-                        (
-                            "导航",
-                            &[
-                                ("Up/Down", "移动"),
-                                ("Left", "Channels"),
-                                ("Enter", "详情"),
-                            ],
-                        ),
-                        ("操作", &[("T", "测活"), ("r", "刷新")]),
-                    ],
-                    Some(("信息", &[("u", "URL"), ("K", "Key")])),
-                ),
-            },
-        };
-
-    let mut lines = vec![shortcut_hint_line(primary_groups)];
-    if let Some(info_group) = info_group {
-        lines.push(shortcut_hint_line(std::slice::from_ref(&info_group)));
+    match app.mode {
+        AppMode::SelectProvider(_) | AppMode::SelectProtocol(_) => vec![shortcut_hint_line(&[
+            ("选择", &[("Up/Down", "选择"), ("Enter", "确认"), ("Esc", "取消")]),
+        ])],
+        AppMode::OnboardRoute(_) | AppMode::EditChannel(_) => vec![shortcut_hint_line(&[
+            ("表单", &[("Up/Down", "字段"), ("Enter", "提交"), ("Esc", "取消")]),
+        ])],
+        AppMode::Confirm(_) => vec![shortcut_hint_line(&[
+            ("确认", &[("Enter / Y", "是"), ("Esc / N", "否")]),
+        ])],
+        AppMode::Search(_) => vec![shortcut_hint_line(&[(
+            "搜索",
+            &[
+                ("输入", "过滤"),
+                ("Enter", "应用"),
+                ("空内容+Enter", "清空"),
+                ("Esc", "取消"),
+            ],
+        )])],
+        AppMode::Detail(_) => vec![shortcut_hint_line(&[(
+            "详情",
+            &[("Enter / Esc", "关闭")],
+        )])],
+        AppMode::Browse => match app.focus {
+            FocusPane::Routes => vec![
+                shortcut_hint_line(&[
+                    (
+                        "导航",
+                        &[("Up/Down", "移动"), ("Enter", "进入"), ("Right", "Channels")],
+                    ),
+                    ("操作", &[("a", "新增"), ("T", "测活"), ("x", "删除"), ("/", "过滤")]),
+                ]),
+                shortcut_hint_line(&[("信息", &[("u", "URL"), ("K", "Key")])]),
+            ],
+            FocusPane::Channels => vec![
+                shortcut_hint_line(&[
+                    (
+                        "导航",
+                        &[("Up/Down", "移动"), ("Left", "Routes"), ("Right", "Logs")],
+                    ),
+                    ("操作", &[("Space", "切换"), ("t", "测活"), ("T", "整组"), ("c", "恢复")]),
+                ]),
+                shortcut_hint_line(&[
+                    ("编辑", &[("a", "新增"), ("i", "编辑"), ("x", "删除")]),
+                    ("信息", &[("u", "URL"), ("K", "Key")]),
+                ]),
+            ],
+            FocusPane::Logs => vec![
+                shortcut_hint_line(&[
+                    (
+                        "导航",
+                        &[("Up/Down", "移动"), ("Left", "Channels"), ("Enter", "详情")],
+                    ),
+                    ("操作", &[("T", "测活"), ("r", "刷新")]),
+                ]),
+                shortcut_hint_line(&[("信息", &[("u", "URL"), ("K", "Key")])]),
+            ],
+        },
     }
-    lines
 }
 
 fn shortcut_hint_line(groups: &[(&str, &[(&str, &str)])]) -> Line<'static> {
