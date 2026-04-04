@@ -7,7 +7,7 @@ Usage: install-server.sh [options]
 
 Options:
   --repo owner/repo         GitHub repository, default nodca/routellm unless --asset-url is set
-  --tag v0.2.1              Release tag, defaults to latest
+  --tag v0.2.2              Release tag, defaults to latest
   --asset-url URL           Direct asset URL override
   --install-dir DIR         Install directory, default /opt/routellm
   --bin-path PATH           Binary install path, default <install-dir>/metapi-rs
@@ -77,7 +77,7 @@ prepare_path_parent() {
   parent="$(dirname "$path")"
   mkdir -p "$parent" 2>/dev/null || {
     echo "Failed to prepare directory: $parent" >&2
-    echo "Try running as root, or pass --install-dir \$HOME/.local/share/routellm for a user-local install." >&2
+    echo "Try running with sudo, or pass --install-dir \$HOME/.local/share/routellm for a user-local install." >&2
     exit 1
   }
 }
@@ -255,4 +255,5 @@ Next steps:
      set -a; . "${ENV_FILE}"; set +a; "${BIN_PATH}"
   3. For a non-root install, rerun with:
      --install-dir "$HOME/.local/share/routellm" --env-file "$HOME/.config/routellm/server.env" --skip-systemd
+  4. For the default /opt install, run the installer with sudo.
 EOF

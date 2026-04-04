@@ -173,14 +173,14 @@ TUI 与管理面主要展示四种状态：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh | \
-  bash -s -- --repo nodca/routellm --tag v0.2.1
+  sudo bash -s -- --repo nodca/routellm --tag v0.2.2
 ```
 
 默认安装到 `/opt/routellm`，适合 root 管理的服务端部署。非 root 安装建议改成：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh | \
-  bash -s -- --repo nodca/routellm --tag v0.2.1 \
+  bash -s -- --repo nodca/routellm --tag v0.2.2 \
     --install-dir "$HOME/.local/share/routellm" \
     --env-file "$HOME/.config/routellm/server.env" \
     --skip-systemd
@@ -190,14 +190,14 @@ curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.sh | \
-  bash -s -- --repo nodca/routellm --tag v0.2.1 --server http://127.0.0.1:8080
+  bash -s -- --repo nodca/routellm --tag v0.2.2 --server http://127.0.0.1:8080
 ```
 
 #### Windows Server
 
 ```powershell
 powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.ps1 -OutFile install-server.ps1"
-powershell -ExecutionPolicy Bypass -File .\install-server.ps1 -Repo nodca/routellm -Tag v0.2.1
+powershell -ExecutionPolicy Bypass -File .\install-server.ps1 -Repo nodca/routellm -Tag v0.2.2
 ```
 
 Windows 默认安装到 `%LOCALAPPDATA%\routellm`。
@@ -206,7 +206,7 @@ Windows 默认安装到 `%LOCALAPPDATA%\routellm`。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.ps1 -OutFile install-tui.ps1"
-powershell -ExecutionPolicy Bypass -File .\install-tui.ps1 -Repo nodca/routellm -Tag v0.2.1 -Server http://127.0.0.1:8080 -AuthKey sk-metapi-your-key
+powershell -ExecutionPolicy Bypass -File .\install-tui.ps1 -Repo nodca/routellm -Tag v0.2.2 -Server http://127.0.0.1:8080 -AuthKey sk-metapi-your-key
 ```
 
 Windows TUI 默认也放在 `%LOCALAPPDATA%\routellm`。
