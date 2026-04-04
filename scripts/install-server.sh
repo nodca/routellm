@@ -71,6 +71,13 @@ generate_master_key() {
   printf 'sk-llmrouter-%s\n' "$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 }
 
+read_env_value() {
+  local file="$1"
+  local key="$2"
+  [[ -f "$file" ]] || return 1
+  awk -F= -v wanted="$key" '$1 == wanted {print substr($0, index($0, "=") + 1); exit}' "$file"
+}
+
 prepare_path_parent() {
   local path="$1"
   local parent
@@ -89,9 +96,10 @@ INSTALL_DIR="${LLMROUTER_INSTALL_DIR:-/opt/llmrouter}"
 BIN_PATH=""
 CONFIG_FILE=""
 ENV_FILE="${LLMROUTER_ENV_FILE:-/etc/llmrouter.env}"
-BIND_ADDR="${LLMROUTER_BIND_ADDR:-0.0.0.0:1290}"
+BIND_ADDR="${LLMROUTER_BIND_ADDR:-}"
 MASTER_KEY="${LLMROUTER_MASTER_KEY:-}"
-REQUEST_TIMEOUT="${LLMROUTER_REQUEST_TIMEOUT_SECS:-90}"
+REQUEST_TIMEOUT="${LLMROUTER_REQUEST_TIMEOUT_SECS:-}"
+DATABASE_URL=""
 SERVICE_NAME="${LLMROUTER_SERVICE_NAME:-llmrouter}"
 SERVICE_USER="${LLMROUTER_SERVICE_USER:-llmrouter}"
 SKIP_SYSTEMD=0
@@ -132,9 +140,27 @@ fi
 if [[ -z "$CONFIG_FILE" ]]; then
   CONFIG_FILE="${INSTALL_DIR}/llmrouter.toml"
 fi
-DATABASE_URL="sqlite://${INSTALL_DIR}/llmrouter-state.db"
+if [[ -z "$BIND_ADDR" ]]; then
+  BIND_ADDR="$(read_env_value "$ENV_FILE" "LLMROUTER_BIND_ADDR" || true)"
+fi
+if [[ -z "$BIND_ADDR" ]]; then
+  BIND_ADDR="0.0.0.0:1290"
+fi
+if [[ -z "$REQUEST_TIMEOUT" ]]; then
+  REQUEST_TIMEOUT="$(read_env_value "$ENV_FILE" "LLMROUTER_REQUEST_TIMEOUT_SECS" || true)"
+fi
+if [[ -z "$REQUEST_TIMEOUT" ]]; then
+  REQUEST_TIMEOUT="90"
+fi
+if [[ -z "$MASTER_KEY" ]]; then
+  MASTER_KEY="$(read_env_value "$ENV_FILE" "LLMROUTER_MASTER_KEY" || true)"
+fi
 if [[ -z "$MASTER_KEY" ]]; then
   MASTER_KEY="$(generate_master_key)"
+fi
+DATABASE_URL="$(read_env_value "$ENV_FILE" "LLMROUTER_DATABASE_URL" || true)"
+if [[ -z "$DATABASE_URL" ]]; then
+  DATABASE_URL="sqlite://${INSTALL_DIR}/llmrouter-state.db"
 fi
 
 require_cmd curl

@@ -35,6 +35,16 @@ function New-MasterKey {
     return "sk-llmrouter-" + ([guid]::NewGuid().ToString("N").Substring(0, 24))
 }
 
+function Get-EnvFileValue([string]$Path, [string]$Key) {
+    if (-not (Test-Path $Path)) { return $null }
+    foreach ($line in Get-Content $Path) {
+        if ($line -match '^\s*([A-Z0-9_]+)=(.*)$' -and $matches[1] -eq $Key) {
+            return $matches[2]
+        }
+    }
+    return $null
+}
+
 function Test-IsAdmin {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -62,19 +72,37 @@ function Register-StartupTask([string]$TaskName, [string]$ScriptPath) {
         -Force | Out-Null
 }
 
+$AssetName = "llmrouter-windows-$(Get-ArchName).zip"
+$TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("llmrouter-server-" + [guid]::NewGuid().ToString("N"))
+$ArchivePath = Join-Path $TempDir $AssetName
+$RunScript = Join-Path $InstallDir "run-llmrouter.ps1"
+$EnvFile = Join-Path $InstallDir "server.env"
+
 if (-not $ConfigFile) {
     $ConfigFile = Join-Path $InstallDir "llmrouter.toml"
+}
+if (-not $Bind) {
+    $Bind = Get-EnvFileValue -Path $EnvFile -Key "LLMROUTER_BIND_ADDR"
+}
+if (-not $Bind) {
+    $Bind = "0.0.0.0:1290"
+}
+if (-not $RequestTimeout) {
+    $RequestTimeout = Get-EnvFileValue -Path $EnvFile -Key "LLMROUTER_REQUEST_TIMEOUT_SECS"
+}
+if (-not $RequestTimeout) {
+    $RequestTimeout = "90"
+}
+if (-not $MasterKey) {
+    $MasterKey = Get-EnvFileValue -Path $EnvFile -Key "LLMROUTER_MASTER_KEY"
 }
 if (-not $MasterKey) {
     $MasterKey = New-MasterKey
 }
-
-$AssetName = "llmrouter-windows-$(Get-ArchName).zip"
-$TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("llmrouter-server-" + [guid]::NewGuid().ToString("N"))
-$ArchivePath = Join-Path $TempDir $AssetName
-$DatabaseUrl = "sqlite://llmrouter-state.db"
-$RunScript = Join-Path $InstallDir "run-llmrouter.ps1"
-$EnvFile = Join-Path $InstallDir "server.env"
+$DatabaseUrl = Get-EnvFileValue -Path $EnvFile -Key "LLMROUTER_DATABASE_URL"
+if (-not $DatabaseUrl) {
+    $DatabaseUrl = "sqlite://llmrouter-state.db"
+}
 
 New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null

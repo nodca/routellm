@@ -44,13 +44,16 @@ raw_script_url() {
   echo "https://raw.githubusercontent.com/${REPO}/${ref}/scripts/${script_name}"
 }
 
-generate_master_key() {
-  printf 'sk-llmrouter-%s\n' "$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-}
-
 resolve_user_home() {
   local user_name="$1"
   getent passwd "$user_name" | cut -d: -f6
+}
+
+read_env_value() {
+  local file="$1"
+  local key="$2"
+  [[ -f "$file" ]] || return 1
+  awk -F= -v wanted="$key" '$1 == wanted {print substr($0, index($0, "=") + 1); exit}' "$file"
 }
 
 REPO="${LLMROUTER_REPO:-nodca/routellm}"
@@ -127,9 +130,6 @@ fi
 if [[ -z "$CONFIG_FILE" ]]; then
   CONFIG_FILE="${INSTALL_DIR}/llmrouter.toml"
 fi
-if [[ -z "$MASTER_KEY" ]]; then
-  MASTER_KEY="$(generate_master_key)"
-fi
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -141,17 +141,32 @@ curl -fsSL "$(raw_script_url install-server.sh)" -o "$SERVER_SCRIPT"
 curl -fsSL "$(raw_script_url install-tui.sh)" -o "$TUI_SCRIPT"
 chmod +x "$SERVER_SCRIPT" "$TUI_SCRIPT"
 
-bash "$SERVER_SCRIPT" \
-  --repo "$REPO" \
-  --tag "$TAG" \
-  --install-dir "$INSTALL_DIR" \
-  --env-file "$ENV_FILE" \
-  --config-file "$CONFIG_FILE" \
-  --bind "$BIND_ADDR" \
-  --master-key "$MASTER_KEY" \
-  --service-name "$SERVICE_NAME" \
-  --service-user "$SERVICE_USER" \
-  $(if [[ "$SKIP_START" -eq 1 ]]; then printf '%s' '--skip-start'; fi)
+server_args=(
+  --repo "$REPO"
+  --tag "$TAG"
+  --install-dir "$INSTALL_DIR"
+  --env-file "$ENV_FILE"
+  --config-file "$CONFIG_FILE"
+  --bind "$BIND_ADDR"
+  --service-name "$SERVICE_NAME"
+  --service-user "$SERVICE_USER"
+)
+if [[ -n "$MASTER_KEY" ]]; then
+  server_args+=(--master-key "$MASTER_KEY")
+fi
+if [[ "$SKIP_START" -eq 1 ]]; then
+  server_args+=(--skip-start)
+fi
+
+bash "$SERVER_SCRIPT" "${server_args[@]}"
+
+if [[ -z "$MASTER_KEY" ]]; then
+  MASTER_KEY="$(read_env_value "$ENV_FILE" "LLMROUTER_MASTER_KEY" || true)"
+fi
+if [[ -z "$MASTER_KEY" ]]; then
+  echo "无法从 ${ENV_FILE} 读取管理 Key" >&2
+  exit 1
+fi
 
 mkdir -p "$TUI_BIN_DIR" "$TUI_CONFIG_DIR"
 bash "$TUI_SCRIPT" \
