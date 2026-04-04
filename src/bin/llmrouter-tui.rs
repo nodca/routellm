@@ -15,7 +15,7 @@ use std::io::Write;
 #[cfg(not(windows))]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -137,12 +137,15 @@ struct ProbeChannelOutcome {
 
 #[derive(Debug, Clone)]
 enum ProbeEvent {
-    Single(ProbeChannelOutcome),
-    Batch {
-        route_id: i64,
+    Single {
+        outcome: ProbeChannelOutcome,
+        select_channel: bool,
+    },
+    BatchComplete {
         route_model: String,
-        selected_channel_id: Option<i64>,
-        outcomes: Vec<ProbeChannelOutcome>,
+        ok_count: usize,
+        failed_count: usize,
+        transport_failures: usize,
     },
 }
 
@@ -1585,10 +1588,13 @@ impl App {
         tokio::spawn(async move {
             let result =
                 probe_channel_request(client, base_url, auth_key, outcome.channel_id).await;
-            let _ = tx.send(ProbeEvent::Single(ProbeChannelOutcome {
-                result,
-                ..outcome
-            }));
+            let _ = tx.send(ProbeEvent::Single {
+                outcome: ProbeChannelOutcome {
+                    result,
+                    ..outcome
+                },
+                select_channel: true,
+            });
         });
     }
 
@@ -1613,9 +1619,6 @@ impl App {
             return;
         }
 
-        let selected_channel_id = self
-            .selected_channel_ref()
-            .map(|channel| channel.channel_id);
         let route_model_for_status = route_model.clone();
         let outcomes: Vec<ProbeChannelOutcome> = envelope
             .channels
@@ -1644,31 +1647,60 @@ impl App {
         let tx = self.probe_tx.clone();
 
         tokio::spawn(async move {
-            let mut completed = Vec::with_capacity(outcomes.len());
+            let mut pending = FuturesUnordered::new();
             for outcome in outcomes {
-                let result = probe_channel_request(
-                    client.clone(),
-                    base_url.clone(),
-                    auth_key.clone(),
-                    outcome.channel_id,
-                )
-                .await;
-                completed.push(ProbeChannelOutcome { result, ..outcome });
+                let client = client.clone();
+                let base_url = base_url.clone();
+                let auth_key = auth_key.clone();
+                pending.push(async move {
+                    let result =
+                        probe_channel_request(client, base_url, auth_key, outcome.channel_id).await;
+                    ProbeChannelOutcome { result, ..outcome }
+                });
             }
-            let _ = tx.send(ProbeEvent::Batch {
-                route_id,
+
+            let mut ok_count = 0usize;
+            let mut failed_count = 0usize;
+            let mut transport_failures = 0usize;
+
+            while let Some(outcome) = pending.next().await {
+                match &outcome.result {
+                    Ok(updated) if updated.state == "ready" => ok_count += 1,
+                    Ok(_) => failed_count += 1,
+                    Err(_) => {
+                        failed_count += 1;
+                        transport_failures += 1;
+                    }
+                }
+
+                let _ = tx.send(ProbeEvent::Single {
+                    outcome,
+                    select_channel: false,
+                });
+            }
+
+            let _ = tx.send(ProbeEvent::BatchComplete {
                 route_model,
-                selected_channel_id,
-                outcomes: completed,
+                ok_count,
+                failed_count,
+                transport_failures,
             });
         });
     }
 
     async fn handle_probe_event(&mut self, event: ProbeEvent) {
         match event {
-            ProbeEvent::Single(outcome) => {
+            ProbeEvent::Single {
+                outcome,
+                select_channel,
+            } => {
                 self.probing_channels.remove(&outcome.channel_id);
-                self.apply_probe_outcomes(outcome.route_id, Some(outcome.channel_id), [&outcome])
+                let selected_channel_id = if select_channel {
+                    Some(outcome.channel_id)
+                } else {
+                    None
+                };
+                self.apply_probe_outcomes(outcome.route_id, selected_channel_id, [&outcome])
                     .await;
                 self.status = match &outcome.result {
                     Ok(updated) if updated.state == "ready" => {
@@ -1689,31 +1721,12 @@ impl App {
                     ),
                 };
             }
-            ProbeEvent::Batch {
-                route_id,
+            ProbeEvent::BatchComplete {
                 route_model,
-                selected_channel_id,
-                outcomes,
+                ok_count,
+                failed_count,
+                transport_failures,
             } => {
-                for outcome in &outcomes {
-                    self.probing_channels.remove(&outcome.channel_id);
-                }
-                self.apply_probe_outcomes(route_id, selected_channel_id, outcomes.iter())
-                    .await;
-
-                let mut ok_count = 0usize;
-                let mut failed_count = 0usize;
-                let mut transport_failures = 0usize;
-                for outcome in &outcomes {
-                    match &outcome.result {
-                        Ok(updated) if updated.state == "ready" => ok_count += 1,
-                        Ok(_) => failed_count += 1,
-                        Err(_) => {
-                            failed_count += 1;
-                            transport_failures += 1;
-                        }
-                    }
-                }
                 self.status = if transport_failures > 0 {
                     format!(
                         "probed route {route_model}: {ok_count} ok, {failed_count} failed ({transport_failures} request errors)"

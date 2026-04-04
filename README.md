@@ -99,6 +99,87 @@ lrtui --import /path/to/cc-switch.db
 3. 用 `lrtui` 进入 TUI 管理
 4. 下游客户端把 Base URL 指向 `http://127.0.0.1:1290/v1`
 
+### 服务器 + 本机 TUI 模式
+
+这是更常见的用法：
+
+1. 在远程 Linux 服务器上安装并启动 `server`
+2. 在你自己的电脑上安装 `TUI`
+3. `TUI` 连接远程 `server` 的管理地址
+4. 下游客户端统一请求这台服务器的 `/v1`
+
+服务端部署：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh | sudo bash
+```
+
+安装完成后，服务端会：
+
+- 默认监听 `0.0.0.0:1290`
+- 注册 `systemd` 开机自启动
+- 生成一个 `master_key`
+
+然后在服务器上编辑配置文件，加入你的 route 和 channel，最后重启：
+
+```bash
+sudo systemctl restart llmrouter
+```
+
+本机安装 TUI：
+
+Linux：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.sh | bash
+```
+
+Windows：
+
+```powershell
+irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.ps1 | iex
+```
+
+第一次连接远程服务端时，把服务端地址和 `master_key` 写进去即可。
+
+Linux：
+
+```bash
+LLMROUTER_BASE_URL=http://你的服务器IP:1290 \
+LLMROUTER_AUTH_KEY=你的master_key \
+lrtui
+```
+
+Windows：
+
+```powershell
+$env:LLMROUTER_BASE_URL="http://你的服务器IP:1290"
+$env:LLMROUTER_AUTH_KEY="你的master_key"
+lrtui
+```
+
+如果你想长期保存这组连接信息，也可以直接重装一次 TUI 并写入本地配置：
+
+Linux：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.sh | \
+  bash -s -- --server http://你的服务器IP:1290 --auth-key 你的master_key
+```
+
+Windows：
+
+```powershell
+$script = [scriptblock]::Create((irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.ps1))
+& $script -Server "http://你的服务器IP:1290" -AuthKey "你的master_key"
+```
+
+下游客户端配置：
+
+- Base URL：`http://你的服务器IP:1290/v1`
+- API Key：填写服务端的 `master_key`
+- model：填写你在 route 里定义的模型名，例如 `gpt-5.4`
+
 ### 手动启动
 
 ```bash
@@ -170,7 +251,7 @@ LLMROUTER_AUTH_KEY=sk-llmrouter-local \
 主动测活：
 
 - `t`：测活当前 channel
-- `T`：顺序测活当前 route 下全部 channel
+- `T`：并发测活当前 route 下全部 channel，并实时刷新结果
 - 测活成功回到 `RUN`
 - 测活失败默认进入 `UNAVAIL`
 
