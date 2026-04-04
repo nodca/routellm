@@ -81,6 +81,40 @@ struct UpstreamDispatch {
     response_adapter: ResponseAdapter,
 }
 
+fn build_upstream_url(base_url: &str, protocol: Protocol) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    match protocol {
+        Protocol::Responses => {
+            if trimmed.ends_with("/v1/responses") {
+                trimmed.to_string()
+            } else if trimmed.ends_with("/v1") {
+                format!("{trimmed}/responses")
+            } else {
+                format!("{trimmed}/v1/responses")
+            }
+        }
+        Protocol::ChatCompletions => {
+            if trimmed.ends_with("/v1/chat/completions") || trimmed.ends_with("/chat/completions")
+            {
+                trimmed.to_string()
+            } else if trimmed.ends_with("/v1") || trimmed.ends_with("/openai") {
+                format!("{trimmed}/chat/completions")
+            } else {
+                format!("{trimmed}/v1/chat/completions")
+            }
+        }
+        Protocol::Messages => {
+            if trimmed.ends_with("/v1/messages") || trimmed.ends_with("/messages") {
+                trimmed.to_string()
+            } else if trimmed.ends_with("/v1") {
+                format!("{trimmed}/messages")
+            } else {
+                format!("{trimmed}/v1/messages")
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ProbeOutcome {
     http_status: Option<u16>,
@@ -513,11 +547,7 @@ async fn attempt_proxy_request(
     let dispatch = build_upstream_dispatch(payload, downstream_protocol, channel_protocol)?;
     let started_at = Instant::now();
 
-    let upstream_url = format!(
-        "{}{}",
-        selected.site_base_url.trim_end_matches('/'),
-        dispatch.upstream_protocol.path()
-    );
+    let upstream_url = build_upstream_url(&selected.site_base_url, dispatch.upstream_protocol);
     let upstream_response = timeout(
         Duration::from_secs(FIRST_TOKEN_TIMEOUT_SECS),
         apply_upstream_auth(
@@ -1385,7 +1415,7 @@ async fn run_upstream_probe(
     upstream_model: &str,
     protocol: Protocol,
 ) -> Result<u16, ProbeOutcome> {
-    let probe_url = format!("{base_url}{}", protocol.path());
+    let probe_url = build_upstream_url(base_url, protocol);
     let probe_payload = build_probe_payload(protocol, upstream_model);
 
     let response = apply_upstream_auth(state.upstream_client.post(&probe_url), protocol, api_key)
@@ -1478,7 +1508,7 @@ fn classify_upstream_error(
     if last_status == Some(404) && normalized.contains("page not found") {
         return (
             "upstream_path_error",
-            Some("check base_url compatibility path; /v1 suffix is accepted".to_string()),
+            Some("check base_url and protocol path; full endpoint and /v1-style prefixes are accepted".to_string()),
         );
     }
 
@@ -2348,6 +2378,7 @@ mod tests {
     use crate::{
         app,
         config::{Config, CooldownPolicy, ManualInterventionPolicy},
+        protocol::Protocol,
     };
 
     async fn spawn_streaming_upstream() -> SocketAddr {
@@ -2551,6 +2582,59 @@ mod tests {
         }
 
         let app = Router::new().route("/v1/messages", post(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    async fn spawn_gemini_openai_upstream() -> SocketAddr {
+        async fn handler(headers: HeaderMap) -> Response<Body> {
+            let auth_ok = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                == Some("Bearer test-key");
+
+            if !auth_ok {
+                return Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"error":{"message":"missing bearer auth"}}"#,
+                    ))
+                    .unwrap();
+            }
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "id": "chatcmpl_gemini_123",
+                        "object": "chat.completion",
+                        "model": "gemini-2.5-pro",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "hello from gemini-compatible upstream"
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 9,
+                            "completion_tokens": 6,
+                            "total_tokens": 15
+                        }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap()
+        }
+
+        let app = Router::new().route("/v1beta/openai/chat/completions", post(handler));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -3154,7 +3238,7 @@ mod tests {
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             value["data"]["site_base_url"],
-            format!("http://{replacement_upstream_addr}")
+            format!("http://{replacement_upstream_addr}/v1")
         );
         assert_eq!(value["data"]["upstream_model"], "gpt-5.4-mini");
         assert_eq!(value["data"]["protocol"], "messages");
@@ -3174,7 +3258,7 @@ mod tests {
         let prefill_value: Value = serde_json::from_slice(&prefill_body).unwrap();
         assert_eq!(
             prefill_value["data"]["base_url"],
-            format!("http://{replacement_upstream_addr}")
+            format!("http://{replacement_upstream_addr}/v1")
         );
         assert_eq!(prefill_value["data"]["api_key"], "replacement-key");
     }
@@ -3551,7 +3635,7 @@ mod tests {
         assert_eq!(created["data"]["route_id"], 1);
         assert_eq!(
             created["data"]["site_base_url"],
-            "https://provider.example.com"
+            "https://provider.example.com/v1"
         );
         assert_eq!(created["data"]["upstream_model"], "gpt-5.4");
         assert_eq!(created["data"]["channel_label"], "ch-2");
@@ -3574,7 +3658,7 @@ mod tests {
         assert!(
             channels
                 .iter()
-                .any(|channel| channel["site_base_url"] == "https://provider.example.com")
+                .any(|channel| channel["site_base_url"] == "https://provider.example.com/v1")
         );
     }
 
@@ -3675,6 +3759,74 @@ mod tests {
             proxy_value["output"][0]["content"][0]["text"],
             "hello from upstream"
         );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_channel_accepts_gemini_openai_base_prefix() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_gemini_openai_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+        sqlx::query("insert into model_routes (model_pattern, enabled, routing_strategy, cooldown_seconds) values ('gemini-2.5-pro', 1, 'weighted', 300)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let create_channel_request = Request::builder()
+            .method("POST")
+            .uri("/api/routes/1/channels")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "base_url": format!("http://{upstream_addr}/v1beta/openai"),
+                    "api_key": "test-key",
+                    "upstream_model": "gemini-2.5-pro",
+                    "protocol": "chat_completions"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let create_response = app.clone().oneshot(create_channel_request).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+
+        let proxy_request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "gemini-2.5-pro",
+                    "messages": [{ "role": "user", "content": "ping" }]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
+        assert_eq!(proxy_response.status(), StatusCode::OK);
+        let proxy_body = to_bytes(proxy_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let proxy_value: Value = serde_json::from_slice(&proxy_body).unwrap();
+        assert_eq!(proxy_value["object"], "chat.completion");
+        assert_eq!(
+            proxy_value["choices"][0]["message"]["content"],
+            "hello from gemini-compatible upstream"
+        );
+        assert_eq!(proxy_value["usage"]["prompt_tokens"], 9);
+        assert_eq!(proxy_value["usage"]["completion_tokens"], 6);
     }
 
     #[tokio::test]
@@ -3932,6 +4084,31 @@ mod tests {
         assert_eq!(
             proxy_value["content"][0]["text"],
             "hello from claude upstream"
+        );
+    }
+
+    #[test]
+    fn build_upstream_url_supports_openai_compatible_prefixes() {
+        assert_eq!(
+            super::build_upstream_url(
+                "https://api.example.com",
+                Protocol::ChatCompletions
+            ),
+            "https://api.example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            super::build_upstream_url(
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                Protocol::ChatCompletions
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        );
+        assert_eq!(
+            super::build_upstream_url(
+                "https://example.com/v1/chat/completions",
+                Protocol::ChatCompletions
+            ),
+            "https://example.com/v1/chat/completions"
         );
     }
 

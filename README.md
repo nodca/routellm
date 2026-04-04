@@ -1,177 +1,45 @@
 # llmrouter
 
-一个轻量、优雅、具有确定性选路逻辑的 LLM 路由网关。
+一个轻量、确定性、SSH/TUI 友好的 LLM 路由网关。
 
-`llmrouter` 面向个人开发者和小团队，专注解决三个实际问题：
+`llmrouter` 面向个人开发者和小团队，用一个小而稳的中间层解决三件事：
 
-- 多个上游中转站不稳定，挂了就得手工切换
-- 不同上游的模型名不统一，下游接入很痛苦
-- 只想要一个小而稳的工具，不想上重型平台
+- 多个上游不稳定，挂了就得手工切换
+- 同一个模型在不同上游名字不统一
+- 不想上重型平台，只想快速部署和运维
 
-它不是一个大而全的 AI 平台，而是一个小而清楚的中间层：
+它不是 Web 平台，也不是多租户 AI 网关。它更像一个单二进制、可解释、可运维的路由器。
 
-- 服务端承接下游请求
-- TUI 负责本地或远程运维
-- 单二进制部署
-- 显式协议绑定
-- `priority` 决定选路
-- 规则可解释，状态可观察
+## 特点
 
-## 为什么是 llmrouter
-
-在拥有多个 LLM 上游时，你通常会遇到这些问题：
-
-- 某个通道挂了，下游客户端得改 `Base URL` 或 `API Key`
-- 同一个模型在不同供应商那里名字不同，例如 `gpt-5.4` / `gpt-5-4`
-- 管理和排障常常依赖脚本、数据库、面板，心智负担很重
-
-`llmrouter` 的设计重点不是“功能越多越好”，而是：
-
-- 确定性：抛弃复杂权重、随机策略和黑盒修正
-- 显式协议：每个 channel 必须明确指定上游协议，不靠猜
-- 极简部署：Rust 单二进制，支持 release 下载和安装脚本
-- SSH 友好：TUI 直接回答“谁在跑、谁挂了、刚才请求去哪了”
+- 单二进制部署，Linux / Windows 都可用
+- 显式协议绑定：`responses` / `chat_completions` / `messages`
+- 确定性选路：优先看 `priority`
+- 同一次请求内可自动切到下一个可用 channel
+- 支持流式与非流式转发
+- 支持 `tools / tool_calls`
+- 支持 TUI 管理、主动测活、运行状态查看
+- 支持 `master_key` 保护 `/v1/*` 和 `/api/*`
 
 ## 核心概念
 
 | 概念 | 说明 |
 | --- | --- |
-| Route | 稳定的下游模型名，例如 `gpt-5.4`。客户端始终请求它。 |
-| Channel | Route 下的一条具体上游通道，包含 `base_url`、`api_key`、`upstream_model`、`protocol`、`priority`。 |
-| Protocol | 显式指定的上游协议类型，只能是 `responses`、`chat_completions`、`messages`。 |
-| Priority | 选路优先级，数值越小越优先。只在最小 `priority` 组内继续选路。 |
-| Cooldown | 自动冷却机制。运行时请求失败后进入倒计时，时间到后自动恢复。 |
+| Route | 稳定的下游模型名，例如 `gpt-5.4` |
+| Channel | Route 下的一条具体上游通道，包含 `base_url`、`api_key`、`upstream_model`、`protocol`、`priority` |
+| Protocol | 上游协议类型，只能是 `responses` / `chat_completions` / `messages` |
+| Priority | 越小越优先，只在最小 `priority` 组内继续选路 |
+| Cooldown | 请求失败后的自动冷却状态，带倒计时 |
 
-## 当前能力
+## 安装
 
-- 支持下游入口：
-  - `POST /v1/responses`
-  - `POST /v1/chat/completions`
-  - `POST /v1/messages`
-- 支持上游协议：
-  - `responses`
-  - `chat_completions`
-  - `messages`
-- 支持流式与非流式转发
-- 支持 `chat/completions` 的 `tools / tool_calls`
-- 支持 Anthropic `messages`
-- 支持最小管理 API
-- 支持 SSH/TUI 运维
-- 支持 `t / T` 主动测活
-- 支持 `llmrouter.toml` 启动导入
-- 支持 `master_key` 保护 `/v1/*` 与 `/api/*`
-- 支持 Linux / Windows 发布资产
-
-## 明确不做什么
-
-为了保持轻量和可维护，当前版本明确不做：
-
-- Web UI
-- 多用户系统
-- 计费、配额、多租户
-- 复杂统计大屏
-- 插件系统
-- 多层熔断、健康分、概率修正
-- 为兼容历史行为而长期保留多套路径
-
-## 路由与协议规则
-
-### 显式协议
-
-每个 channel 都必须显式绑定一个上游协议：
-
-- `responses`
-- `chat_completions`
-- `messages`
-
-添加 channel 时，`protocol` 是必填项，不再默认 `responses`。
-
-### 当前兼容矩阵
-
-| 下游请求 | 上游 channel |
-| --- | --- |
-| `responses` | `responses` |
-| `chat_completions` | `chat_completions` |
-| `messages` | `messages` |
-| `chat_completions` | `responses`，通过薄适配层兼容 |
-
-当前不支持：
-
-- `responses -> chat_completions`
-- `responses -> messages`
-- `messages -> responses`
-- `messages -> chat_completions`
-
-### 选路规则
-
-`llmrouter` 采用“确定性优先”的选路风格：
-
-1. 根据请求里的 `model` 精确匹配 route
-2. 过滤不可用 channel：
-   - `channel.enabled = false`
-   - account inactive
-   - site inactive
-   - manual blocked
-   - cooldown 未到期
-   - protocol 不兼容
-3. 取最小 `priority` 的可用组
-4. 在同优先级组内，优先选择协议直连的 channel
-5. 只有同优先级组内没有直连时，才尝试有限协议适配
-6. 若仍有多个候选，则按添加顺序落到具体 channel
-
-已移除 `weight`。当前选路是明确、稳定、可解释的，不是随机加权。
-
-## 状态模型
-
-TUI 与管理面主要展示四种状态：
-
-| 状态 | 说明 |
-| --- | --- |
-| `RUN` | 通道可用 |
-| `COOL 23s` | 运行时请求失败后进入自动冷却，显示剩余秒数 |
-| `UNAVAIL` | 不可用，通常是手动阻断或主动测活失败 |
-| `OFF` | 手动禁用，不参与选路 |
-
-### 主动测活语义
-
-- `t`：测活当前 channel
-- `T`：顺序测活当前 route 下全部 channel
-- 测活成功：恢复为 `RUN`
-- 测活失败：默认进入 `UNAVAIL`
-- `COOL` 主要保留给真实请求路径里的自动冷却，不作为主动测活失败的默认结果
-
-### 错误分类
-
-当前主要错误类型：
-
-- `auth_error`
-- `rate_limited`
-- `upstream_server_error`
-- `transport_error`
-- `edge_blocked`
-- `upstream_path_error`
-- `unknown_error`
-
-可以按错误类型配置不同冷却秒数，也可以让某些错误直接进入人工处理状态。
-
-## 快速开始
-
-### 方式一：直接下载 Release
-
-发布页：
+Release：
 
 - <https://github.com/nodca/routellm/releases>
 
-当前提供：
+安装脚本默认拉取最新 release。
 
-- Linux `x86_64`
-- Windows `x86_64`
-
-### 方式二：安装脚本
-
-#### 安装命令速查
-
-Linux:
+### Linux
 
 ```bash
 # server，systemd 开机自启动
@@ -187,10 +55,12 @@ curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/uninstall-local.sh | sudo bash
 ```
 
-Windows:
+### Windows
+
+请在管理员 PowerShell 中运行 `server` 和单机安装命令。
 
 ```powershell
-# server，默认注册开机自启动任务
+# server，注册开机自启动任务
 irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.ps1 | iex
 
 # TUI
@@ -203,99 +73,33 @@ irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-local.
 irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/uninstall-local.ps1 | iex
 ```
 
-说明：
+安装后：
 
-- Linux 的 `server` 和单机模式会安装为 `systemd` 服务并开机自启动
-- Windows 的 `server` 和单机模式请在管理员 PowerShell 中运行，会注册开机自启动计划任务
-- 所有脚本默认下载最新 release，无需手动填写版本号
+- Linux TUI 直接运行 `lrtui`
+- Windows TUI 新开终端后直接运行 `lrtui`
 
-#### Linux 单机模式
-
-本机 server + 本机 TUI，一次装好。server 默认只监听本机 `127.0.0.1:1290`，并启用 systemd 自启动。
+从本机 `cc-switch` 导入：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-local.sh | \
-  sudo bash
+# 默认读取 ~/.cc-switch/cc-switch.db
+lrtui --import cc-switch
+
+# 或显式指定 sqlite 路径
+lrtui --import /path/to/cc-switch.db
 ```
 
-脚本会自动：
+## 快速开始
 
-- 安装 `llmrouter` server
-- 配置 systemd 开机自启
-- 为当前登录用户安装 `llmrouter-tui` 和 `lrtui`
-- 把本机地址和同一把管理 `KEY` 写进 TUI 配置
+### 本机模式
 
-一键卸载：
+最简单的方式是单机安装，然后：
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/uninstall-local.sh | \
-  sudo bash
-```
+1. 编辑 `llmrouter.toml`，加入 route 和 channel
+2. server 自动启动或重启服务
+3. 用 `lrtui` 进入 TUI 管理
+4. 下游客户端把 Base URL 指向 `http://127.0.0.1:1290/v1`
 
-#### Linux Server
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh | \
-  sudo bash
-```
-
-默认安装到 `/opt/llmrouter`，适合 root 管理的服务端部署。非 root 安装建议改成：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh | \
-  bash -s -- \
-    --install-dir "$HOME/.local/share/llmrouter" \
-    --env-file "$HOME/.config/llmrouter/server.env" \
-    --skip-systemd
-```
-
-#### Linux TUI
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.sh | \
-  bash -s -- --server http://127.0.0.1:1290
-```
-
-安装后可直接运行 `lrtui`。
-
-`llmrouter-tui` 会优先读取本地保存的连接配置；如果没有配置，首次启动会引导你填写一次 `Server URL` 和管理 `KEY`，之后自动复用。
-
-#### Windows Server
-
-```powershell
-irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.ps1 | iex
-```
-
-请在管理员 PowerShell 中运行。默认安装到 `%LOCALAPPDATA%\llmrouter`，并注册 `llmrouter` 开机自启动任务。
-
-#### Windows 单机模式
-
-本机 `server + tui` 一次装好。`server` 默认监听 `127.0.0.1:1290`，并注册开机自启动任务。
-
-```powershell
-irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-local.ps1 | iex
-```
-
-请在管理员 PowerShell 中运行。
-
-#### Windows TUI
-
-```powershell
-irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.ps1 | iex
-```
-
-Windows TUI 默认也放在 `%LOCALAPPDATA%\llmrouter`。
-安装脚本会写入本地配置，并创建 `lrtui.cmd`，同时把安装目录加入用户 `PATH`。新开一个终端后可直接运行 `lrtui`。
-
-Windows 一键卸载：
-
-```powershell
-irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/uninstall-local.ps1 | iex
-```
-
-## 启动方式
-
-### 直接启动服务端
+### 手动启动
 
 ```bash
 LLMROUTER_BIND_ADDR=127.0.0.1:1290 \
@@ -305,95 +109,107 @@ LLMROUTER_CONFIG_PATH=./examples/llmrouter.toml \
 ./target/release/llmrouter
 ```
 
-### 校验配置文件
-
-```bash
-./target/release/llmrouter check-config ./examples/llmrouter.toml
-```
-
-如果已经设置了 `LLMROUTER_CONFIG_PATH`，也可以：
-
-```bash
-LLMROUTER_CONFIG_PATH=./examples/llmrouter.toml ./target/release/llmrouter check-config
-```
-
-### 启动 TUI
-
 ```bash
 LLMROUTER_BASE_URL=http://127.0.0.1:1290 \
 LLMROUTER_AUTH_KEY=sk-llmrouter-local \
 ./target/release/llmrouter-tui
 ```
 
-这组环境变量主要用于临时覆盖。正常使用时，`llmrouter-tui` 会自动读取本地配置文件：
-
-- Linux/macOS: `~/.config/llmrouter/tui.env`
-- Windows: `%LOCALAPPDATA%\llmrouter\tui.env`
-
-## 部署方式
-
-### 1. 本机一体化
-
-适合个人本地使用：
-
-- server 和 TUI 都在同一台机器
-- TUI 连接本机 `http://127.0.0.1:1290`
-
-### 2. 远程 Server + 本地 TUI
-
-适合常见的“服务器承接流量，本地管理”：
-
-- server 部署在 Linux VPS 或常开机器
-- TUI 在本地电脑运行
-- TUI 首次连接时填写远程 server 地址
-- 如果 server 开启了 `master_key`，TUI 填一次同一把管理 key 后本地保存
-
-示例：
+校验配置：
 
 ```bash
-LLMROUTER_BASE_URL=http://your-server-ip:1290 \
-LLMROUTER_AUTH_KEY=sk-llmrouter-your-key \
-lrtui
+./target/release/llmrouter check-config ./examples/llmrouter.toml
 ```
 
-## TUI 是什么，不是什么
+## 路由规则
 
-TUI 是 `llmrouter` 的应用级管理终端。
+每个 channel 都必须显式指定协议：
 
-它可以管理：
+- `responses`
+- `chat_completions`
+- `messages`
 
-- route
-- channel
-- 启用 / 禁用 / 恢复
-- 主动测活
-- 查看日志
-- 新增 / 编辑 / 删除 channel
+当前兼容关系：
 
-它不能直接管理：
+| 下游请求 | 上游 channel |
+| --- | --- |
+| `responses` | `responses` |
+| `chat_completions` | `chat_completions` |
+| `messages` | `messages` |
+| `chat_completions` | `responses`，通过薄兼容层转换 |
 
-- systemd 服务启停
-- server 进程重启
-- 系统端口、系统环境、主机资源
+当前不支持：
 
-也就是说：
+- `responses -> chat_completions`
+- `responses -> messages`
+- `messages -> responses`
+- `messages -> chat_completions`
 
-- TUI 可以远程管理 server 里的“应用状态”
-- 但不能替代 `systemctl`、SSH 或系统级运维工具
+选路顺序：
 
-## TUI 界面与快捷键
+1. 根据请求里的 `model` 匹配 route
+2. 过滤不可用 channel：
+   `OFF`、`UNAVAIL`、冷却中、协议不兼容、站点/账号不可用
+3. 取最小 `priority` 的可用组
+4. 同优先级内优先直连协议
+5. 同优先级且同协议成本时，优先历史延迟更低的 channel
+6. 最后按添加顺序稳定落位
 
-### 界面布局
+## 状态与故障处理
+
+主要状态：
+
+| 状态 | 说明 |
+| --- | --- |
+| `RUN` | 可用 |
+| `COOL 23s` | 自动冷却中 |
+| `UNAVAIL` | 不可用，通常是手动阻断或主动测活失败 |
+| `OFF` | 手动禁用 |
+| `PROBING` | 正在主动测活 |
+
+主动测活：
+
+- `t`：测活当前 channel
+- `T`：顺序测活当前 route 下全部 channel
+- 测活成功回到 `RUN`
+- 测活失败默认进入 `UNAVAIL`
+
+运行时策略：
+
+- 请求失败会进入冷却或不可用状态
+- 同一次请求内会尝试切到下一个可用 channel
+- 如果当前 route 下所有 channel 都不可用，会直接返回错误，不无限等待
+
+## TUI
+
+布局：
 
 - 左侧：Routes
 - 右上：Channels
 - 右下：Logs
 - 底部：Status
 
-### 常用快捷键
+导入 `cc-switch`：
+
+- `lrtui --import cc-switch`
+- `lrtui --import /path/to/cc-switch.db`
+
+导入时会自动确保这三个 route 存在：
+
+- `gpt-5.4`
+- `claude-opus-4-6`
+- `gemini-3.1-pro-preview`
+
+CLI 执行结束后会打印：
+
+- `imported_channels`
+- `created_routes`
+- `skipped`
+
+常用快捷键：
 
 | 按键 | 功能 |
 | --- | --- |
-| `Tab` | 在 Routes / Channels / Logs 之间切换 |
 | `Left/Right` | 左右切换 pane |
 | `Up/Down` | 移动选中项 |
 | `Home/End` | 跳到顶部 / 底部 |
@@ -403,23 +219,22 @@ TUI 是 `llmrouter` 的应用级管理终端。
 | `i` | 编辑当前 channel |
 | `x` | 删除当前项 |
 | `Space` | 快速切换 channel 状态 |
-| `e` | 启用 channel |
-| `d` | 禁用 channel |
 | `c` | 恢复 channel，清掉冷却 / 阻断 |
-| `t` | 主动测活当前 channel |
-| `T` | 主动测活当前 route 下全部 channel |
+| `t` | 测活当前 channel |
+| `T` | 测活当前 route |
 | `u` | 复制下游 Base URL |
 | `K` | 复制下游 API Key |
 | `Enter` | 进入或查看详情 |
 | `Esc` | 返回 / 取消 |
-| `y / n` | 确认弹窗 |
 | `r` | 刷新 |
 | `?` | 帮助 |
 | `q` | 退出 |
 
-## 配置文件
+TUI 能管理应用状态，但不能替代系统级运维工具。服务启停、systemd、计划任务这些仍然由系统管理。
 
-`llmrouter` 支持用 `llmrouter.toml` 描述静态拓扑，sqlite 负责保存运行态状态和日志。
+## 配置
+
+`llmrouter.toml` 描述静态拓扑，SQLite 保存运行态状态和日志。
 
 最小示例：
 
@@ -467,47 +282,29 @@ priority = 1
 enabled = true
 ```
 
-### channel 字段说明
+channel 字段：
 
 | 字段 | 说明 |
 | --- | --- |
-| `base_url` | 上游站点根地址，可直接填写带 `/v1` 的兼容地址 |
+| `base_url` | 上游根地址，可直接填写带 `/v1` 的兼容地址 |
 | `api_key` | 上游 key |
 | `upstream_model` | 实际发给上游的模型名 |
-| `protocol` | 必填，只能是 `responses` / `chat_completions` / `messages` |
+| `protocol` | 必填，`responses` / `chat_completions` / `messages` |
 | `priority` | 必须 `>= 0`，越小越优先 |
 | `enabled` | 是否启用 |
 
-## 环境变量
+## 鉴权与 API
 
-### 服务端
+如果设置了 `master_key`，以下接口统一要求 Bearer Token：
 
-- `LLMROUTER_BIND_ADDR`
-- `LLMROUTER_DATABASE_URL`
-- `LLMROUTER_REQUEST_TIMEOUT_SECS`
-- `LLMROUTER_MASTER_KEY`
-- `LLMROUTER_CONFIG_PATH`
+- `/v1/*`
+- `/api/*`
 
-### TUI
+`/healthz` 不鉴权。
 
-- `LLMROUTER_BASE_URL`
-- `LLMROUTER_AUTH_KEY`
-
-通常不需要每次手动设置。它们主要用于：
-
-- 首次安装时由脚本写入本地配置
-- 临时覆盖默认连接目标
-- CI、脚本化启动或调试
-
-## 管理 API
-
-### 健康检查
+管理 API：
 
 - `GET /healthz`
-
-### 管理接口
-
-- `GET /api/routes/decision?model=...`
 - `GET /api/routes`
 - `POST /api/routes`
 - `DELETE /api/routes/:id`
@@ -522,113 +319,22 @@ enabled = true
 - `POST /api/channels/:id/disable`
 - `POST /api/channels/:id/reset-cooldown`
 
-## 下游鉴权
-
-如果设置了 `master_key`，以下接口会统一要求 Bearer Token：
-
-- `/v1/*`
-- `/api/*`
-
-`/healthz` 不鉴权。
-
-最简单的本机模式可以这样配：
-
-```bash
-export LLMROUTER_MASTER_KEY=sk-llmrouter-local
-export LLMROUTER_AUTH_KEY=sk-llmrouter-local
-export LLMROUTER_BASE_URL=http://127.0.0.1:1290
-```
-
-此时：
-
-- 下游客户端把 `Base URL` 设为 `http://127.0.0.1:1290/v1`
-- `API Key` 设为 `sk-llmrouter-local`
-- TUI 也使用同一个 key 连接服务端
-
-但如果你使用了安装脚本，通常不用手动 export 这些变量：
-
-- `install-local.sh` 会把本机地址和管理 key 自动写进 TUI 配置
-- `llmrouter-tui` 也支持首次启动引导，填一次后自动保存
-
-## 协议支持
-
-### 下游入口
-
-- OpenAI `responses`
-- OpenAI `chat/completions`
-- Anthropic `messages`
-
-### 上游能力
-
-- `responses`
-  - 支持流式与非流式
-- `chat_completions`
-  - 支持原生直连
-  - 也支持通过薄兼容层适配到 `responses`
-- `messages`
-  - 上游走 `/v1/messages`
-  - 使用 `x-api-key`
-  - 自动带 `anthropic-version: 2023-06-01`
-
-### `chat/completions` 薄兼容层
-
-当前已经支持：
-
-- chat 请求映射到 responses
-- 非流式 JSON 映射回 chat completion
-- 流式 SSE 映射为 `chat.completion.chunk`
-- `tools / tool_calls`
-
-## 配置导入与运行态
-
-设计上：
-
-- `llmrouter.toml` 是静态拓扑真源
-- sqlite 负责运行态状态与日志
-
-当前实现是：
-
-- server 启动时读取 `LLMROUTER_CONFIG_PATH`
-- 把 route/channel 同步进 sqlite
-- 运行过程中继续在 sqlite 里维护：
-  - cooldown
-  - fail count
-  - manual blocked
-  - request logs
-
-也就是说，当前版本还不是纯文件模式，sqlite 仍然是必要组件。
-
 ## 当前限制
 
-- 还没有独立的测活面板
-- `T` 是 TUI 顺序调用单通道 probe，不是专门的异步批量任务
 - 没有 Web UI
-- 没有多用户 / token 管理系统
-- 没有复杂批量管理功能
-- 没有 alias 模型系统
-- 没有自动协议探测
-- 还没有完全去 sqlite 化
-- Windows 已可发布和运行，但主支持平台仍然更偏 Linux
+- 没有多用户、计费、配额、多租户
+- 没有复杂智能调度和黑盒负载均衡
+- `T` 目前是顺序 probe，不是独立异步批任务
+- 还没有自动协议探测
+- 仍然依赖 SQLite 保存运行态
+- Windows 可用，但主支持平台仍更偏 Linux
 
-## 开发验证
+## 开发
 
 ```bash
 cargo fmt
 cargo test
 ```
-
-当前测试覆盖：
-
-- 配置解析
-- 协议校验
-- 路由选择
-- responses / chat / messages 转发
-- tools / tool_calls 映射
-- 冷却与人工阻断
-- 主动 probe 成功 / 失败
-- 管理 API
-- `master_key`
-- TUI 部分辅助逻辑
 
 ## License
 

@@ -103,7 +103,7 @@ mod tests {
                 model: "gpt-5.4".to_string(),
                 cooldown_seconds: 600,
                 channels: vec![ConfiguredChannel {
-                    base_url: "https://api.example.com".to_string(),
+                    base_url: "https://api.example.com/v1".to_string(),
                     api_key: "sk-1".to_string(),
                     upstream_model: "gpt-5.4".to_string(),
                     protocol: "messages".to_string(),

@@ -799,7 +799,7 @@ pub(crate) fn normalize_base_url(base_url: &str) -> Result<String, AppError> {
             "field `base_url` must start with http:// or https://".to_string(),
         ));
     }
-    Ok(trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string())
+    Ok(trimmed.to_string())
 }
 
 fn normalize_api_key(api_key: &str) -> Result<&str, AppError> {

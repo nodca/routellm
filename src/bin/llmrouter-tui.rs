@@ -28,6 +28,11 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::mpsc;
 use tokio::time::{self, MissedTickBehavior};
 
+use llmrouter::cc_switch::{
+    DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL, DEFAULT_GEMINI_MODEL, ImportCandidate,
+    load_cc_switch_import,
+};
+
 #[derive(Debug, Deserialize, Clone)]
 struct ApiResponse<T> {
     data: T,
@@ -194,11 +199,156 @@ fn toggle_action_for_channel(channel: &ChannelSummary) -> ChannelAction {
 #[derive(Debug, Clone)]
 enum AppMode {
     Browse,
+    SelectProvider(ProviderSelectDialog),
+    SelectProtocol(ProtocolSelectDialog),
     OnboardRoute(OnboardRouteForm),
     EditChannel(EditChannelForm),
     Confirm(ConfirmDialog),
     Search(SearchDialog),
     Detail(DetailDialog),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelProvider {
+    OpenAiCompatible,
+    Gemini,
+    Anthropic,
+}
+
+impl ChannelProvider {
+    fn all() -> [Self; 3] {
+        [Self::OpenAiCompatible, Self::Gemini, Self::Anthropic]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "OpenAI-compatible",
+            Self::Gemini => "Gemini",
+            Self::Anthropic => "Anthropic",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "OpenAI 或国产兼容站。常见前缀是根域名或 /v1。",
+            Self::Gemini => "Google Gemini 官方兼容入口。会规范到 /v1beta/openai。",
+            Self::Anthropic => "Anthropic Messages 协议。常见前缀是根域名或 /v1。",
+        }
+    }
+
+    fn protocol_options(self) -> &'static [&'static str] {
+        match self {
+            Self::OpenAiCompatible => &["responses", "chat_completions"],
+            Self::Gemini => &["chat_completions"],
+            Self::Anthropic => &["messages"],
+        }
+    }
+
+    fn normalize_base_url(self, raw_base_url: &str, protocol: &str) -> String {
+        let trimmed = raw_base_url.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            return String::new();
+        }
+
+        match self {
+            Self::OpenAiCompatible => match protocol {
+                "responses" => trimmed
+                    .strip_suffix("/v1/responses")
+                    .or_else(|| trimmed.strip_suffix("/responses"))
+                    .unwrap_or(trimmed)
+                    .to_string(),
+                "chat_completions" => trimmed
+                    .strip_suffix("/v1/chat/completions")
+                    .or_else(|| trimmed.strip_suffix("/chat/completions"))
+                    .unwrap_or(trimmed)
+                    .to_string(),
+                _ => trimmed.to_string(),
+            },
+            Self::Gemini => {
+                let without_endpoint = trimmed
+                    .strip_suffix("/v1beta/openai/chat/completions")
+                    .or_else(|| trimmed.strip_suffix("/chat/completions"))
+                    .unwrap_or(trimmed);
+                if without_endpoint.ends_with("/v1beta/openai") {
+                    without_endpoint.to_string()
+                } else if without_endpoint.ends_with("/v1beta") {
+                    format!("{without_endpoint}/openai")
+                } else {
+                    format!("{without_endpoint}/v1beta/openai")
+                }
+            }
+            Self::Anthropic => trimmed
+                .strip_suffix("/v1/messages")
+                .or_else(|| trimmed.strip_suffix("/messages"))
+                .unwrap_or(trimmed)
+                .to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderSelectDialog {
+    route_id: i64,
+    route_model: String,
+    selected: usize,
+}
+
+impl ProviderSelectDialog {
+    fn new(route: &RouteSummary) -> Self {
+        Self {
+            route_id: route.id,
+            route_model: route.model_pattern.clone(),
+            selected: 0,
+        }
+    }
+
+    fn selected_provider(&self) -> ChannelProvider {
+        ChannelProvider::all()[self.selected]
+    }
+
+    fn next(&mut self) {
+        self.selected = (self.selected + 1) % ChannelProvider::all().len();
+    }
+
+    fn previous(&mut self) {
+        self.selected = (self.selected + ChannelProvider::all().len() - 1)
+            % ChannelProvider::all().len();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProtocolSelectDialog {
+    route_id: i64,
+    route_model: String,
+    provider: ChannelProvider,
+    selected: usize,
+}
+
+impl ProtocolSelectDialog {
+    fn new(route_id: i64, route_model: String, provider: ChannelProvider) -> Self {
+        Self {
+            route_id,
+            route_model,
+            provider,
+            selected: 0,
+        }
+    }
+
+    fn options(&self) -> &'static [&'static str] {
+        self.provider.protocol_options()
+    }
+
+    fn selected_protocol(&self) -> &'static str {
+        self.options()[self.selected]
+    }
+
+    fn next(&mut self) {
+        self.selected = (self.selected + 1) % self.options().len();
+    }
+
+    fn previous(&mut self) {
+        self.selected = (self.selected + self.options().len() - 1) % self.options().len();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,7 +444,10 @@ enum DetailDialog {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FormMode {
     NewRoute,
-    AddChannel { route_id: i64 },
+    AddChannel {
+        route_id: i64,
+        provider: ChannelProvider,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -437,14 +590,17 @@ impl OnboardRouteForm {
         }
     }
 
-    fn add_channel(route: &RouteSummary) -> Self {
+    fn add_channel(route: &RouteSummary, provider: ChannelProvider, protocol: &str) -> Self {
         Self {
-            mode: FormMode::AddChannel { route_id: route.id },
+            mode: FormMode::AddChannel {
+                route_id: route.id,
+                provider,
+            },
             route_model: route.model_pattern.clone(),
             base_url: String::new(),
             api_key: String::new(),
             upstream_model: route.model_pattern.clone(),
-            protocol: String::new(),
+            protocol: protocol.to_string(),
             priority: "0".to_string(),
             active_field: OnboardRouteField::BaseUrl,
         }
@@ -472,6 +628,13 @@ impl OnboardRouteForm {
         }
     }
 
+    fn provider(&self) -> Option<ChannelProvider> {
+        match self.mode {
+            FormMode::NewRoute => None,
+            FormMode::AddChannel { provider, .. } => Some(provider),
+        }
+    }
+
     fn to_add_channel_request(&self) -> Result<CreateRouteFormRequest, String> {
         let route_model = self.route_model.trim().to_string();
         if route_model.is_empty() {
@@ -491,6 +654,10 @@ impl OnboardRouteForm {
         let priority = parse_optional_i64(&self.priority, "priority")?;
         let upstream_model = self.upstream_model.trim();
         let protocol = normalize_protocol_input(&self.protocol)?;
+        let provider = self
+            .provider()
+            .ok_or_else(|| "provider is required".to_string())?;
+        let base_url = provider.normalize_base_url(&base_url, &protocol);
 
         Ok(CreateRouteFormRequest {
             route_model,
@@ -517,7 +684,7 @@ impl OnboardRouteForm {
     fn to_submission(&self) -> Result<FormSubmission, String> {
         match self.mode {
             FormMode::NewRoute => Ok(FormSubmission::CreateRoute(self.to_create_route_request()?)),
-            FormMode::AddChannel { route_id } => {
+            FormMode::AddChannel { route_id, .. } => {
                 let request = self.to_add_channel_request()?;
                 Ok(FormSubmission::AddChannel {
                     route_id,
@@ -1172,7 +1339,7 @@ impl App {
             return;
         };
         let route = route.clone();
-        self.mode = AppMode::OnboardRoute(OnboardRouteForm::add_channel(&route));
+        self.mode = AppMode::SelectProvider(ProviderSelectDialog::new(&route));
     }
 
     fn open_new_route_form(&mut self) {
@@ -1843,6 +2010,10 @@ impl App {
     async fn handle_mode_key(&mut self, key: KeyCode) -> bool {
         match key {
             KeyCode::Esc => match self.mode {
+                AppMode::SelectProvider(_) | AppMode::SelectProtocol(_) => {
+                    self.close_mode("cancelled add channel");
+                    true
+                }
                 AppMode::OnboardRoute(_) => {
                     self.close_mode("cancelled onboarding");
                     true
@@ -1876,6 +2047,32 @@ impl App {
                 },
             },
             KeyCode::Enter => match self.mode {
+                AppMode::SelectProvider(ref dialog) => {
+                    self.mode = AppMode::SelectProtocol(ProtocolSelectDialog::new(
+                        dialog.route_id,
+                        dialog.route_model.clone(),
+                        dialog.selected_provider(),
+                    ));
+                    true
+                }
+                AppMode::SelectProtocol(ref dialog) => {
+                    let route = RouteSummary {
+                        id: dialog.route_id,
+                        model_pattern: dialog.route_model.clone(),
+                        enabled: true,
+                        routing_strategy: String::new(),
+                        channel_count: 0,
+                        ready_channel_count: 0,
+                        cooling_channel_count: 0,
+                        manual_blocked_channel_count: 0,
+                    };
+                    self.mode = AppMode::OnboardRoute(OnboardRouteForm::add_channel(
+                        &route,
+                        dialog.provider,
+                        dialog.selected_protocol(),
+                    ));
+                    true
+                }
                 AppMode::OnboardRoute(_) => {
                     self.submit_add_channel_form().await;
                     true
@@ -1899,6 +2096,14 @@ impl App {
                 AppMode::Browse => false,
             },
             KeyCode::Down => match &mut self.mode {
+                AppMode::SelectProvider(dialog) => {
+                    dialog.next();
+                    true
+                }
+                AppMode::SelectProtocol(dialog) => {
+                    dialog.next();
+                    true
+                }
                 AppMode::OnboardRoute(form) => {
                     form.next_field();
                     true
@@ -1911,6 +2116,14 @@ impl App {
                 AppMode::Browse => false,
             },
             KeyCode::Up => match &mut self.mode {
+                AppMode::SelectProvider(dialog) => {
+                    dialog.previous();
+                    true
+                }
+                AppMode::SelectProtocol(dialog) => {
+                    dialog.previous();
+                    true
+                }
                 AppMode::OnboardRoute(form) => {
                     form.previous_field();
                     true
@@ -1927,6 +2140,7 @@ impl App {
                     form.backspace();
                     true
                 }
+                AppMode::SelectProvider(_) | AppMode::SelectProtocol(_) => false,
                 AppMode::EditChannel(form) => {
                     form.backspace();
                     true
@@ -1943,6 +2157,7 @@ impl App {
                     form.push_char(ch);
                     true
                 }
+                AppMode::SelectProvider(_) | AppMode::SelectProtocol(_) => false,
                 AppMode::EditChannel(form) => {
                     form.push_char(ch);
                     true
@@ -2021,11 +2236,116 @@ impl App {
         self.delete_empty(&format!("/api/routes/{route_id}"), "delete route")
             .await
     }
+
+    async fn import_cc_switch(&self, source_path: Option<&Path>) -> Result<ImportExecutionSummary, String> {
+        let parsed = load_cc_switch_import(source_path)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut skipped = parsed.skipped;
+        let mut created_routes = 0_usize;
+
+        let default_routes = [
+            DEFAULT_CODEX_MODEL,
+            DEFAULT_CLAUDE_MODEL,
+            DEFAULT_GEMINI_MODEL,
+        ];
+
+        let mut route_ids = std::collections::HashMap::new();
+        for route_model in default_routes {
+            let response = self
+                .create_route(&CreateRouteRequest {
+                    route_model: route_model.to_string(),
+                    cooldown_seconds: None,
+                })
+                .await?;
+            if response.created {
+                created_routes += 1;
+            }
+            route_ids.insert(route_model.to_string(), response.route.id);
+        }
+
+        let mut existing_channels = std::collections::HashMap::new();
+        for route_model in default_routes {
+            let route_id = *route_ids
+                .get(route_model)
+                .ok_or_else(|| format!("route id missing for {route_model}"))?;
+            let envelope = self.fetch_route_channels(route_id).await?;
+            existing_channels.insert(route_model.to_string(), envelope.channels);
+        }
+
+        let mut imported_channels = 0_usize;
+        for candidate in parsed.channels {
+            let route_id = *route_ids
+                .get(&candidate.route_model)
+                .ok_or_else(|| format!("route id missing for {}", candidate.route_model))?;
+
+            let channels = existing_channels
+                .entry(candidate.route_model.clone())
+                .or_insert_with(Vec::new);
+            if channels
+                .iter()
+                .any(|channel| is_same_import_channel(channel, &candidate))
+            {
+                skipped.push(format!(
+                    "{} skipped: duplicate channel {} {} {}",
+                    candidate.route_model, candidate.protocol, candidate.upstream_model, candidate.base_url
+                ));
+                continue;
+            }
+
+            let created = self
+                .create_route_channel(
+                    route_id,
+                    &CreateRouteChannelRequest {
+                        base_url: candidate.base_url.clone(),
+                        api_key: candidate.api_key.clone(),
+                        upstream_model: Some(candidate.upstream_model.clone()),
+                        protocol: candidate.protocol.clone(),
+                        priority: Some(0),
+                    },
+                )
+                .await?;
+            channels.push(created);
+            imported_channels += 1;
+        }
+
+        Ok(ImportExecutionSummary {
+            source_path: parsed.source_path,
+            imported_channels,
+            created_routes,
+            skipped,
+        })
+    }
+}
+
+fn is_same_import_channel(existing: &ChannelSummary, candidate: &ImportCandidate) -> bool {
+    existing.site_base_url.trim_end_matches('/') == candidate.base_url.trim_end_matches('/')
+        && existing.upstream_model == candidate.upstream_model
+        && existing.protocol == candidate.protocol
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
+
+    match parse_tui_command(env::args().skip(1).collect())? {
+        TuiCommand::ImportCcSwitch(path) => {
+            let startup = load_tui_startup_config()?;
+            let (probe_tx, _) = mpsc::unbounded_channel();
+            let app = App::new(startup.base_url, startup.auth_key, probe_tx);
+            let summary = app.import_cc_switch(path.as_deref()).await?;
+            println!("cc-switch import ok");
+            println!("source={}", summary.source_path.display());
+            println!("imported_channels={}", summary.imported_channels);
+            println!("created_routes={}", summary.created_routes);
+            println!("skipped={}", summary.skipped.len());
+            for skipped in summary.skipped {
+                println!("skip: {skipped}");
+            }
+            return Ok(());
+        }
+        TuiCommand::Run => {}
+    }
 
     let startup = load_tui_startup_config()?;
     let base_url = startup.base_url;
@@ -2043,10 +2363,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
     result
 }
 
+fn parse_tui_command(args: Vec<String>) -> Result<TuiCommand, Box<dyn Error>> {
+    match args.as_slice() {
+        [] => Ok(TuiCommand::Run),
+        [flag, source] if flag == "--import" && source == "cc-switch" => {
+            Ok(TuiCommand::ImportCcSwitch(None))
+        }
+        [flag, source] if flag == "--import" => {
+            Ok(TuiCommand::ImportCcSwitch(Some(PathBuf::from(source))))
+        }
+        _ => Err("usage: lrtui [--import cc-switch|/path/to/cc-switch.db]".into()),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TuiStartupConfig {
     base_url: String,
     auth_key: Option<String>,
+}
+
+enum TuiCommand {
+    Run,
+    ImportCcSwitch(Option<PathBuf>),
+}
+
+struct ImportExecutionSummary {
+    source_path: PathBuf,
+    imported_channels: usize,
+    created_routes: usize,
+    skipped: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -2286,6 +2631,8 @@ fn draw(frame: &mut Frame, app: &App) {
     }
 
     match &app.mode {
+        AppMode::SelectProvider(dialog) => draw_provider_select_modal(frame, dialog),
+        AppMode::SelectProtocol(dialog) => draw_protocol_select_modal(frame, dialog),
         AppMode::OnboardRoute(form) => {
             if matches!(form.mode, FormMode::AddChannel { .. }) {
                 draw_add_channel_modal(frame, form);
@@ -2770,6 +3117,10 @@ fn pane_label(base: &str, count: usize, query: Option<&str>) -> String {
 
 fn shortcut_hint_line(app: &App) -> Line<'static> {
     let groups: &[(&str, &[(&str, &str)])] = match app.mode {
+        AppMode::SelectProvider(_) | AppMode::SelectProtocol(_) => &[(
+            "Select",
+            &[("Up/Down", "choose"), ("Enter", "confirm"), ("Esc", "cancel")],
+        )],
         AppMode::OnboardRoute(_) | AppMode::EditChannel(_) => &[(
             "Form",
             &[("Up/Down", "field"), ("Enter", "submit"), ("Esc", "cancel")],
@@ -3230,6 +3581,14 @@ fn draw_add_channel_modal(frame: &mut Frame, form: &OnboardRouteForm) {
 
     let mut lines = vec![
         Line::from(vec![
+            Span::styled("Provider: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(
+                form.provider()
+                    .map(ChannelProvider::label)
+                    .unwrap_or("Custom"),
+            ),
+        ]),
+        Line::from(vec![
             Span::styled("Preview: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(format!(
                 "{} -> {} @ {}",
@@ -3239,8 +3598,8 @@ fn draw_add_channel_modal(frame: &mut Frame, form: &OnboardRouteForm) {
             )),
         ]),
         Line::from(vec![
-            Span::styled("Probe: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("submit 前会按 protocol 真实测活一次，失败不会保存。"),
+            Span::styled("Normalize: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("提交前会按 Provider 规范化 base_url 前缀，再按 protocol 拼接真实请求路径。"),
         ]),
         Line::from(""),
     ];
@@ -3311,6 +3670,75 @@ fn draw_add_channel_modal(frame: &mut Frame, form: &OnboardRouteForm) {
         .block(Block::default().borders(Borders::ALL).title(form.title()))
         .wrap(Wrap { trim: true });
     frame.render_widget(widget, area);
+}
+
+fn draw_provider_select_modal(frame: &mut Frame, dialog: &ProviderSelectDialog) {
+    let area = centered_rect(60, 42, frame.area());
+    frame.render_widget(Clear, area);
+
+    let items = ChannelProvider::all()
+        .iter()
+        .map(|provider| {
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(provider.label(), Style::default().add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(Span::styled(
+                    provider.description(),
+                    Style::default().fg(Color::Gray),
+                )),
+            ])
+        })
+        .collect::<Vec<_>>();
+
+    let mut state = ListState::default().with_selected(Some(dialog.selected));
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Select Provider ({})", dialog.route_model)),
+        )
+        .highlight_style(list_highlight_style())
+        .highlight_symbol("┃ ");
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_protocol_select_modal(frame: &mut Frame, dialog: &ProtocolSelectDialog) {
+    let area = centered_rect(58, 34, frame.area());
+    frame.render_widget(Clear, area);
+
+    let items = dialog
+        .options()
+        .iter()
+        .map(|protocol| {
+            ListItem::new(Line::from(vec![
+                Span::styled(*protocol, Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" "),
+                Span::styled(
+                    match *protocol {
+                        "responses" => "Responses API",
+                        "chat_completions" => "Chat Completions",
+                        "messages" => "Anthropic Messages",
+                        _ => "",
+                    },
+                    Style::default().fg(Color::Gray),
+                ),
+            ]))
+        })
+        .collect::<Vec<_>>();
+
+    let mut state = ListState::default().with_selected(Some(dialog.selected));
+    let list = List::new(items)
+        .block(
+            Block::default().borders(Borders::ALL).title(format!(
+                "Select Protocol ({}, {})",
+                dialog.route_model,
+                dialog.provider.label()
+            )),
+        )
+        .highlight_style(list_highlight_style())
+        .highlight_symbol("┃ ");
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_edit_channel_modal(frame: &mut Frame, form: &EditChannelForm) {
@@ -3475,7 +3903,7 @@ fn centered_rect(horizontal_percent: u16, vertical_percent: u16, area: Rect) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelAction, ChannelSummary, masked_secret, normalize_protocol_input,
+        ChannelAction, ChannelProvider, ChannelSummary, masked_secret, normalize_protocol_input,
         toggle_action_for_channel,
     };
 
@@ -3534,5 +3962,24 @@ mod tests {
         assert_eq!(normalize_protocol_input("messages").unwrap(), "messages");
         assert!(normalize_protocol_input("").is_err());
         assert!(normalize_protocol_input("invalid").is_err());
+    }
+
+    #[test]
+    fn provider_normalizes_base_url_prefixes() {
+        assert_eq!(
+            ChannelProvider::OpenAiCompatible
+                .normalize_base_url("https://api.example.com/v1/chat/completions", "chat_completions"),
+            "https://api.example.com"
+        );
+        assert_eq!(
+            ChannelProvider::Gemini
+                .normalize_base_url("https://generativelanguage.googleapis.com", "chat_completions"),
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        );
+        assert_eq!(
+            ChannelProvider::Anthropic
+                .normalize_base_url("https://api.anthropic.com/v1/messages", "messages"),
+            "https://api.anthropic.com"
+        );
     }
 }
