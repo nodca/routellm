@@ -176,6 +176,16 @@ curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install
   bash -s -- --repo nodca/routellm --tag v0.2.1
 ```
 
+默认安装到 `/opt/routellm`，适合 root 管理的服务端部署。非 root 安装建议改成：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh | \
+  bash -s -- --repo nodca/routellm --tag v0.2.1 \
+    --install-dir "$HOME/.local/share/routellm" \
+    --env-file "$HOME/.config/routellm/server.env" \
+    --skip-systemd
+```
+
 #### Linux TUI
 
 ```bash
@@ -190,12 +200,16 @@ powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.c
 powershell -ExecutionPolicy Bypass -File .\install-server.ps1 -Repo nodca/routellm -Tag v0.2.1
 ```
 
+Windows 默认安装到 `%LOCALAPPDATA%\routellm`。
+
 #### Windows TUI
 
 ```powershell
 powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.ps1 -OutFile install-tui.ps1"
 powershell -ExecutionPolicy Bypass -File .\install-tui.ps1 -Repo nodca/routellm -Tag v0.2.1 -Server http://127.0.0.1:8080 -AuthKey sk-metapi-your-key
 ```
+
+Windows TUI 默认也放在 `%LOCALAPPDATA%\routellm`。
 
 ## 启动方式
 

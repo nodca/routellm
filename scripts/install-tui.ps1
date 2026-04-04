@@ -2,7 +2,7 @@ param(
     [string]$Repo = $(if ($env:METAPI_REPO) { $env:METAPI_REPO } else { "nodca/routellm" }),
     [string]$Tag = $(if ($env:METAPI_TAG) { $env:METAPI_TAG } else { "latest" }),
     [string]$AssetUrl = $env:METAPI_ASSET_URL,
-    [string]$InstallDir = $(if ($env:METAPI_TUI_INSTALL_DIR) { $env:METAPI_TUI_INSTALL_DIR } else { (Join-Path $env:LOCALAPPDATA "metapi") }),
+    [string]$InstallDir = $(if ($env:METAPI_TUI_INSTALL_DIR) { $env:METAPI_TUI_INSTALL_DIR } else { (Join-Path $env:LOCALAPPDATA "routellm") }),
     [string]$Server = $(if ($env:METAPI_BASE_URL) { $env:METAPI_BASE_URL } else { "http://127.0.0.1:8080" }),
     [string]$AuthKey = $env:METAPI_AUTH_KEY,
     [switch]$SkipRunScript

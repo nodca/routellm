@@ -97,7 +97,7 @@ mkdir -p "${PACKAGE_ROOT}/examples"
 
 install -m 755 "${ROOT_DIR}/target/release/metapi-rs" "${PACKAGE_ROOT}/metapi-rs"
 install -m 755 "${ROOT_DIR}/target/release/metapi-tui" "${PACKAGE_ROOT}/metapi-tui"
-install -m 644 "${ROOT_DIR}/examples/metapi.service" "${PACKAGE_ROOT}/examples/metapi.service"
+install -m 644 "${ROOT_DIR}/examples/routellm.service" "${PACKAGE_ROOT}/examples/routellm.service"
 install -m 644 "${ROOT_DIR}/examples/metapi.toml" "${PACKAGE_ROOT}/examples/metapi.toml"
 install -m 644 "${ROOT_DIR}/README.md" "${PACKAGE_ROOT}/README.md"
 

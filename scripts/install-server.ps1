@@ -2,7 +2,7 @@ param(
     [string]$Repo = $(if ($env:METAPI_REPO) { $env:METAPI_REPO } else { "nodca/routellm" }),
     [string]$Tag = $(if ($env:METAPI_TAG) { $env:METAPI_TAG } else { "latest" }),
     [string]$AssetUrl = $env:METAPI_ASSET_URL,
-    [string]$InstallDir = $(if ($env:METAPI_INSTALL_DIR) { $env:METAPI_INSTALL_DIR } else { (Join-Path $env:LOCALAPPDATA "metapi") }),
+    [string]$InstallDir = $(if ($env:METAPI_INSTALL_DIR) { $env:METAPI_INSTALL_DIR } else { (Join-Path $env:LOCALAPPDATA "routellm") }),
     [string]$Bind = $(if ($env:METAPI_BIND_ADDR) { $env:METAPI_BIND_ADDR } else { "0.0.0.0:8080" }),
     [string]$MasterKey = $env:METAPI_MASTER_KEY,
     [string]$RequestTimeout = $(if ($env:METAPI_REQUEST_TIMEOUT_SECS) { $env:METAPI_REQUEST_TIMEOUT_SECS } else { "90" }),
@@ -106,6 +106,9 @@ if (-not $SkipRunScript) {
     Write-Host "Run script:"
     Write-Host "  $RunScript"
     Write-Host ""
-    Write-Host "Run:"
-    Write-Host "  powershell -ExecutionPolicy Bypass -File `"$RunScript`""
+Write-Host "Run:"
+Write-Host "  powershell -ExecutionPolicy Bypass -File `"$RunScript`""
+Write-Host ""
+Write-Host "Tip:"
+Write-Host "  Override -InstallDir if you want a different location."
 }

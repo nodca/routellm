@@ -5,11 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=metapi
-Group=metapi
-WorkingDirectory=/opt/metapi
-EnvironmentFile=/etc/metapi.env
-ExecStart=/opt/metapi/metapi-rs
+User=routellm
+Group=routellm
+WorkingDirectory=/opt/routellm
+EnvironmentFile=/etc/routellm.env
+ExecStart=/opt/routellm/metapi-rs
 Restart=always
 RestartSec=3
 LimitNOFILE=65535

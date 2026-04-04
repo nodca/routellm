@@ -9,15 +9,15 @@ Options:
   --repo owner/repo         GitHub repository, default nodca/routellm unless --asset-url is set
   --tag v0.2.1              Release tag, defaults to latest
   --asset-url URL           Direct asset URL override
-  --install-dir DIR         Install directory, default /opt/metapi
+  --install-dir DIR         Install directory, default /opt/routellm
   --bin-path PATH           Binary install path, default <install-dir>/metapi-rs
   --config-file PATH        Config path, default <install-dir>/metapi.toml
-  --env-file PATH           Environment file, default /etc/metapi.env
+  --env-file PATH           Environment file, default /etc/routellm.env
   --bind ADDR               Bind address, default 0.0.0.0:8080
   --master-key KEY          Downstream auth key, default auto-generated
   --request-timeout SECS    Request timeout, default 90
-  --service-name NAME       systemd service name, default metapi
-  --service-user USER       Linux service user, default metapi
+  --service-name NAME       systemd service name, default routellm
+  --service-user USER       Linux service user, default routellm
   --skip-systemd            Do not install a systemd unit
   --skip-start              Do not enable/start the service
   -h, --help                Show this help
@@ -77,7 +77,7 @@ prepare_path_parent() {
   parent="$(dirname "$path")"
   mkdir -p "$parent" 2>/dev/null || {
     echo "Failed to prepare directory: $parent" >&2
-    echo "Try running as root or choose a writable path." >&2
+    echo "Try running as root, or pass --install-dir \$HOME/.local/share/routellm for a user-local install." >&2
     exit 1
   }
 }
@@ -85,15 +85,15 @@ prepare_path_parent() {
 REPO="${METAPI_REPO:-nodca/routellm}"
 TAG="${METAPI_TAG:-latest}"
 ASSET_URL="${METAPI_ASSET_URL:-}"
-INSTALL_DIR="${METAPI_INSTALL_DIR:-/opt/metapi}"
+INSTALL_DIR="${METAPI_INSTALL_DIR:-/opt/routellm}"
 BIN_PATH=""
 CONFIG_FILE=""
-ENV_FILE="${METAPI_ENV_FILE:-/etc/metapi.env}"
+ENV_FILE="${METAPI_ENV_FILE:-/etc/routellm.env}"
 BIND_ADDR="${METAPI_BIND_ADDR:-0.0.0.0:8080}"
 MASTER_KEY="${METAPI_MASTER_KEY:-}"
 REQUEST_TIMEOUT="${METAPI_REQUEST_TIMEOUT_SECS:-90}"
-SERVICE_NAME="${METAPI_SERVICE_NAME:-metapi}"
-SERVICE_USER="${METAPI_SERVICE_USER:-metapi}"
+SERVICE_NAME="${METAPI_SERVICE_NAME:-routellm}"
+SERVICE_USER="${METAPI_SERVICE_USER:-routellm}"
 SKIP_SYSTEMD=0
 SKIP_START=0
 
@@ -253,4 +253,6 @@ Next steps:
   1. Edit ${CONFIG_FILE} and add your routes/channels, or onboard them later via API/TUI.
   2. If systemd was skipped, start manually:
      set -a; . "${ENV_FILE}"; set +a; "${BIN_PATH}"
+  3. For a non-root install, rerun with:
+     --install-dir "$HOME/.local/share/routellm" --env-file "$HOME/.config/routellm/server.env" --skip-systemd
 EOF

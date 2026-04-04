@@ -10,10 +10,10 @@ Options:
   --tag v0.2.1              Release tag, defaults to latest
   --asset-url URL           Direct asset URL override
   --bin-dir DIR             Binary install directory, default ~/.local/bin
-  --config-dir DIR          Config directory, default ~/.config/metapi
+  --config-dir DIR          Config directory, default ~/.config/routellm
   --server URL              TUI target server, default http://127.0.0.1:8080
   --auth-key KEY            TUI auth key, optional
-  --skip-env                Do not write ~/.config/metapi/tui.env
+  --skip-env                Do not write ~/.config/routellm/tui.env
   -h, --help                Show this help
 EOF
 }
@@ -65,7 +65,7 @@ REPO="${METAPI_REPO:-nodca/routellm}"
 TAG="${METAPI_TAG:-latest}"
 ASSET_URL="${METAPI_ASSET_URL:-}"
 BIN_DIR="${METAPI_TUI_BIN_DIR:-${HOME}/.local/bin}"
-CONFIG_DIR="${METAPI_TUI_CONFIG_DIR:-${HOME}/.config/metapi}"
+CONFIG_DIR="${METAPI_TUI_CONFIG_DIR:-${HOME}/.config/routellm}"
 SERVER_URL="${METAPI_BASE_URL:-http://127.0.0.1:8080}"
 AUTH_KEY="${METAPI_AUTH_KEY:-}"
 SKIP_ENV=0
