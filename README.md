@@ -1,8 +1,8 @@
-# routellm
+# llmrouter
 
 一个轻量、优雅、具有确定性选路逻辑的 LLM 路由网关。
 
-`routellm` 面向个人开发者和小团队，专注解决三个实际问题：
+`llmrouter` 面向个人开发者和小团队，专注解决三个实际问题：
 
 - 多个上游中转站不稳定，挂了就得手工切换
 - 不同上游的模型名不统一，下游接入很痛苦
@@ -17,7 +17,7 @@
 - `priority` 决定选路
 - 规则可解释，状态可观察
 
-## 为什么是 routellm
+## 为什么是 llmrouter
 
 在拥有多个 LLM 上游时，你通常会遇到这些问题：
 
@@ -25,7 +25,7 @@
 - 同一个模型在不同供应商那里名字不同，例如 `gpt-5.4` / `gpt-5-4`
 - 管理和排障常常依赖脚本、数据库、面板，心智负担很重
 
-`routellm` 的设计重点不是“功能越多越好”，而是：
+`llmrouter` 的设计重点不是“功能越多越好”，而是：
 
 - 确定性：抛弃复杂权重、随机策略和黑盒修正
 - 显式协议：每个 channel 必须明确指定上游协议，不靠猜
@@ -58,7 +58,7 @@
 - 支持最小管理 API
 - 支持 SSH/TUI 运维
 - 支持 `t / T` 主动测活
-- 支持 `metapi.toml` 启动导入
+- 支持 `llmrouter.toml` 启动导入
 - 支持 `master_key` 保护 `/v1/*` 与 `/api/*`
 - 支持 Linux / Windows 发布资产
 
@@ -104,7 +104,7 @@
 
 ### 选路规则
 
-`routellm` 采用“确定性优先”的选路风格：
+`llmrouter` 采用“确定性优先”的选路风格：
 
 1. 根据请求里的 `model` 精确匹配 route
 2. 过滤不可用 channel：
@@ -169,20 +169,36 @@ TUI 与管理面主要展示四种状态：
 
 ### 方式二：安装脚本
 
+#### Linux 单机模式
+
+本机 server + 本机 TUI，一次装好。server 默认只监听本机 `127.0.0.1:1290`，并启用 systemd 自启动。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-local.sh | \
+  sudo bash -s -- --repo nodca/routellm --tag v1.0
+```
+
+脚本会自动：
+
+- 安装 `llmrouter` server
+- 配置 systemd 开机自启
+- 为当前登录用户安装 `llmrouter-tui`
+- 把本机地址和同一把管理 `KEY` 写进 TUI 配置
+
 #### Linux Server
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh | \
-  sudo bash -s -- --repo nodca/routellm --tag v0.2.2
+  sudo bash -s -- --repo nodca/routellm --tag v1.0
 ```
 
-默认安装到 `/opt/routellm`，适合 root 管理的服务端部署。非 root 安装建议改成：
+默认安装到 `/opt/llmrouter`，适合 root 管理的服务端部署。非 root 安装建议改成：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh | \
-  bash -s -- --repo nodca/routellm --tag v0.2.2 \
-    --install-dir "$HOME/.local/share/routellm" \
-    --env-file "$HOME/.config/routellm/server.env" \
+  bash -s -- --repo nodca/routellm --tag v1.0 \
+    --install-dir "$HOME/.local/share/llmrouter" \
+    --env-file "$HOME/.config/llmrouter/server.env" \
     --skip-systemd
 ```
 
@@ -190,57 +206,57 @@ curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.sh | \
-  bash -s -- --repo nodca/routellm --tag v0.2.2 --server http://127.0.0.1:8080
+  bash -s -- --repo nodca/routellm --tag v1.0 --server http://127.0.0.1:1290
 ```
 
 #### Windows Server
 
 ```powershell
 powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.ps1 -OutFile install-server.ps1"
-powershell -ExecutionPolicy Bypass -File .\install-server.ps1 -Repo nodca/routellm -Tag v0.2.2
+powershell -ExecutionPolicy Bypass -File .\install-server.ps1 -Repo nodca/routellm -Tag v1.0
 ```
 
-Windows 默认安装到 `%LOCALAPPDATA%\routellm`。
+Windows 默认安装到 `%LOCALAPPDATA%\llmrouter`。
 
 #### Windows TUI
 
 ```powershell
 powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.ps1 -OutFile install-tui.ps1"
-powershell -ExecutionPolicy Bypass -File .\install-tui.ps1 -Repo nodca/routellm -Tag v0.2.2 -Server http://127.0.0.1:8080 -AuthKey sk-metapi-your-key
+powershell -ExecutionPolicy Bypass -File .\install-tui.ps1 -Repo nodca/routellm -Tag v1.0 -Server http://127.0.0.1:1290 -AuthKey sk-llmrouter-your-key
 ```
 
-Windows TUI 默认也放在 `%LOCALAPPDATA%\routellm`。
+Windows TUI 默认也放在 `%LOCALAPPDATA%\llmrouter`。
 
 ## 启动方式
 
 ### 直接启动服务端
 
 ```bash
-METAPI_BIND_ADDR=127.0.0.1:8080 \
-METAPI_DATABASE_URL=sqlite://./metapi-state.db \
-METAPI_MASTER_KEY=sk-metapi-local \
-METAPI_CONFIG_PATH=./examples/metapi.toml \
-./target/release/metapi-rs
+LLMROUTER_BIND_ADDR=127.0.0.1:1290 \
+LLMROUTER_DATABASE_URL=sqlite://./llmrouter-state.db \
+LLMROUTER_MASTER_KEY=sk-llmrouter-local \
+LLMROUTER_CONFIG_PATH=./examples/llmrouter.toml \
+./target/release/llmrouter
 ```
 
 ### 校验配置文件
 
 ```bash
-./target/release/metapi-rs check-config ./examples/metapi.toml
+./target/release/llmrouter check-config ./examples/llmrouter.toml
 ```
 
-如果已经设置了 `METAPI_CONFIG_PATH`，也可以：
+如果已经设置了 `LLMROUTER_CONFIG_PATH`，也可以：
 
 ```bash
-METAPI_CONFIG_PATH=./examples/metapi.toml ./target/release/metapi-rs check-config
+LLMROUTER_CONFIG_PATH=./examples/llmrouter.toml ./target/release/llmrouter check-config
 ```
 
 ### 启动 TUI
 
 ```bash
-METAPI_BASE_URL=http://127.0.0.1:8080 \
-METAPI_AUTH_KEY=sk-metapi-local \
-./target/release/metapi-tui
+LLMROUTER_BASE_URL=http://127.0.0.1:1290 \
+LLMROUTER_AUTH_KEY=sk-llmrouter-local \
+./target/release/llmrouter-tui
 ```
 
 ## 部署方式
@@ -250,7 +266,7 @@ METAPI_AUTH_KEY=sk-metapi-local \
 适合个人本地使用：
 
 - server 和 TUI 都在同一台机器
-- TUI 连接本机 `http://127.0.0.1:8080`
+- TUI 连接本机 `http://127.0.0.1:1290`
 
 ### 2. 远程 Server + 本地 TUI
 
@@ -258,20 +274,20 @@ METAPI_AUTH_KEY=sk-metapi-local \
 
 - server 部署在 Linux VPS 或常开机器
 - TUI 在本地电脑运行
-- TUI 通过 `METAPI_BASE_URL` 连接远程 server
-- TUI 通过 `METAPI_AUTH_KEY` 使用同一个 `master_key`
+- TUI 通过 `LLMROUTER_BASE_URL` 连接远程 server
+- TUI 通过 `LLMROUTER_AUTH_KEY` 使用同一个 `master_key`
 
 示例：
 
 ```bash
-METAPI_BASE_URL=http://your-server-ip:8080 \
-METAPI_AUTH_KEY=sk-metapi-your-key \
-metapi-tui
+LLMROUTER_BASE_URL=http://your-server-ip:8080 \
+LLMROUTER_AUTH_KEY=sk-llmrouter-your-key \
+llmrouter-tui
 ```
 
 ## TUI 是什么，不是什么
 
-TUI 是 `routellm` 的应用级管理终端。
+TUI 是 `llmrouter` 的应用级管理终端。
 
 它可以管理：
 
@@ -332,16 +348,16 @@ TUI 是 `routellm` 的应用级管理终端。
 
 ## 配置文件
 
-`routellm` 支持用 `metapi.toml` 描述静态拓扑，sqlite 负责保存运行态状态和日志。
+`llmrouter` 支持用 `llmrouter.toml` 描述静态拓扑，sqlite 负责保存运行态状态和日志。
 
 最小示例：
 
 ```toml
 [server]
 bind_addr = "0.0.0.0:8080"
-database_url = "sqlite://metapi-state.db"
+database_url = "sqlite://llmrouter-state.db"
 request_timeout_secs = 90
-master_key = "sk-metapi-change-me"
+master_key = "sk-llmrouter-change-me"
 
 [routing]
 default_cooldown_seconds = 300
@@ -395,16 +411,16 @@ enabled = true
 
 ### 服务端
 
-- `METAPI_BIND_ADDR`
-- `METAPI_DATABASE_URL`
-- `METAPI_REQUEST_TIMEOUT_SECS`
-- `METAPI_MASTER_KEY`
-- `METAPI_CONFIG_PATH`
+- `LLMROUTER_BIND_ADDR`
+- `LLMROUTER_DATABASE_URL`
+- `LLMROUTER_REQUEST_TIMEOUT_SECS`
+- `LLMROUTER_MASTER_KEY`
+- `LLMROUTER_CONFIG_PATH`
 
 ### TUI
 
-- `METAPI_BASE_URL`
-- `METAPI_AUTH_KEY`
+- `LLMROUTER_BASE_URL`
+- `LLMROUTER_AUTH_KEY`
 
 ## 管理 API
 
@@ -441,15 +457,15 @@ enabled = true
 最简单的本机模式可以这样配：
 
 ```bash
-export METAPI_MASTER_KEY=sk-metapi-local
-export METAPI_AUTH_KEY=sk-metapi-local
-export METAPI_BASE_URL=http://127.0.0.1:8080
+export LLMROUTER_MASTER_KEY=sk-llmrouter-local
+export LLMROUTER_AUTH_KEY=sk-llmrouter-local
+export LLMROUTER_BASE_URL=http://127.0.0.1:1290
 ```
 
 此时：
 
-- 下游客户端把 `Base URL` 设为 `http://127.0.0.1:8080/v1`
-- `API Key` 设为 `sk-metapi-local`
+- 下游客户端把 `Base URL` 设为 `http://127.0.0.1:1290/v1`
+- `API Key` 设为 `sk-llmrouter-local`
 - TUI 也使用同一个 key 连接服务端
 
 ## 协议支持
@@ -485,12 +501,12 @@ export METAPI_BASE_URL=http://127.0.0.1:8080
 
 设计上：
 
-- `metapi.toml` 是静态拓扑真源
+- `llmrouter.toml` 是静态拓扑真源
 - sqlite 负责运行态状态与日志
 
 当前实现是：
 
-- server 启动时读取 `METAPI_CONFIG_PATH`
+- server 启动时读取 `LLMROUTER_CONFIG_PATH`
 - 把 route/channel 同步进 sqlite
 - 运行过程中继续在 sqlite 里维护：
   - cooldown

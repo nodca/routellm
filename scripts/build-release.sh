@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/build-release.sh [--tag v0.2.2] [--output-dir dist]
+Usage: scripts/build-release.sh [--tag v1.0] [--output-dir dist]
 
 Build release binaries for the current host and package them into a GitHub Releases asset.
 EOF
@@ -82,23 +82,23 @@ fi
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OS="$(detect_os)"
 ARCH="$(detect_arch)"
-ASSET_BASENAME="metapi-${OS}-${ARCH}"
+ASSET_BASENAME="llmrouter-${OS}-${ARCH}"
 
 mkdir -p "${ROOT_DIR}/${OUTPUT_DIR}"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 pushd "$ROOT_DIR" >/dev/null
-cargo build --release --bin metapi-rs --bin metapi-tui
+cargo build --release --bin llmrouter --bin llmrouter-tui
 popd >/dev/null
 
 PACKAGE_ROOT="${TMP_DIR}/${ASSET_BASENAME}"
 mkdir -p "${PACKAGE_ROOT}/examples"
 
-install -m 755 "${ROOT_DIR}/target/release/metapi-rs" "${PACKAGE_ROOT}/metapi-rs"
-install -m 755 "${ROOT_DIR}/target/release/metapi-tui" "${PACKAGE_ROOT}/metapi-tui"
-install -m 644 "${ROOT_DIR}/examples/routellm.service" "${PACKAGE_ROOT}/examples/routellm.service"
-install -m 644 "${ROOT_DIR}/examples/metapi.toml" "${PACKAGE_ROOT}/examples/metapi.toml"
+install -m 755 "${ROOT_DIR}/target/release/llmrouter" "${PACKAGE_ROOT}/llmrouter"
+install -m 755 "${ROOT_DIR}/target/release/llmrouter-tui" "${PACKAGE_ROOT}/llmrouter-tui"
+install -m 644 "${ROOT_DIR}/examples/llmrouter.service" "${PACKAGE_ROOT}/examples/llmrouter.service"
+install -m 644 "${ROOT_DIR}/examples/llmrouter.toml" "${PACKAGE_ROOT}/examples/llmrouter.toml"
 install -m 644 "${ROOT_DIR}/README.md" "${PACKAGE_ROOT}/README.md"
 
 ARCHIVE_PATH="${ROOT_DIR}/${OUTPUT_DIR}/${ASSET_BASENAME}.tar.gz"

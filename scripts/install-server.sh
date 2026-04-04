@@ -7,17 +7,17 @@ Usage: install-server.sh [options]
 
 Options:
   --repo owner/repo         GitHub repository, default nodca/routellm unless --asset-url is set
-  --tag v0.2.2              Release tag, defaults to latest
+  --tag v1.0                Release tag, defaults to latest
   --asset-url URL           Direct asset URL override
-  --install-dir DIR         Install directory, default /opt/routellm
-  --bin-path PATH           Binary install path, default <install-dir>/metapi-rs
-  --config-file PATH        Config path, default <install-dir>/metapi.toml
-  --env-file PATH           Environment file, default /etc/routellm.env
+  --install-dir DIR         Install directory, default /opt/llmrouter
+  --bin-path PATH           Binary install path, default <install-dir>/llmrouter
+  --config-file PATH        Config path, default <install-dir>/llmrouter.toml
+  --env-file PATH           Environment file, default /etc/llmrouter.env
   --bind ADDR               Bind address, default 0.0.0.0:8080
   --master-key KEY          Downstream auth key, default auto-generated
   --request-timeout SECS    Request timeout, default 90
-  --service-name NAME       systemd service name, default routellm
-  --service-user USER       Linux service user, default routellm
+  --service-name NAME       systemd service name, default llmrouter
+  --service-user USER       Linux service user, default llmrouter
   --skip-systemd            Do not install a systemd unit
   --skip-start              Do not enable/start the service
   -h, --help                Show this help
@@ -68,7 +68,7 @@ download_url() {
 }
 
 generate_master_key() {
-  printf 'sk-metapi-%s\n' "$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  printf 'sk-llmrouter-%s\n' "$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 }
 
 prepare_path_parent() {
@@ -77,23 +77,23 @@ prepare_path_parent() {
   parent="$(dirname "$path")"
   mkdir -p "$parent" 2>/dev/null || {
     echo "Failed to prepare directory: $parent" >&2
-    echo "Try running with sudo, or pass --install-dir \$HOME/.local/share/routellm for a user-local install." >&2
+    echo "Try running with sudo, or pass --install-dir \$HOME/.local/share/llmrouter for a user-local install." >&2
     exit 1
   }
 }
 
-REPO="${METAPI_REPO:-nodca/routellm}"
-TAG="${METAPI_TAG:-latest}"
-ASSET_URL="${METAPI_ASSET_URL:-}"
-INSTALL_DIR="${METAPI_INSTALL_DIR:-/opt/routellm}"
+REPO="${LLMROUTER_REPO:-nodca/routellm}"
+TAG="${LLMROUTER_TAG:-latest}"
+ASSET_URL="${LLMROUTER_ASSET_URL:-}"
+INSTALL_DIR="${LLMROUTER_INSTALL_DIR:-/opt/llmrouter}"
 BIN_PATH=""
 CONFIG_FILE=""
-ENV_FILE="${METAPI_ENV_FILE:-/etc/routellm.env}"
-BIND_ADDR="${METAPI_BIND_ADDR:-0.0.0.0:8080}"
-MASTER_KEY="${METAPI_MASTER_KEY:-}"
-REQUEST_TIMEOUT="${METAPI_REQUEST_TIMEOUT_SECS:-90}"
-SERVICE_NAME="${METAPI_SERVICE_NAME:-routellm}"
-SERVICE_USER="${METAPI_SERVICE_USER:-routellm}"
+ENV_FILE="${LLMROUTER_ENV_FILE:-/etc/llmrouter.env}"
+BIND_ADDR="${LLMROUTER_BIND_ADDR:-0.0.0.0:8080}"
+MASTER_KEY="${LLMROUTER_MASTER_KEY:-}"
+REQUEST_TIMEOUT="${LLMROUTER_REQUEST_TIMEOUT_SECS:-90}"
+SERVICE_NAME="${LLMROUTER_SERVICE_NAME:-llmrouter}"
+SERVICE_USER="${LLMROUTER_SERVICE_USER:-llmrouter}"
 SKIP_SYSTEMD=0
 SKIP_START=0
 
@@ -124,15 +124,15 @@ done
 
 OS="$(detect_os)"
 ARCH="$(detect_arch)"
-ASSET_NAME="metapi-${OS}-${ARCH}.tar.gz"
+ASSET_NAME="llmrouter-${OS}-${ARCH}.tar.gz"
 
 if [[ -z "$BIN_PATH" ]]; then
-  BIN_PATH="${INSTALL_DIR}/metapi-rs"
+  BIN_PATH="${INSTALL_DIR}/llmrouter"
 fi
 if [[ -z "$CONFIG_FILE" ]]; then
-  CONFIG_FILE="${INSTALL_DIR}/metapi.toml"
+  CONFIG_FILE="${INSTALL_DIR}/llmrouter.toml"
 fi
-DATABASE_URL="sqlite://${INSTALL_DIR}/metapi-state.db"
+DATABASE_URL="sqlite://${INSTALL_DIR}/llmrouter-state.db"
 if [[ -z "$MASTER_KEY" ]]; then
   MASTER_KEY="$(generate_master_key)"
 fi
@@ -164,7 +164,7 @@ if [[ -z "$PACKAGE_ROOT" ]]; then
 fi
 
 mkdir -p "$INSTALL_DIR"
-install -m 755 "${PACKAGE_ROOT}/metapi-rs" "$BIN_PATH"
+install -m 755 "${PACKAGE_ROOT}/llmrouter" "$BIN_PATH"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   cat > "$CONFIG_FILE" <<EOF
@@ -187,11 +187,11 @@ EOF
 fi
 
 cat > "$ENV_FILE" <<EOF
-METAPI_BIND_ADDR=${BIND_ADDR}
-METAPI_DATABASE_URL=${DATABASE_URL}
-METAPI_REQUEST_TIMEOUT_SECS=${REQUEST_TIMEOUT}
-METAPI_MASTER_KEY=${MASTER_KEY}
-METAPI_CONFIG_PATH=${CONFIG_FILE}
+LLMROUTER_BIND_ADDR=${BIND_ADDR}
+LLMROUTER_DATABASE_URL=${DATABASE_URL}
+LLMROUTER_REQUEST_TIMEOUT_SECS=${REQUEST_TIMEOUT}
+LLMROUTER_MASTER_KEY=${MASTER_KEY}
+LLMROUTER_CONFIG_PATH=${CONFIG_FILE}
 EOF
 
 if [[ "$SKIP_SYSTEMD" -eq 0 ]]; then
@@ -209,7 +209,7 @@ if [[ "$SKIP_SYSTEMD" -eq 0 ]]; then
   SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=metapi-rs lightweight LLM router
+Description=llmrouter lightweight LLM router
 After=network-online.target
 Wants=network-online.target
 
@@ -254,6 +254,6 @@ Next steps:
   2. If systemd was skipped, start manually:
      set -a; . "${ENV_FILE}"; set +a; "${BIN_PATH}"
   3. For a non-root install, rerun with:
-     --install-dir "$HOME/.local/share/routellm" --env-file "$HOME/.config/routellm/server.env" --skip-systemd
+     --install-dir "$HOME/.local/share/llmrouter" --env-file "$HOME/.config/llmrouter/server.env" --skip-systemd
   4. For the default /opt install, run the installer with sudo.
 EOF

@@ -10,7 +10,7 @@ use serde::Deserialize;
 use crate::error::AppError;
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
-const DEFAULT_DATABASE_URL: &str = "sqlite://metapi-state.db";
+const DEFAULT_DATABASE_URL: &str = "sqlite://llmrouter-state.db";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_ROUTE_COOLDOWN_SECS: i64 = 300;
 
@@ -135,22 +135,22 @@ struct RawChannelConfig {
 
 impl Config {
     pub fn from_env() -> Result<Self, AppError> {
-        let bind_addr_env = std::env::var("METAPI_BIND_ADDR").ok();
-        let database_url_env = std::env::var("METAPI_DATABASE_URL").ok();
-        let request_timeout_secs_env = std::env::var("METAPI_REQUEST_TIMEOUT_SECS")
+        let bind_addr_env = std::env::var("LLMROUTER_BIND_ADDR").ok();
+        let database_url_env = std::env::var("LLMROUTER_DATABASE_URL").ok();
+        let request_timeout_secs_env = std::env::var("LLMROUTER_REQUEST_TIMEOUT_SECS")
             .ok()
             .map(|value| {
                 value.parse::<u64>().map_err(|error| {
-                    AppError::Config(format!("invalid METAPI_REQUEST_TIMEOUT_SECS: {error}"))
+                    AppError::Config(format!("invalid LLMROUTER_REQUEST_TIMEOUT_SECS: {error}"))
                 })
             })
             .transpose()?;
-        let master_key_env = std::env::var("METAPI_MASTER_KEY")
+        let master_key_env = std::env::var("LLMROUTER_MASTER_KEY")
             .ok()
-            .map(|value| normalize_optional_secret(value, "METAPI_MASTER_KEY"))
+            .map(|value| normalize_optional_secret(value, "LLMROUTER_MASTER_KEY"))
             .transpose()?
             .flatten();
-        let config_path = std::env::var("METAPI_CONFIG_PATH")
+        let config_path = std::env::var("LLMROUTER_CONFIG_PATH")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from);
@@ -188,7 +188,7 @@ impl Config {
 
         Ok(Self {
             bind_addr: SocketAddr::from_str(&bind_addr)
-                .map_err(|error| AppError::Config(format!("invalid METAPI_BIND_ADDR: {error}")))?,
+                .map_err(|error| AppError::Config(format!("invalid LLMROUTER_BIND_ADDR: {error}")))?,
             database_url,
             request_timeout_secs,
             master_key,
@@ -212,7 +212,7 @@ impl Config {
 
         Ok(Self {
             bind_addr: SocketAddr::from_str(&bind_addr)
-                .map_err(|error| AppError::Config(format!("invalid METAPI_BIND_ADDR: {error}")))?,
+                .map_err(|error| AppError::Config(format!("invalid LLMROUTER_BIND_ADDR: {error}")))?,
             database_url,
             request_timeout_secs,
             master_key: file_config.master_key(),
@@ -223,7 +223,7 @@ impl Config {
     }
 
     pub fn config_path_from_env() -> Option<PathBuf> {
-        std::env::var("METAPI_CONFIG_PATH")
+        std::env::var("LLMROUTER_CONFIG_PATH")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
@@ -447,7 +447,7 @@ mod tests {
             r#"
             [server]
             bind_addr = "127.0.0.1:18080"
-            master_key = "sk-metapi-test"
+            master_key = "sk-llmrouter-test"
 
             [routing]
             default_cooldown_seconds = 450
@@ -468,7 +468,7 @@ mod tests {
             parsed.server_bind_addr().as_deref(),
             Some("127.0.0.1:18080")
         );
-        assert_eq!(parsed.master_key().as_deref(), Some("sk-metapi-test"));
+        assert_eq!(parsed.master_key().as_deref(), Some("sk-llmrouter-test"));
         assert_eq!(parsed.bootstrap.default_cooldown_seconds, 450);
         assert_eq!(parsed.bootstrap.routes.len(), 1);
         assert_eq!(parsed.bootstrap.routes[0].cooldown_seconds, 450);

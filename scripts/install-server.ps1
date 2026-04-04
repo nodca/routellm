@@ -1,11 +1,11 @@
 param(
-    [string]$Repo = $(if ($env:METAPI_REPO) { $env:METAPI_REPO } else { "nodca/routellm" }),
-    [string]$Tag = $(if ($env:METAPI_TAG) { $env:METAPI_TAG } else { "latest" }),
-    [string]$AssetUrl = $env:METAPI_ASSET_URL,
-    [string]$InstallDir = $(if ($env:METAPI_INSTALL_DIR) { $env:METAPI_INSTALL_DIR } else { (Join-Path $env:LOCALAPPDATA "routellm") }),
-    [string]$Bind = $(if ($env:METAPI_BIND_ADDR) { $env:METAPI_BIND_ADDR } else { "0.0.0.0:8080" }),
-    [string]$MasterKey = $env:METAPI_MASTER_KEY,
-    [string]$RequestTimeout = $(if ($env:METAPI_REQUEST_TIMEOUT_SECS) { $env:METAPI_REQUEST_TIMEOUT_SECS } else { "90" }),
+    [string]$Repo = $(if ($env:LLMROUTER_REPO) { $env:LLMROUTER_REPO } else { "nodca/routellm" }),
+    [string]$Tag = $(if ($env:LLMROUTER_TAG) { $env:LLMROUTER_TAG } else { "latest" }),
+    [string]$AssetUrl = $env:LLMROUTER_ASSET_URL,
+    [string]$InstallDir = $(if ($env:LLMROUTER_INSTALL_DIR) { $env:LLMROUTER_INSTALL_DIR } else { (Join-Path $env:LOCALAPPDATA "llmrouter") }),
+    [string]$Bind = $(if ($env:LLMROUTER_BIND_ADDR) { $env:LLMROUTER_BIND_ADDR } else { "0.0.0.0:8080" }),
+    [string]$MasterKey = $env:LLMROUTER_MASTER_KEY,
+    [string]$RequestTimeout = $(if ($env:LLMROUTER_REQUEST_TIMEOUT_SECS) { $env:LLMROUTER_REQUEST_TIMEOUT_SECS } else { "90" }),
     [string]$ConfigFile = "",
     [switch]$SkipRunScript
 )
@@ -29,21 +29,21 @@ function Get-DownloadUrl([string]$AssetName) {
 }
 
 function New-MasterKey {
-    return "sk-metapi-" + ([guid]::NewGuid().ToString("N").Substring(0, 24))
+    return "sk-llmrouter-" + ([guid]::NewGuid().ToString("N").Substring(0, 24))
 }
 
 if (-not $ConfigFile) {
-    $ConfigFile = Join-Path $InstallDir "metapi.toml"
+    $ConfigFile = Join-Path $InstallDir "llmrouter.toml"
 }
 if (-not $MasterKey) {
     $MasterKey = New-MasterKey
 }
 
-$AssetName = "metapi-windows-$(Get-ArchName).zip"
-$TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("metapi-server-" + [guid]::NewGuid().ToString("N"))
+$AssetName = "llmrouter-windows-$(Get-ArchName).zip"
+$TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("llmrouter-server-" + [guid]::NewGuid().ToString("N"))
 $ArchivePath = Join-Path $TempDir $AssetName
-$DatabaseUrl = "sqlite://metapi-state.db"
-$RunScript = Join-Path $InstallDir "run-metapi-server.ps1"
+$DatabaseUrl = "sqlite://llmrouter-state.db"
+$RunScript = Join-Path $InstallDir "run-llmrouter.ps1"
 
 New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
@@ -58,7 +58,7 @@ if (-not $PackageRoot) {
     throw "Downloaded archive does not contain a package directory"
 }
 
-Copy-Item (Join-Path $PackageRoot.FullName "metapi-rs.exe") (Join-Path $InstallDir "metapi-rs.exe") -Force
+Copy-Item (Join-Path $PackageRoot.FullName "llmrouter.exe") (Join-Path $InstallDir "llmrouter.exe") -Force
 
 if (-not (Test-Path $ConfigFile)) {
 @"
@@ -83,12 +83,12 @@ upstream_path_error = true
 if (-not $SkipRunScript) {
 @"
 Set-Location "$InstallDir"
-`$env:METAPI_BIND_ADDR = "$Bind"
-`$env:METAPI_DATABASE_URL = "$DatabaseUrl"
-`$env:METAPI_REQUEST_TIMEOUT_SECS = "$RequestTimeout"
-`$env:METAPI_MASTER_KEY = "$MasterKey"
-`$env:METAPI_CONFIG_PATH = "$ConfigFile"
-& "$InstallDir\metapi-rs.exe"
+`$env:LLMROUTER_BIND_ADDR = "$Bind"
+`$env:LLMROUTER_DATABASE_URL = "$DatabaseUrl"
+`$env:LLMROUTER_REQUEST_TIMEOUT_SECS = "$RequestTimeout"
+`$env:LLMROUTER_MASTER_KEY = "$MasterKey"
+`$env:LLMROUTER_CONFIG_PATH = "$ConfigFile"
+& "$InstallDir\llmrouter.exe"
 "@ | Set-Content -Path $RunScript
 }
 
@@ -97,7 +97,7 @@ Remove-Item $TempDir -Recurse -Force
 Write-Host "Server installation complete."
 Write-Host ""
 Write-Host "Binary:"
-Write-Host "  $(Join-Path $InstallDir 'metapi-rs.exe')"
+Write-Host "  $(Join-Path $InstallDir 'llmrouter.exe')"
 Write-Host "Config:"
 Write-Host "  $ConfigFile"
 Write-Host "Master key:"

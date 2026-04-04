@@ -15,7 +15,7 @@ function Get-ArchName {
 
 $RootDir = Split-Path -Parent $PSScriptRoot
 $Arch = Get-ArchName
-$AssetBaseName = "metapi-windows-$Arch"
+$AssetBaseName = "llmrouter-windows-$Arch"
 $DistDir = Join-Path $RootDir $OutputDir
 $PackageDir = Join-Path ([System.IO.Path]::GetTempPath()) ("$AssetBaseName-" + [System.Guid]::NewGuid().ToString("N"))
 $PackageRoot = Join-Path $PackageDir $AssetBaseName
@@ -24,12 +24,12 @@ New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "examples") | Out-Null
 
 Push-Location $RootDir
-cargo build --release --bin metapi-rs --bin metapi-tui
+cargo build --release --bin llmrouter --bin llmrouter-tui
 Pop-Location
 
-Copy-Item (Join-Path $RootDir "target\release\metapi-rs.exe") (Join-Path $PackageRoot "metapi-rs.exe")
-Copy-Item (Join-Path $RootDir "target\release\metapi-tui.exe") (Join-Path $PackageRoot "metapi-tui.exe")
-Copy-Item (Join-Path $RootDir "examples\metapi.toml") (Join-Path $PackageRoot "examples\metapi.toml")
+Copy-Item (Join-Path $RootDir "target\release\llmrouter.exe") (Join-Path $PackageRoot "llmrouter.exe")
+Copy-Item (Join-Path $RootDir "target\release\llmrouter-tui.exe") (Join-Path $PackageRoot "llmrouter-tui.exe")
+Copy-Item (Join-Path $RootDir "examples\llmrouter.toml") (Join-Path $PackageRoot "examples\llmrouter.toml")
 Copy-Item (Join-Path $RootDir "README.md") (Join-Path $PackageRoot "README.md")
 
 $ArchivePath = Join-Path $DistDir "$AssetBaseName.zip"

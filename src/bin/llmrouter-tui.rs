@@ -1,4 +1,10 @@
-use std::{error::Error, time::Duration};
+use std::{
+    env, fs,
+    error::Error,
+    io::{self, IsTerminal},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[cfg(not(windows))]
 use std::io::Write;
@@ -1844,12 +1850,9 @@ impl App {
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
 
-    let base_url =
-        std::env::var("METAPI_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-    let auth_key = std::env::var("METAPI_AUTH_KEY")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let startup = load_tui_startup_config()?;
+    let base_url = startup.base_url;
+    let auth_key = startup.auth_key;
     let mut app = App::new(base_url, auth_key);
     app.refresh_all().await;
 
@@ -1860,6 +1863,156 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ratatui::restore();
 
     result
+}
+
+#[derive(Debug, Clone)]
+struct TuiStartupConfig {
+    base_url: String,
+    auth_key: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct SavedTuiEnv {
+    base_url: Option<String>,
+    auth_key: Option<String>,
+}
+
+fn load_tui_startup_config() -> Result<TuiStartupConfig, Box<dyn Error>> {
+    let config_path = tui_env_file_path()
+        .ok_or("could not determine a local config path for llmrouter-tui")?;
+    let saved = load_tui_env_file(&config_path).unwrap_or_default();
+
+    let base_url = env::var("LLMROUTER_BASE_URL")
+        .ok()
+        .and_then(|value| normalize_optional_input(&value))
+        .or(saved.base_url)
+        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
+    let auth_key = env::var("LLMROUTER_AUTH_KEY")
+        .ok()
+        .and_then(|value| normalize_optional_input(&value))
+        .or(saved.auth_key);
+
+    if config_path.exists()
+        || env::var("LLMROUTER_BASE_URL").is_ok()
+        || env::var("LLMROUTER_AUTH_KEY").is_ok()
+    {
+        return Ok(TuiStartupConfig { base_url, auth_key });
+    }
+
+    run_first_start_wizard(&config_path, &base_url)
+}
+
+fn load_tui_env_file(path: &Path) -> io::Result<SavedTuiEnv> {
+    let contents = fs::read_to_string(path)?;
+    let mut saved = SavedTuiEnv::default();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "LLMROUTER_BASE_URL" => {
+                saved.base_url = normalize_optional_input(value);
+            }
+            "LLMROUTER_AUTH_KEY" => {
+                saved.auth_key = normalize_optional_input(value);
+            }
+            _ => {}
+        }
+    }
+    Ok(saved)
+}
+
+fn run_first_start_wizard(
+    config_path: &Path,
+    default_base_url: &str,
+) -> Result<TuiStartupConfig, Box<dyn Error>> {
+    if !io::stdin().is_terminal() {
+        return Err(format!(
+            "llmrouter-tui needs LLMROUTER_BASE_URL / LLMROUTER_AUTH_KEY or a config file at {}",
+            config_path.display()
+        )
+        .into());
+    }
+
+    println!("llmrouter-tui first start");
+    println!("No local connection config found. Fill it once and it will be saved locally.");
+    println!();
+
+    let base_url = prompt_value("Server URL", Some(default_base_url))?;
+    let auth_key = normalize_optional_input(&prompt_value(
+        "Management Key (optional, leave blank if server auth is off)",
+        None,
+    )?);
+
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut contents = format!("LLMROUTER_BASE_URL={base_url}\n");
+    if let Some(value) = &auth_key {
+        contents.push_str(&format!("LLMROUTER_AUTH_KEY={value}\n"));
+    }
+    fs::write(config_path, contents)?;
+
+    println!();
+    println!("Saved local TUI config to {}", config_path.display());
+    println!();
+
+    Ok(TuiStartupConfig { base_url, auth_key })
+}
+
+fn prompt_value(label: &str, default: Option<&str>) -> io::Result<String> {
+    let mut input = String::new();
+    match default {
+        Some(value) => println!("{label} [{value}]:"),
+        None => println!("{label}:"),
+    }
+    io::stdin().read_line(&mut input)?;
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        Ok(default.unwrap_or("").to_string())
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn normalize_optional_input(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn tui_env_file_path() -> Option<PathBuf> {
+    if let Some(value) = env::var_os("LLMROUTER_TUI_ENV_FILE") {
+        let trimmed = value.to_string_lossy().trim().to_string();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .map(|path| path.join("llmrouter").join("tui.env"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
+            return Some(PathBuf::from(path).join("llmrouter").join("tui.env"));
+        }
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|path| path.join(".config").join("llmrouter").join("tui.env"))
+    }
 }
 
 async fn run_app(mut terminal: DefaultTerminal, mut app: App) -> Result<(), Box<dyn Error>> {
@@ -2166,7 +2319,7 @@ fn draw_help_modal(frame: &mut Frame) {
     frame.render_widget(Clear, area);
     let text = vec![
         Line::from(Span::styled(
-            "metapi-tui",
+            "llmrouter-tui",
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -2909,7 +3062,7 @@ mod tests {
 
     #[test]
     fn masked_secret_keeps_head_and_tail() {
-        assert_eq!(masked_secret(Some("sk-metapi-secret")), "sk-m...cret");
+        assert_eq!(masked_secret(Some("sk-llmrouter-secret")), "sk-l...cret");
     }
 
     #[test]

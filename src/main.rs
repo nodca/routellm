@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use metapi_rs::{app, bootstrap, config::Config};
+use llmrouter::{app, bootstrap, config::Config};
 use tokio::net::TcpListener;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -83,9 +83,9 @@ fn parse_command(args: Vec<String>) -> Result<Command, Box<dyn std::error::Error
         [] => Ok(Command::Serve),
         [cmd] if cmd == "check-config" => Ok(Command::CheckConfig(
             Config::config_path_from_env()
-                .ok_or("check-config requires a path or METAPI_CONFIG_PATH")?,
+                .ok_or("check-config requires a path or LLMROUTER_CONFIG_PATH")?,
         )),
         [cmd, path] if cmd == "check-config" => Ok(Command::CheckConfig(PathBuf::from(path))),
-        _ => Err("usage: metapi-rs [check-config [config_path]]".into()),
+        _ => Err("usage: llmrouter [check-config [config_path]]".into()),
     }
 }

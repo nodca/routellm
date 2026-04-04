@@ -153,12 +153,12 @@ mod tests {
     #[tokio::test]
     async fn healthz_is_not_protected_by_master_key() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             database_url: database_url(&db_path),
             request_timeout_secs: 30,
-            master_key: Some("sk-metapi-test".to_string()),
+            master_key: Some("sk-llmrouter-test".to_string()),
             bootstrap: None,
             cooldown_policy: Default::default(),
             manual_intervention_policy: Default::default(),
@@ -181,12 +181,12 @@ mod tests {
     #[tokio::test]
     async fn api_and_v1_routes_require_matching_bearer_token_when_master_key_is_set() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             database_url: database_url(&db_path),
             request_timeout_secs: 30,
-            master_key: Some("sk-metapi-test".to_string()),
+            master_key: Some("sk-llmrouter-test".to_string()),
             bootstrap: None,
             cooldown_policy: Default::default(),
             manual_intervention_policy: Default::default(),
@@ -216,7 +216,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/routes")
-                    .header("Authorization", "Bearer sk-metapi-test")
+                    .header("Authorization", "Bearer sk-llmrouter-test")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -243,7 +243,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/responses")
-                    .header("Authorization", "Bearer sk-metapi-test")
+                    .header("Authorization", "Bearer sk-llmrouter-test")
                     .header("Content-Type", "application/json")
                     .body(Body::from(r#"{"model":"gpt-5.4","input":"ping"}"#))
                     .unwrap(),

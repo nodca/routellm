@@ -1,8 +1,8 @@
 [server]
 bind_addr = "0.0.0.0:8080"
-database_url = "sqlite://metapi-state.db"
+database_url = "sqlite://llmrouter-state.db"
 request_timeout_secs = 90
-master_key = "sk-metapi-change-me"
+master_key = "sk-llmrouter-change-me"
 
 [routing]
 default_cooldown_seconds = 300

@@ -1,0 +1,18 @@
+[Unit]
+Description=llmrouter lightweight LLM router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=llmrouter
+Group=llmrouter
+WorkingDirectory=/opt/llmrouter
+EnvironmentFile=/etc/llmrouter.env
+ExecStart=/opt/llmrouter/llmrouter
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

@@ -2412,7 +2412,7 @@ mod tests {
     #[tokio::test]
     async fn responses_stream_is_proxied_end_to_end() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_streaming_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -2456,7 +2456,7 @@ mod tests {
     #[tokio::test]
     async fn chat_completions_non_stream_maps_from_responses() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_json_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -2503,7 +2503,7 @@ mod tests {
     #[tokio::test]
     async fn chat_completions_stream_maps_from_responses_sse() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_streaming_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -2549,7 +2549,7 @@ mod tests {
     #[tokio::test]
     async fn management_routes_list_aggregates_channel_counts() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_json_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -2599,7 +2599,7 @@ mod tests {
     #[tokio::test]
     async fn management_route_channels_show_cooldown_and_reason() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_json_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -2660,7 +2660,7 @@ mod tests {
     #[tokio::test]
     async fn management_route_logs_list_recent_requests() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_json_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -2707,7 +2707,7 @@ mod tests {
     #[tokio::test]
     async fn management_channel_prefill_returns_base_url_and_api_key() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_json_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -2740,7 +2740,7 @@ mod tests {
     #[tokio::test]
     async fn update_channel_edits_base_url_api_key_and_routing_fields() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_json_upstream().await;
         let replacement_upstream_addr = spawn_json_upstream().await;
         let config = Config {
@@ -2828,7 +2828,7 @@ mod tests {
     #[tokio::test]
     async fn auth_error_can_require_manual_intervention_until_reset() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_auth_error_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -2930,7 +2930,7 @@ mod tests {
     #[tokio::test]
     async fn delete_channel_removes_selected_channel() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_json_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -2981,7 +2981,7 @@ mod tests {
     #[tokio::test]
     async fn deleting_last_channel_also_removes_empty_route() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_json_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -3028,7 +3028,7 @@ mod tests {
     #[tokio::test]
     async fn delete_route_requires_empty_route_and_deletes_when_empty() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_json_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -3095,7 +3095,7 @@ mod tests {
     #[tokio::test]
     async fn create_route_channel_adds_channel_to_selected_route() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_json_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -3162,7 +3162,7 @@ mod tests {
     #[tokio::test]
     async fn create_route_channel_requires_protocol() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_json_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -3196,7 +3196,7 @@ mod tests {
     #[tokio::test]
     async fn create_route_channel_accepts_base_url_with_v1_suffix_for_proxying() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_json_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -3262,7 +3262,7 @@ mod tests {
     #[tokio::test]
     async fn onboard_route_keeps_one_route_and_adds_multiple_channels() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_a = spawn_json_upstream().await;
         let upstream_b = spawn_json_upstream().await;
         let config = Config {
@@ -3376,7 +3376,7 @@ mod tests {
     #[tokio::test]
     async fn onboarding_probe_rejects_edge_blocked_channel() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_edge_blocked_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -3433,7 +3433,7 @@ mod tests {
     #[tokio::test]
     async fn claude_protocol_proxies_messages_with_anthropic_headers() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_claude_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -3495,7 +3495,7 @@ mod tests {
     #[tokio::test]
     async fn channel_actions_disable_and_reset_cooldown_update_state() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_json_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -3566,7 +3566,7 @@ mod tests {
     #[tokio::test]
     async fn probe_channel_marks_success_ready() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_json_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -3619,7 +3619,7 @@ mod tests {
     #[tokio::test]
     async fn probe_channel_marks_failure_unavailable() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_edge_blocked_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -3751,7 +3751,7 @@ mod tests {
     #[tokio::test]
     async fn chat_completions_non_stream_maps_function_calls_from_responses() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_tool_call_json_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -3808,7 +3808,7 @@ mod tests {
     #[tokio::test]
     async fn chat_completions_stream_maps_function_calls_from_responses_sse() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_tool_call_streaming_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),

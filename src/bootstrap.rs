@@ -65,7 +65,7 @@ mod tests {
     #[tokio::test]
     async fn sync_config_creates_and_updates_routes_and_channels() {
         let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("metapi.db");
+        let db_path = temp_dir.path().join("llmrouter.db");
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             database_url: database_url(&db_path),
