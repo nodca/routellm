@@ -3,24 +3,24 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: install-tui.sh [options]
+用法：install-tui.sh [选项]
 
-Options:
-  --repo owner/repo         GitHub repository, default nodca/routellm unless --asset-url is set
-  --tag v1.1.0              Release tag, defaults to latest
-  --asset-url URL           Direct asset URL override
-  --bin-dir DIR             Binary install directory, default ~/.local/bin
-  --config-dir DIR          Config directory, default ~/.config/llmrouter
-  --server URL              TUI target server, default http://127.0.0.1:1290
-  --auth-key KEY            TUI auth key, optional
-  --skip-env                Do not write ~/.config/llmrouter/tui.env
-  -h, --help                Show this help
+选项：
+  --repo owner/repo         GitHub 仓库，默认 nodca/routellm；如果传了 --asset-url 则忽略
+  --tag v1.1.0              Release 标签，默认 latest
+  --asset-url URL           直接指定资源下载地址
+  --bin-dir DIR             二进制安装目录，默认 ~/.local/bin
+  --config-dir DIR          配置目录，默认 ~/.config/llmrouter
+  --server URL              TUI 连接的服务端地址，默认 http://127.0.0.1:1290
+  --auth-key KEY            TUI 认证 Key，可选
+  --skip-env                不写入 ~/.config/llmrouter/tui.env
+  -h, --help                显示帮助
 EOF
 }
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
-    echo "Missing required command: $1" >&2
+    echo "缺少必要命令：$1" >&2
     exit 1
   }
 }
@@ -30,7 +30,7 @@ detect_os() {
     Linux) echo "linux" ;;
     Darwin) echo "macos" ;;
     *)
-      echo "Unsupported OS: $(uname -s)" >&2
+      echo "暂不支持当前操作系统：$(uname -s)" >&2
       exit 1
       ;;
   esac
@@ -41,7 +41,7 @@ detect_arch() {
     x86_64|amd64) echo "x86_64" ;;
     aarch64|arm64) echo "aarch64" ;;
     *)
-      echo "Unsupported architecture: $(uname -m)" >&2
+      echo "暂不支持当前架构：$(uname -m)" >&2
       exit 1
       ;;
   esac
@@ -82,7 +82,7 @@ while [[ $# -gt 0 ]]; do
     --skip-env) SKIP_ENV=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *)
-      echo "Unknown argument: $1" >&2
+      echo "未知参数：$1" >&2
       usage >&2
       exit 1
       ;;
@@ -102,12 +102,12 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 URL="$(download_url "$ASSET_NAME")"
 ARCHIVE_PATH="${TMP_DIR}/${ASSET_NAME}"
-echo "Downloading ${URL}"
+echo "正在下载：${URL}"
 curl -fsSL "$URL" -o "$ARCHIVE_PATH"
 tar -xzf "$ARCHIVE_PATH" -C "$TMP_DIR"
 PACKAGE_ROOT="$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 -type d | head -n1)"
 if [[ -z "$PACKAGE_ROOT" ]]; then
-  echo "Downloaded archive does not contain a package directory" >&2
+  echo "下载的压缩包中未找到程序目录" >&2
   exit 1
 fi
 
@@ -127,25 +127,25 @@ if [[ "$SKIP_ENV" -eq 0 ]]; then
 fi
 
 cat <<EOF
-TUI installation complete.
+TUI 安装完成。
 
-Binary:
+二进制文件：
   ${BIN_DIR}/llmrouter-tui
-Alias:
+快捷命令：
   ${BIN_DIR}/lrtui
 EOF
 
 if [[ "$SKIP_ENV" -eq 0 ]]; then
   cat <<EOF
-Env file:
+配置文件：
   ${ENV_FILE}
 
-Run:
+启动方式：
   lrtui
 EOF
 else
   cat <<EOF
-Run:
+启动方式：
   LLMROUTER_BASE_URL=${SERVER_URL} lrtui
 EOF
 fi
@@ -154,8 +154,8 @@ case ":$PATH:" in
   *":${BIN_DIR}:"*) ;;
   *)
     echo
-    echo "Note: ${BIN_DIR} is not in your PATH. Add it or run the binary with its full path."
-    echo "Direct path:"
+    echo "注意：${BIN_DIR} 当前不在 PATH 中。请先加入 PATH，或直接使用完整路径运行。"
+    echo "可直接执行："
     echo "  ${BIN_DIR}/lrtui"
     ;;
 esac

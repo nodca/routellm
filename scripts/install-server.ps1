@@ -19,7 +19,7 @@ function Get-ArchName {
     switch ($env:PROCESSOR_ARCHITECTURE) {
         "AMD64" { return "x86_64" }
         "ARM64" { return "aarch64" }
-        default { throw "Unsupported Windows architecture: $($env:PROCESSOR_ARCHITECTURE)" }
+        default { throw "暂不支持当前 Windows 架构：$($env:PROCESSOR_ARCHITECTURE)" }
     }
 }
 
@@ -80,13 +80,13 @@ New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
 $Url = Get-DownloadUrl $AssetName
-Write-Host "Downloading $Url"
+Write-Host "正在下载：$Url"
 Invoke-WebRequest -Uri $Url -OutFile $ArchivePath
 Expand-Archive -LiteralPath $ArchivePath -DestinationPath $TempDir -Force
 
 $PackageRoot = Get-ChildItem -Path $TempDir -Directory | Where-Object { $_.FullName -ne $TempDir } | Select-Object -First 1
 if (-not $PackageRoot) {
-    throw "Downloaded archive does not contain a package directory"
+    throw "下载的压缩包中未找到程序目录"
 }
 
 Copy-Item (Join-Path $PackageRoot.FullName "llmrouter.exe") (Join-Path $InstallDir "llmrouter.exe") -Force
@@ -134,7 +134,7 @@ LLMROUTER_CONFIG_PATH=$ConfigFile
 $AutostartEnabled = $false
 if (-not $SkipAutostart) {
     if (-not (Test-IsAdmin)) {
-        throw "Windows server autostart requires an elevated PowerShell session. Re-run as Administrator, or pass -SkipAutostart."
+        throw "Windows 服务端自启动需要管理员权限。请用管理员 PowerShell 重新运行，或传入 -SkipAutostart。"
     }
 
     Register-StartupTask -TaskName $StartupTaskName -ScriptPath $RunScript
@@ -144,39 +144,39 @@ if (-not $SkipAutostart) {
         try {
             Start-ScheduledTask -TaskName $StartupTaskName
         } catch {
-            Write-Warning "Autostart task was created, but the immediate start attempt failed: $($_.Exception.Message)"
+            Write-Warning "已创建开机启动任务，但立即启动失败：$($_.Exception.Message)"
         }
     }
 }
 
 Remove-Item $TempDir -Recurse -Force
 
-Write-Host "Server installation complete."
+Write-Host "服务端安装完成。"
 Write-Host ""
-Write-Host "Binary:"
+Write-Host "二进制文件："
 Write-Host "  $(Join-Path $InstallDir 'llmrouter.exe')"
-Write-Host "Config:"
+Write-Host "配置文件："
 Write-Host "  $ConfigFile"
-Write-Host "Env file:"
+Write-Host "环境文件："
 Write-Host "  $EnvFile"
-Write-Host "Master key:"
+Write-Host "管理 Key："
 Write-Host "  $MasterKey"
 if ($AutostartEnabled) {
-    Write-Host "Startup task:"
+    Write-Host "启动任务："
     Write-Host "  $StartupTaskName"
-    Write-Host "Autostart:"
-    Write-Host "  enabled"
+    Write-Host "开机自启："
+    Write-Host "  已启用"
 } else {
-    Write-Host "Autostart:"
-    Write-Host "  disabled"
+    Write-Host "开机自启："
+    Write-Host "  未启用"
 }
 if (-not $SkipRunScript) {
-    Write-Host "Run script:"
+    Write-Host "启动脚本："
     Write-Host "  $RunScript"
     Write-Host ""
-    Write-Host "Run:"
+    Write-Host "手动启动："
     Write-Host "  powershell -ExecutionPolicy Bypass -File `"$RunScript`""
     Write-Host ""
-    Write-Host "Tip:"
-    Write-Host "  Override -InstallDir if you want a different location."
+    Write-Host "提示："
+    Write-Host "  如果你想换安装目录，可以传入 -InstallDir。"
 }

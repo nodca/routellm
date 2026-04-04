@@ -16,7 +16,7 @@ function Get-ArchName {
     switch ($env:PROCESSOR_ARCHITECTURE) {
         "AMD64" { return "x86_64" }
         "ARM64" { return "aarch64" }
-        default { throw "Unsupported Windows architecture: $($env:PROCESSOR_ARCHITECTURE)" }
+        default { throw "暂不支持当前 Windows 架构：$($env:PROCESSOR_ARCHITECTURE)" }
     }
 }
 
@@ -59,13 +59,13 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 
 $Url = Get-DownloadUrl $AssetName
-Write-Host "Downloading $Url"
+Write-Host "正在下载：$Url"
 Invoke-WebRequest -Uri $Url -OutFile $ArchivePath
 Expand-Archive -LiteralPath $ArchivePath -DestinationPath $TempDir -Force
 
 $PackageRoot = Get-ChildItem -Path $TempDir -Directory | Where-Object { $_.FullName -ne $TempDir } | Select-Object -First 1
 if (-not $PackageRoot) {
-    throw "Downloaded archive does not contain a package directory"
+    throw "下载的压缩包中未找到程序目录"
 }
 
 Copy-Item (Join-Path $PackageRoot.FullName "llmrouter-tui.exe") (Join-Path $InstallDir "llmrouter-tui.exe") -Force
@@ -98,23 +98,23 @@ Add-UserPathEntry $InstallDir
 
 Remove-Item $TempDir -Recurse -Force
 
-Write-Host "TUI installation complete."
+Write-Host "TUI 安装完成。"
 Write-Host ""
-Write-Host "Binary:"
+Write-Host "二进制文件："
 Write-Host "  $(Join-Path $InstallDir 'llmrouter-tui.exe')"
-Write-Host "Alias:"
+Write-Host "快捷命令："
 Write-Host "  $AliasCmd"
 if (-not $SkipEnv) {
-    Write-Host "Env file:"
+    Write-Host "配置文件："
     Write-Host "  $EnvFile"
 }
 if (-not $SkipRunScript) {
-    Write-Host "Run script:"
+    Write-Host "启动脚本："
     Write-Host "  $RunScript"
     Write-Host ""
-    Write-Host "Run:"
+    Write-Host "启动方式："
     Write-Host "  powershell -ExecutionPolicy Bypass -File `"$RunScript`""
 }
 Write-Host ""
-Write-Host "Direct command:"
+Write-Host "直接命令："
 Write-Host "  lrtui"

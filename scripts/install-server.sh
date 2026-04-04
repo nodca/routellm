@@ -3,30 +3,30 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: install-server.sh [options]
+用法：install-server.sh [选项]
 
-Options:
-  --repo owner/repo         GitHub repository, default nodca/routellm unless --asset-url is set
-  --tag v1.1.0              Release tag, defaults to latest
-  --asset-url URL           Direct asset URL override
-  --install-dir DIR         Install directory, default /opt/llmrouter
-  --bin-path PATH           Binary install path, default <install-dir>/llmrouter
-  --config-file PATH        Config path, default <install-dir>/llmrouter.toml
-  --env-file PATH           Environment file, default /etc/llmrouter.env
-  --bind ADDR               Bind address, default 0.0.0.0:1290
-  --master-key KEY          Downstream auth key, default auto-generated
-  --request-timeout SECS    Request timeout, default 90
-  --service-name NAME       systemd service name, default llmrouter
-  --service-user USER       Linux service user, default llmrouter
-  --skip-systemd            Do not install a systemd unit
-  --skip-start              Do not enable/start the service
-  -h, --help                Show this help
+选项：
+  --repo owner/repo         GitHub 仓库，默认 nodca/routellm；如果传了 --asset-url 则忽略
+  --tag v1.1.0              Release 标签，默认 latest
+  --asset-url URL           直接指定资源下载地址
+  --install-dir DIR         安装目录，默认 /opt/llmrouter
+  --bin-path PATH           二进制安装路径，默认 <install-dir>/llmrouter
+  --config-file PATH        配置文件路径，默认 <install-dir>/llmrouter.toml
+  --env-file PATH           环境变量文件路径，默认 /etc/llmrouter.env
+  --bind ADDR               监听地址，默认 0.0.0.0:1290
+  --master-key KEY          下游认证 Key，默认自动生成
+  --request-timeout SECS    请求超时秒数，默认 90
+  --service-name NAME       systemd 服务名，默认 llmrouter
+  --service-user USER       Linux 服务用户，默认 llmrouter
+  --skip-systemd            不安装 systemd 服务单元
+  --skip-start              不启用或启动服务
+  -h, --help                显示帮助
 EOF
 }
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
-    echo "Missing required command: $1" >&2
+    echo "缺少必要命令：$1" >&2
     exit 1
   }
 }
@@ -36,7 +36,7 @@ detect_os() {
     Linux) echo "linux" ;;
     Darwin) echo "macos" ;;
     *)
-      echo "Unsupported OS: $(uname -s)" >&2
+      echo "暂不支持当前操作系统：$(uname -s)" >&2
       exit 1
       ;;
   esac
@@ -47,7 +47,7 @@ detect_arch() {
     x86_64|amd64) echo "x86_64" ;;
     aarch64|arm64) echo "aarch64" ;;
     *)
-      echo "Unsupported architecture: $(uname -m)" >&2
+      echo "暂不支持当前架构：$(uname -m)" >&2
       exit 1
       ;;
   esac
@@ -76,8 +76,8 @@ prepare_path_parent() {
   local parent
   parent="$(dirname "$path")"
   mkdir -p "$parent" 2>/dev/null || {
-    echo "Failed to prepare directory: $parent" >&2
-    echo "Try running with sudo, or pass --install-dir \$HOME/.local/share/llmrouter for a user-local install." >&2
+    echo "无法创建目录：$parent" >&2
+    echo "请尝试用 sudo 运行，或传入 --install-dir \$HOME/.local/share/llmrouter 做当前用户安装。" >&2
     exit 1
   }
 }
@@ -115,7 +115,7 @@ while [[ $# -gt 0 ]]; do
     --skip-start) SKIP_START=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *)
-      echo "Unknown argument: $1" >&2
+      echo "未知参数：$1" >&2
       usage >&2
       exit 1
       ;;
@@ -154,12 +154,12 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 URL="$(download_url "$ASSET_NAME")"
 ARCHIVE_PATH="${TMP_DIR}/${ASSET_NAME}"
-echo "Downloading ${URL}"
+echo "正在下载：${URL}"
 curl -fsSL "$URL" -o "$ARCHIVE_PATH"
 tar -xzf "$ARCHIVE_PATH" -C "$TMP_DIR"
 PACKAGE_ROOT="$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 -type d | head -n1)"
 if [[ -z "$PACKAGE_ROOT" ]]; then
-  echo "Downloaded archive does not contain a package directory" >&2
+  echo "下载的压缩包中未找到程序目录" >&2
   exit 1
 fi
 
@@ -196,7 +196,7 @@ EOF
 
 if [[ "$SKIP_SYSTEMD" -eq 0 ]]; then
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    echo "systemd installation requires root" >&2
+    echo "安装 systemd 服务需要 root 权限" >&2
     exit 1
   fi
 
@@ -235,25 +235,25 @@ EOF
 fi
 
 cat <<EOF
-Server installation complete.
+服务端安装完成。
 
-Binary:
+二进制文件：
   ${BIN_PATH}
 
-Config:
+配置文件：
   ${CONFIG_FILE}
 
-Env:
+环境文件：
   ${ENV_FILE}
 
-Master key:
+管理 Key：
   ${MASTER_KEY}
 
-Next steps:
-  1. Edit ${CONFIG_FILE} and add your routes/channels, or onboard them later via API/TUI.
-  2. If systemd was skipped, start manually:
+后续步骤：
+  1. 编辑 ${CONFIG_FILE}，添加你的 route 和 channel；也可以稍后通过 API/TUI 配置。
+  2. 如果跳过了 systemd，请手动启动：
      set -a; . "${ENV_FILE}"; set +a; "${BIN_PATH}"
-  3. For a non-root install, rerun with:
+  3. 如果你想做非 root 安装，可以这样重装：
      --install-dir "$HOME/.local/share/llmrouter" --env-file "$HOME/.config/llmrouter/server.env" --skip-systemd
-  4. For the default /opt install, run the installer with sudo.
+  4. 如果使用默认的 /opt 安装目录，请用 sudo 运行安装脚本。
 EOF
