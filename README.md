@@ -120,45 +120,8 @@ curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install
 - 注册 `systemd` 开机自启动
 - 自动随机生成一个 `master_key`
 
-然后在服务器上编辑配置文件，加入你的 route 和 channel，最后重启：
-
-```bash
-sudo systemctl restart llmrouter
-```
 
 本机安装 TUI：
-
-Linux：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.sh | bash
-```
-
-Windows：
-
-```powershell
-irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.ps1 | iex
-```
-
-第一次连接远程服务端时，把服务端地址和 `master_key` 写进去即可。
-
-Linux：
-
-```bash
-LLMROUTER_BASE_URL=http://你的服务器IP:1290 \
-LLMROUTER_AUTH_KEY=你的master_key \
-lrtui
-```
-
-Windows：
-
-```powershell
-$env:LLMROUTER_BASE_URL="http://你的服务器IP:1290"
-$env:LLMROUTER_AUTH_KEY="你的master_key"
-lrtui
-```
-
-如果你想长期保存这组连接信息，也可以直接重装一次 TUI 并写入本地配置：
 
 Linux：
 
