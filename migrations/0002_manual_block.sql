@@ -1,0 +1,2 @@
+ALTER TABLE channels
+ADD COLUMN manual_blocked INTEGER NOT NULL DEFAULT 0;

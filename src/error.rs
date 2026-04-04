@@ -1,0 +1,85 @@
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use serde::Serialize;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum AppError {
+    #[error("{0}")]
+    BadRequest(String),
+    #[error("{0}")]
+    Unauthorized(String),
+    #[error("{0}")]
+    NotFound(String),
+    #[error("{0}")]
+    NoRoute(String),
+    #[error("{0}")]
+    Config(String),
+    #[error("{0}")]
+    UpstreamTransport(String),
+    #[error("{0}")]
+    UpstreamStatus(String, StatusCode),
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+    #[error(transparent)]
+    Migration(#[from] sqlx::migrate::MigrateError),
+    #[error("{0}")]
+    Internal(String),
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorBody {
+    error: ErrorPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorPayload {
+    message: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+impl AppError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::NoRoute(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Config(_) | Self::Internal(_) | Self::Database(_) | Self::Migration(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            Self::UpstreamTransport(_) => StatusCode::BAD_GATEWAY,
+            Self::UpstreamStatus(_, status) => *status,
+        }
+    }
+
+    fn error_type(&self) -> &'static str {
+        match self {
+            Self::BadRequest(_) => "bad_request",
+            Self::Unauthorized(_) => "auth_error",
+            Self::NotFound(_) => "not_found",
+            Self::NoRoute(_) => "routing_error",
+            Self::Config(_) | Self::Internal(_) | Self::Database(_) | Self::Migration(_) => {
+                "internal_error"
+            }
+            Self::UpstreamTransport(_) | Self::UpstreamStatus(_, _) => "upstream_error",
+        }
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let status = self.status_code();
+        let body = ErrorBody {
+            error: ErrorPayload {
+                message: self.to_string(),
+                kind: self.error_type().to_string(),
+            },
+        };
+        (status, Json(body)).into_response()
+    }
+}
