@@ -169,13 +169,53 @@ TUI 与管理面主要展示四种状态：
 
 ### 方式二：安装脚本
 
+#### 安装命令速查
+
+Linux:
+
+```bash
+# server，systemd 开机自启动
+curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh | sudo bash
+
+# TUI
+curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.sh | bash
+
+# 单机模式：server + tui，一次装好
+curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-local.sh | sudo bash
+
+# 一键卸载
+curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/uninstall-local.sh | sudo bash
+```
+
+Windows:
+
+```powershell
+# server，默认注册开机自启动任务
+irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.ps1 | iex
+
+# TUI
+irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.ps1 | iex
+
+# 单机模式：server + tui，一次装好
+irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-local.ps1 | iex
+
+# 一键卸载
+irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/uninstall-local.ps1 | iex
+```
+
+说明：
+
+- Linux 的 `server` 和单机模式会安装为 `systemd` 服务并开机自启动
+- Windows 的 `server` 和单机模式请在管理员 PowerShell 中运行，会注册开机自启动计划任务
+- 所有脚本默认下载最新 release，无需手动填写版本号
+
 #### Linux 单机模式
 
 本机 server + 本机 TUI，一次装好。server 默认只监听本机 `127.0.0.1:1290`，并启用 systemd 自启动。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-local.sh | \
-  sudo bash -s -- --repo nodca/routellm --tag v1.1.0
+  sudo bash
 ```
 
 脚本会自动：
@@ -196,14 +236,14 @@ curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/uninsta
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh | \
-  sudo bash -s -- --repo nodca/routellm --tag v1.1.0
+  sudo bash
 ```
 
 默认安装到 `/opt/llmrouter`，适合 root 管理的服务端部署。非 root 安装建议改成：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh | \
-  bash -s -- --repo nodca/routellm --tag v1.1.0 \
+  bash -s -- \
     --install-dir "$HOME/.local/share/llmrouter" \
     --env-file "$HOME/.config/llmrouter/server.env" \
     --skip-systemd
@@ -213,7 +253,7 @@ curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.sh | \
-  bash -s -- --repo nodca/routellm --tag v1.1.0 --server http://127.0.0.1:1290
+  bash -s -- --server http://127.0.0.1:1290
 ```
 
 安装后可直接运行 `lrtui`。
@@ -223,17 +263,25 @@ curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install
 #### Windows Server
 
 ```powershell
-powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.ps1 -OutFile install-server.ps1"
-powershell -ExecutionPolicy Bypass -File .\install-server.ps1 -Repo nodca/routellm -Tag v1.1.0
+irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.ps1 | iex
 ```
 
-Windows 默认安装到 `%LOCALAPPDATA%\llmrouter`。
+请在管理员 PowerShell 中运行。默认安装到 `%LOCALAPPDATA%\llmrouter`，并注册 `llmrouter` 开机自启动任务。
+
+#### Windows 单机模式
+
+本机 `server + tui` 一次装好。`server` 默认监听 `127.0.0.1:1290`，并注册开机自启动任务。
+
+```powershell
+irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-local.ps1 | iex
+```
+
+请在管理员 PowerShell 中运行。
 
 #### Windows TUI
 
 ```powershell
-powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.ps1 -OutFile install-tui.ps1"
-powershell -ExecutionPolicy Bypass -File .\install-tui.ps1 -Repo nodca/routellm -Tag v1.1.0 -Server http://127.0.0.1:1290 -AuthKey sk-llmrouter-your-key
+irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.ps1 | iex
 ```
 
 Windows TUI 默认也放在 `%LOCALAPPDATA%\llmrouter`。
@@ -242,8 +290,7 @@ Windows TUI 默认也放在 `%LOCALAPPDATA%\llmrouter`。
 Windows 一键卸载：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/nodca/routellm/main/scripts/uninstall-local.ps1 -OutFile uninstall-local.ps1"
-powershell -ExecutionPolicy Bypass -File .\uninstall-local.ps1
+irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/uninstall-local.ps1 | iex
 ```
 
 ## 启动方式
