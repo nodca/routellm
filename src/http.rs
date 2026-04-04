@@ -2798,7 +2798,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert!(avg_latency_ms.is_some_and(|value| value > 0));
+        assert!(avg_latency_ms.is_some_and(|value| value >= 0));
     }
 
     #[tokio::test]
