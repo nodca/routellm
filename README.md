@@ -209,6 +209,8 @@ curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install
   bash -s -- --repo nodca/routellm --tag v1.0 --server http://127.0.0.1:1290
 ```
 
+`llmrouter-tui` 会优先读取本地保存的连接配置；如果没有配置，首次启动会引导你填写一次 `Server URL` 和管理 `KEY`，之后自动复用。
+
 #### Windows Server
 
 ```powershell
@@ -226,6 +228,7 @@ powershell -ExecutionPolicy Bypass -File .\install-tui.ps1 -Repo nodca/routellm 
 ```
 
 Windows TUI 默认也放在 `%LOCALAPPDATA%\llmrouter`。
+首次启动同样只需要配置一次，之后会直接读取本地保存的连接信息。
 
 ## 启动方式
 
@@ -259,6 +262,11 @@ LLMROUTER_AUTH_KEY=sk-llmrouter-local \
 ./target/release/llmrouter-tui
 ```
 
+这组环境变量主要用于临时覆盖。正常使用时，`llmrouter-tui` 会自动读取本地配置文件：
+
+- Linux/macOS: `~/.config/llmrouter/tui.env`
+- Windows: `%LOCALAPPDATA%\llmrouter\tui.env`
+
 ## 部署方式
 
 ### 1. 本机一体化
@@ -274,8 +282,8 @@ LLMROUTER_AUTH_KEY=sk-llmrouter-local \
 
 - server 部署在 Linux VPS 或常开机器
 - TUI 在本地电脑运行
-- TUI 通过 `LLMROUTER_BASE_URL` 连接远程 server
-- TUI 通过 `LLMROUTER_AUTH_KEY` 使用同一个 `master_key`
+- TUI 首次连接时填写远程 server 地址
+- 如果 server 开启了 `master_key`，TUI 填一次同一把管理 key 后本地保存
 
 示例：
 
@@ -354,7 +362,7 @@ TUI 是 `llmrouter` 的应用级管理终端。
 
 ```toml
 [server]
-bind_addr = "0.0.0.0:8080"
+bind_addr = "127.0.0.1:1290"
 database_url = "sqlite://llmrouter-state.db"
 request_timeout_secs = 90
 master_key = "sk-llmrouter-change-me"
@@ -422,6 +430,12 @@ enabled = true
 - `LLMROUTER_BASE_URL`
 - `LLMROUTER_AUTH_KEY`
 
+通常不需要每次手动设置。它们主要用于：
+
+- 首次安装时由脚本写入本地配置
+- 临时覆盖默认连接目标
+- CI、脚本化启动或调试
+
 ## 管理 API
 
 ### 健康检查
@@ -467,6 +481,11 @@ export LLMROUTER_BASE_URL=http://127.0.0.1:1290
 - 下游客户端把 `Base URL` 设为 `http://127.0.0.1:1290/v1`
 - `API Key` 设为 `sk-llmrouter-local`
 - TUI 也使用同一个 key 连接服务端
+
+但如果你使用了安装脚本，通常不用手动 export 这些变量：
+
+- `install-local.sh` 会把本机地址和管理 key 自动写进 TUI 配置
+- `llmrouter-tui` 也支持首次启动引导，填一次后自动保存
 
 ## 协议支持
 
