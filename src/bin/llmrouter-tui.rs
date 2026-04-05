@@ -6,7 +6,7 @@ use std::{
     io::{self, IsTerminal},
     path::{Path, PathBuf},
     time::Duration,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(not(windows))]
@@ -32,6 +32,8 @@ use llmrouter::cc_switch::{
     DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL, DEFAULT_GEMINI_MODEL, ImportCandidate,
     load_cc_switch_import,
 };
+
+const ROUTE_REFRESH_DEBOUNCE_MS: u64 = 150;
 
 #[derive(Debug, Deserialize, Clone)]
 struct ApiResponse<T> {
@@ -147,6 +149,20 @@ enum ProbeEvent {
         failed_count: usize,
         transport_failures: usize,
     },
+}
+
+#[derive(Debug, Clone)]
+struct BackgroundRefreshSnapshot {
+    requested_route_id: Option<i64>,
+    routes: Vec<RouteSummary>,
+    route_detail: Option<RouteDetail>,
+    channels: Vec<ChannelSummary>,
+    logs: Vec<RequestLogSummary>,
+}
+
+#[derive(Debug, Clone)]
+enum RefreshEvent {
+    Completed(Result<BackgroundRefreshSnapshot, String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -925,6 +941,8 @@ struct App {
     status: String,
     show_help: bool,
     probing_channels: HashSet<i64>,
+    pending_route_refresh_at: Option<Instant>,
+    background_refresh_in_flight: bool,
 }
 
 impl App {
@@ -952,6 +970,8 @@ impl App {
             status: "loading...".to_string(),
             show_help: false,
             probing_channels: HashSet::new(),
+            pending_route_refresh_at: None,
+            background_refresh_in_flight: false,
         }
     }
 
@@ -974,13 +994,86 @@ impl App {
         }
     }
 
-    async fn refresh_background(&mut self) {
-        if let Err(error) = self.reload_all().await {
-            self.status = error;
+    fn trigger_background_refresh(
+        &mut self,
+        refresh_tx: &mpsc::UnboundedSender<RefreshEvent>,
+    ) {
+        if self.background_refresh_in_flight {
+            return;
+        }
+        self.background_refresh_in_flight = true;
+
+        let client = self.client.clone();
+        let base_url = self.base_url.clone();
+        let auth_key = self.auth_key.clone();
+        let selected_route_id = self.selected_route_ref().map(|route| route.id);
+        let tx = refresh_tx.clone();
+
+        tokio::spawn(async move {
+            let result =
+                fetch_background_snapshot(client, base_url, auth_key, selected_route_id).await;
+            let _ = tx.send(RefreshEvent::Completed(result));
+        });
+    }
+
+    fn handle_refresh_event(&mut self, event: RefreshEvent) {
+        self.background_refresh_in_flight = false;
+
+        let RefreshEvent::Completed(result) = event;
+        let snapshot = match result {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+
+        let current_selected_route_id = self.selected_route_ref().map(|route| route.id);
+        self.routes = snapshot.routes;
+        if self.routes.is_empty() {
+            self.selected_route = 0;
+            self.channels.clear();
+            self.logs.clear();
+            self.route_detail = None;
+            self.selected_channel = 0;
+            self.selected_log = 0;
+            return;
+        }
+
+        if let Some(route_id) = current_selected_route_id {
+            if let Some(index) = self.routes.iter().position(|route| route.id == route_id) {
+                self.selected_route = index;
+            } else {
+                self.selected_route = self.selected_route.min(self.routes.len() - 1);
+            }
+        } else {
+            self.selected_route = self.selected_route.min(self.routes.len() - 1);
+        }
+
+        let selected_route_id = self.selected_route_ref().map(|route| route.id);
+        if selected_route_id != snapshot.requested_route_id {
+            return;
+        }
+
+        if let Some(route_detail) = snapshot.route_detail {
+            self.route_detail = Some(route_detail);
+            self.channels = snapshot.channels;
+            self.logs = self.merge_route_logs(selected_route_id.unwrap_or_default(), snapshot.logs);
+            self.selected_channel = if self.channels.is_empty() {
+                0
+            } else {
+                self.selected_channel.min(self.channels.len() - 1)
+            };
+            self.selected_log = if self.logs.is_empty() {
+                0
+            } else {
+                self.selected_log.min(self.logs.len() - 1)
+            };
         }
     }
 
     async fn reload_all(&mut self) -> Result<(), String> {
+        self.pending_route_refresh_at = None;
         self.routes = self.fetch_routes().await?;
         if self.routes.is_empty() {
             self.selected_route = 0;
@@ -1023,6 +1116,7 @@ impl App {
             self.selected_channel.min(self.channels.len() - 1)
         };
         self.selected_log = 0;
+        self.pending_route_refresh_at = None;
         Ok(())
     }
 
@@ -1207,11 +1301,45 @@ impl App {
             .filter(|query| !query.is_empty())
     }
 
-    async fn set_selected_route(&mut self, route_index: usize) {
+    fn set_selected_route_debounced(&mut self, route_index: usize) {
         if self.selected_route == route_index {
             return;
         }
         self.selected_route = route_index;
+        self.pending_route_refresh_at =
+            Some(Instant::now() + Duration::from_millis(ROUTE_REFRESH_DEBOUNCE_MS));
+        self.selected_channel = 0;
+        self.selected_log = 0;
+    }
+
+    async fn set_selected_route_immediate(&mut self, route_index: usize) {
+        if self.selected_route != route_index {
+            self.selected_route = route_index;
+            self.selected_channel = 0;
+            self.selected_log = 0;
+        }
+        self.pending_route_refresh_at = None;
+        if let Err(error) = self.refresh_channels().await {
+            self.status = error;
+        }
+    }
+
+    async fn flush_pending_route_refresh(&mut self) {
+        if self.pending_route_refresh_at.is_none() {
+            return;
+        }
+        if let Err(error) = self.refresh_channels().await {
+            self.status = error;
+        }
+    }
+
+    async fn refresh_selected_route_if_due(&mut self) {
+        let Some(due_at) = self.pending_route_refresh_at else {
+            return;
+        };
+        if Instant::now() < due_at {
+            return;
+        }
         if let Err(error) = self.refresh_channels().await {
             self.status = error;
         }
@@ -1223,7 +1351,7 @@ impl App {
                 let visible = self.filtered_route_indices();
                 if let Some(position) = self.selected_route_visible_index() {
                     if position + 1 < visible.len() {
-                        self.set_selected_route(visible[position + 1]).await;
+                        self.set_selected_route_debounced(visible[position + 1]);
                     }
                 }
             }
@@ -1248,7 +1376,7 @@ impl App {
                 let visible = self.filtered_route_indices();
                 if let Some(position) = self.selected_route_visible_index() {
                     if position > 0 {
-                        self.set_selected_route(visible[position - 1]).await;
+                        self.set_selected_route_debounced(visible[position - 1]);
                     }
                 }
             }
@@ -1270,7 +1398,7 @@ impl App {
         match self.focus {
             FocusPane::Routes => {
                 if let Some(index) = self.filtered_route_indices().first().copied() {
-                    self.set_selected_route(index).await;
+                    self.set_selected_route_debounced(index);
                 }
             }
             FocusPane::Channels => {
@@ -1291,7 +1419,7 @@ impl App {
         match self.focus {
             FocusPane::Routes => {
                 if let Some(index) = self.filtered_route_indices().last().copied() {
-                    self.set_selected_route(index).await;
+                    self.set_selected_route_debounced(index);
                 }
             }
             FocusPane::Channels => {
@@ -1328,9 +1456,12 @@ impl App {
         };
     }
 
-    fn move_focus_right(&mut self) {
+    async fn move_focus_right(&mut self) {
         self.focus = match self.focus {
-            FocusPane::Routes => FocusPane::Channels,
+            FocusPane::Routes => {
+                self.flush_pending_route_refresh().await;
+                FocusPane::Channels
+            }
             FocusPane::Channels => FocusPane::Logs,
             FocusPane::Logs => FocusPane::Logs,
         };
@@ -1376,9 +1507,10 @@ impl App {
         self.mode = AppMode::EditChannel(EditChannelForm::new(&channel, &route, prefill));
     }
 
-    fn open_detail(&mut self) {
+    async fn open_detail(&mut self) {
         match self.focus {
             FocusPane::Routes => {
+                self.flush_pending_route_refresh().await;
                 self.focus = FocusPane::Channels;
             }
             FocusPane::Channels => {
@@ -1921,7 +2053,7 @@ impl App {
         });
         self.focus = FocusPane::Routes;
         if !matches.contains(&self.selected_route) {
-            self.set_selected_route(matches[0]).await;
+            self.set_selected_route_immediate(matches[0]).await;
         }
         self.status = format!("filtered {} route(s) by `{query}`", matches.len());
     }
@@ -2331,6 +2463,84 @@ impl App {
     }
 }
 
+async fn get_json_with<T: DeserializeOwned>(
+    client: &Client,
+    base_url: &str,
+    auth_key: Option<&str>,
+    path: &str,
+    action: &str,
+) -> Result<T, String> {
+    let mut request = client.get(format!("{base_url}{path}"));
+    if let Some(auth_key) = auth_key {
+        request = request.bearer_auth(auth_key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("failed to {action}: {error}"))?;
+    App::decode_api_response(response, action).await
+}
+
+async fn fetch_background_snapshot(
+    client: Client,
+    base_url: String,
+    auth_key: Option<String>,
+    selected_route_id: Option<i64>,
+) -> Result<BackgroundRefreshSnapshot, String> {
+    let routes: Vec<RouteSummary> =
+        get_json_with(&client, &base_url, auth_key.as_deref(), "/api/routes", "load routes")
+            .await?;
+
+    if routes.is_empty() {
+        return Ok(BackgroundRefreshSnapshot {
+            requested_route_id: None,
+            routes,
+            route_detail: None,
+            channels: Vec::new(),
+            logs: Vec::new(),
+        });
+    }
+
+    let requested_route_id = selected_route_id
+        .filter(|route_id| routes.iter().any(|route| route.id == *route_id))
+        .or_else(|| routes.first().map(|route| route.id));
+
+    let Some(route_id) = requested_route_id else {
+        return Ok(BackgroundRefreshSnapshot {
+            requested_route_id: None,
+            routes,
+            route_detail: None,
+            channels: Vec::new(),
+            logs: Vec::new(),
+        });
+    };
+
+    let channels_envelope: RouteDetailEnvelope = get_json_with(
+        &client,
+        &base_url,
+        auth_key.as_deref(),
+        &format!("/api/routes/{route_id}/channels"),
+        "load route channels",
+    )
+    .await?;
+    let logs_envelope: RouteLogsEnvelope = get_json_with(
+        &client,
+        &base_url,
+        auth_key.as_deref(),
+        &format!("/api/routes/{route_id}/logs?limit=12"),
+        "load route logs",
+    )
+    .await?;
+
+    Ok(BackgroundRefreshSnapshot {
+        requested_route_id: Some(route_id),
+        routes,
+        route_detail: Some(channels_envelope.route),
+        channels: channels_envelope.channels,
+        logs: logs_envelope.logs,
+    })
+}
+
 fn is_same_import_channel(existing: &ChannelSummary, candidate: &ImportCandidate) -> bool {
     existing.site_base_url.trim_end_matches('/') == candidate.base_url.trim_end_matches('/')
         && existing.upstream_model == candidate.upstream_model
@@ -2364,12 +2574,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let base_url = startup.base_url;
     let auth_key = startup.auth_key;
     let (probe_tx, mut probe_rx) = mpsc::unbounded_channel();
+    let (refresh_tx, mut refresh_rx) = mpsc::unbounded_channel();
     let mut app = App::new(base_url, auth_key, probe_tx);
     app.refresh_all().await;
 
     let terminal = ratatui::init();
 
-    let result = run_app(terminal, app, &mut probe_rx).await;
+    let result = run_app(terminal, app, &mut probe_rx, &refresh_tx, &mut refresh_rx).await;
 
     ratatui::restore();
 
@@ -2555,10 +2766,14 @@ async fn run_app(
     mut terminal: DefaultTerminal,
     mut app: App,
     probe_rx: &mut mpsc::UnboundedReceiver<ProbeEvent>,
+    refresh_tx: &mpsc::UnboundedSender<RefreshEvent>,
+    refresh_rx: &mut mpsc::UnboundedReceiver<RefreshEvent>,
 ) -> Result<(), Box<dyn Error>> {
     let mut events = EventStream::new();
     let mut ticker = time::interval(Duration::from_secs(5));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut route_refresh_ticker = time::interval(Duration::from_millis(50));
+    route_refresh_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         terminal.draw(|frame| draw(frame, &app))?;
@@ -2599,10 +2814,10 @@ async fn run_app(
                         KeyCode::Char('K') => app.copy_auth_key(),
                         KeyCode::Char('?') => app.show_help = !app.show_help,
                         KeyCode::Left => app.move_focus_left(),
-                        KeyCode::Right => app.move_focus_right(),
+                        KeyCode::Right => app.move_focus_right().await,
                         KeyCode::Down => app.move_down().await,
                         KeyCode::Up => app.move_up().await,
-                        KeyCode::Enter => app.open_detail(),
+                        KeyCode::Enter => app.open_detail().await,
                         _ => {}
                     }
                 }
@@ -2612,8 +2827,16 @@ async fn run_app(
                     app.handle_probe_event(event).await;
                 }
             }
+            maybe_refresh = refresh_rx.recv() => {
+                if let Some(event) = maybe_refresh {
+                    app.handle_refresh_event(event);
+                }
+            }
             _ = ticker.tick() => {
-                app.refresh_background().await;
+                app.trigger_background_refresh(refresh_tx);
+            }
+            _ = route_refresh_ticker.tick() => {
+                app.refresh_selected_route_if_due().await;
             }
         }
     }
@@ -3040,6 +3263,18 @@ fn short_error_label(kind: &str) -> &str {
     }
 }
 
+fn compact_error_excerpt(message: &str, max_width: usize) -> String {
+    let compact = message
+        .replace("upstream stream error: ", "")
+        .replace("upstream transport error: ", "")
+        .replace("failed to read upstream body chunk: ", "")
+        .replace("failed to read upstream body: ", "")
+        .replace("error decoding response body", "decode-body")
+        .replace("connection closed before message completed", "stream-closed")
+        .replace('\n', " ");
+    truncate_text(compact.trim(), max_width)
+}
+
 fn log_table_header(max_width: usize) -> String {
     truncate_text(
         &format!(
@@ -3062,11 +3297,13 @@ fn log_table_row(log: &RequestLogSummary, max_width: usize) -> String {
             truncate_text(&log.site_name, 16)
         )
     } else if log.error_message.is_some() {
+        let error_excerpt = compact_error_excerpt(log.error_message.as_deref().unwrap_or(""), 28);
         format!(
-            "{} -> {} ({})",
+            "{} -> {} ({}: {})",
             truncate_text(&log.upstream_model, 18),
             truncate_text(&log.site_name, 16),
-            truncate_text(short_error_label(&log.error_kind), 12)
+            truncate_text(short_error_label(&log.error_kind), 12),
+            error_excerpt
         )
     } else {
         format!(

@@ -33,6 +33,8 @@ use crate::{
     routing,
 };
 
+const AUTO_COOLDOWN_FAILURE_THRESHOLD: i64 = 3;
+
 #[derive(Debug, Deserialize)]
 pub struct RouteDecisionQuery {
     model: String,
@@ -614,42 +616,21 @@ async fn attempt_proxy_request(
     }
 
     if dispatch.response_adapter == ResponseAdapter::Passthrough {
-        if is_stream {
-            return proxy_passthrough_stream(
-                state,
-                route,
-                selected,
-                request_id.to_string(),
-                requested_model.to_string(),
-                status,
-                headers,
-                upstream_response,
-                started_at,
-                downstream_protocol,
-                dispatch.upstream_protocol,
-            )
-            .await;
-        }
-
-        let body = read_response_body(upstream_response)
-            .await
-            .map_err(|error| {
-                AppError::UpstreamTransport(format!("failed to read upstream body: {error}"))
-            })?;
-        let token_usage = extract_usage_from_body(dispatch.upstream_protocol, &body);
-        record_success(
-            &state,
-            &selected,
-            request_id,
-            requested_model,
+        return proxy_passthrough_stream(
+            state,
+            route,
+            selected,
+            request_id.to_string(),
+            requested_model.to_string(),
+            status,
+            headers,
+            upstream_response,
+            started_at,
             downstream_protocol,
             dispatch.upstream_protocol,
-            status.as_u16(),
-            started_at.elapsed().as_millis() as i64,
-            token_usage,
+            !is_stream,
         )
-        .await?;
-        return build_response(status, &headers, Body::from(body));
+        .await;
     }
 
     if is_stream {
@@ -662,18 +643,50 @@ async fn attempt_proxy_request(
             upstream_response,
             started_at,
             dispatch.upstream_protocol,
-        )
-        .await;
+            )
+            .await;
     }
 
-    let body = read_response_body(upstream_response)
-        .await
-        .map_err(|error| {
-            AppError::UpstreamTransport(format!("failed to read upstream body: {error}"))
-        })?;
-    let response_value: Value = serde_json::from_slice(&body).map_err(|error| {
-        AppError::UpstreamTransport(format!("invalid upstream json body: {error}"))
-    })?;
+    let body = match read_response_body(upstream_response).await {
+        Ok(body) => body,
+        Err(error) => {
+            let message = format!("failed to read upstream body: {error}");
+            record_failure(
+                &state,
+                &route,
+                &selected,
+                request_id,
+                requested_model,
+                downstream_protocol,
+                dispatch.upstream_protocol,
+                Some(status.as_u16()),
+                started_at.elapsed().as_millis() as i64,
+                message.clone(),
+            )
+            .await?;
+            return Err(AppError::UpstreamTransport(message));
+        }
+    };
+    let response_value: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            let message = format!("invalid upstream json body: {error}");
+            record_failure(
+                &state,
+                &route,
+                &selected,
+                request_id,
+                requested_model,
+                downstream_protocol,
+                dispatch.upstream_protocol,
+                Some(status.as_u16()),
+                started_at.elapsed().as_millis() as i64,
+                message.clone(),
+            )
+            .await?;
+            return Err(AppError::UpstreamTransport(message));
+        }
+    };
     let token_usage = extract_usage_from_value(dispatch.upstream_protocol, &response_value);
     let chat_response =
         responses_json_to_chat_completion(&response_value, requested_model, request_id);
@@ -750,6 +763,7 @@ async fn proxy_passthrough_stream(
     started_at: Instant,
     downstream_protocol: Protocol,
     upstream_protocol: Protocol,
+    capture_usage: bool,
 ) -> Result<Response<Body>, AppError> {
     let mut upstream_stream = upstream_response.bytes_stream();
     let first_chunk = match await_first_upstream_chunk(&mut upstream_stream).await {
@@ -781,8 +795,12 @@ async fn proxy_passthrough_stream(
     tokio::spawn(async move {
         let mut stream_error: Option<String> = None;
         let mut downstream_disconnected = false;
+        let mut usage_buffer = capture_usage.then(Vec::new);
 
         if let Some(chunk) = first_chunk {
+            if let Some(buffer) = usage_buffer.as_mut() {
+                buffer.extend_from_slice(&chunk);
+            }
             if tx.send(Ok(chunk)).await.is_err() {
                 downstream_disconnected = true;
             }
@@ -792,6 +810,9 @@ async fn proxy_passthrough_stream(
             while let Some(next_chunk) = upstream_stream.next().await {
                 match next_chunk {
                     Ok(chunk) => {
+                        if let Some(buffer) = usage_buffer.as_mut() {
+                            buffer.extend_from_slice(&chunk);
+                        }
                         if tx.send(Ok(chunk)).await.is_err() {
                             downstream_disconnected = true;
                             break;
@@ -832,6 +853,9 @@ async fn proxy_passthrough_stream(
 
         let success_note = downstream_disconnected
             .then(|| "downstream disconnected before stream completion".to_string());
+        let token_usage = usage_buffer
+            .as_deref()
+            .and_then(|body| extract_usage_from_body(upstream_protocol, body));
 
         if let Err(error) = record_success_with_note(
             &state_for_task,
@@ -843,7 +867,7 @@ async fn proxy_passthrough_stream(
             status.as_u16(),
             latency_ms,
             success_note,
-            None,
+            token_usage,
         )
         .await
         {
@@ -1353,15 +1377,20 @@ async fn record_failure(
     let next_fail_count = selected.consecutive_fail_count + 1;
     let manual_intervention_required =
         requires_manual_intervention(&state.manual_intervention_policy, error_kind);
-    let cooldown_until = (!manual_intervention_required).then(|| {
-        now_ts()
-            + resolve_cooldown_seconds(
-                &state.cooldown_policy,
-                route.cooldown_seconds,
-                error_kind,
-                next_fail_count,
+    let cooldown_until =
+        if manual_intervention_required || !should_enter_cooldown(next_fail_count) {
+            None
+        } else {
+            Some(
+                now_ts()
+                    + resolve_cooldown_seconds(
+                        &state.cooldown_policy,
+                        route.cooldown_seconds,
+                        error_kind,
+                        cooldown_fail_count(next_fail_count),
+                    ),
             )
-    });
+        };
     let log = RequestLogWrite {
         request_id: request_id.to_string(),
         downstream_path: downstream_protocol.path().to_string(),
@@ -1568,6 +1597,14 @@ fn resolve_cooldown_seconds(
         _ => None,
     }
     .unwrap_or(route_default_seconds)
+}
+
+fn should_enter_cooldown(consecutive_fail_count: i64) -> bool {
+    consecutive_fail_count >= AUTO_COOLDOWN_FAILURE_THRESHOLD
+}
+
+fn cooldown_fail_count(consecutive_fail_count: i64) -> i64 {
+    (consecutive_fail_count - AUTO_COOLDOWN_FAILURE_THRESHOLD + 1).max(1)
 }
 
 fn requires_manual_intervention(policy: &ManualInterventionPolicy, error_kind: &str) -> bool {
@@ -2442,6 +2479,32 @@ mod tests {
         addr
     }
 
+    async fn spawn_broken_json_upstream() -> SocketAddr {
+        async fn handler() -> Response<Body> {
+            let chunks = vec![
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                    b"{\"id\":\"resp_broken\",\"output\":[",
+                )),
+                Err::<Bytes, std::io::Error>(std::io::Error::other(
+                    "error decoding response body",
+                )),
+            ];
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from_stream(tokio_stream::iter(chunks)))
+                .unwrap()
+        }
+
+        let app = Router::new().route("/v1/responses", post(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
     async fn spawn_edge_blocked_upstream() -> SocketAddr {
         async fn handler() -> Response<Body> {
             Response::builder()
@@ -3004,6 +3067,124 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(first_status, Some(401));
+
+        let first_cooldown_until =
+            sqlx::query_scalar::<_, Option<i64>>("select cooldown_until from channels where id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(first_cooldown_until.is_none());
+
+        let first_fail_count = sqlx::query_scalar::<_, i64>(
+            "select consecutive_fail_count from channels where id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(first_fail_count, 1);
+    }
+
+    #[tokio::test]
+    async fn channel_only_enters_cooldown_after_third_consecutive_failure() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_auth_error_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        seed_database(&config.database_url, upstream_addr).await;
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+
+        for attempt in 1..=3 {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": "gpt-5.4",
+                        "input": "ping"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap();
+
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+            let fail_count = sqlx::query_scalar::<_, i64>(
+                "select consecutive_fail_count from channels where id = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(fail_count, attempt);
+
+            let cooldown_until = sqlx::query_scalar::<_, Option<i64>>(
+                "select cooldown_until from channels where id = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            if attempt < 3 {
+                assert!(cooldown_until.is_none());
+            } else {
+                assert!(cooldown_until.is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn non_stream_body_decode_failure_is_recorded_in_request_logs() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_broken_json_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        seed_database(&config.database_url, upstream_addr).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.4",
+                    "input": "ping"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+        let error_message = sqlx::query_scalar::<_, Option<String>>(
+            "select error_message from request_logs order by id desc limit 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!error_message.trim().is_empty());
     }
 
     #[tokio::test]
@@ -3313,6 +3494,23 @@ mod tests {
             super::resolve_cooldown_seconds(&policy, 300, "first_token_timeout", 9),
             1920
         );
+    }
+
+    #[test]
+    fn cooldown_starts_on_third_consecutive_failure() {
+        assert!(!super::should_enter_cooldown(1));
+        assert!(!super::should_enter_cooldown(2));
+        assert!(super::should_enter_cooldown(3));
+        assert!(super::should_enter_cooldown(4));
+    }
+
+    #[test]
+    fn cooldown_backoff_restarts_when_threshold_is_reached() {
+        assert_eq!(super::cooldown_fail_count(1), 1);
+        assert_eq!(super::cooldown_fail_count(2), 1);
+        assert_eq!(super::cooldown_fail_count(3), 1);
+        assert_eq!(super::cooldown_fail_count(4), 2);
+        assert_eq!(super::cooldown_fail_count(5), 3);
     }
 
     #[test]
