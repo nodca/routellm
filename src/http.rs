@@ -562,12 +562,22 @@ async fn attempt_proxy_request(
     let channel_protocol = Protocol::parse(&selected.protocol)?;
     let dispatch = build_upstream_dispatch(payload, downstream_protocol, channel_protocol)?;
     let started_at = Instant::now();
+    let is_stream = dispatch
+        .payload
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let upstream_url = build_upstream_url(&selected.site_base_url, dispatch.upstream_protocol);
+    let upstream_client = if is_stream {
+        &state.upstream_stream_client
+    } else {
+        &state.upstream_client
+    };
     let upstream_response = timeout(
         Duration::from_secs(FIRST_TOKEN_TIMEOUT_SECS),
         apply_upstream_auth(
-            state.upstream_client.post(&upstream_url),
+            upstream_client.post(&upstream_url),
             dispatch.upstream_protocol,
             &selected.account_api_key,
         )
@@ -608,11 +618,6 @@ async fn attempt_proxy_request(
 
     let status = upstream_response.status();
     let headers = upstream_response.headers().clone();
-    let is_stream = dispatch
-        .payload
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
 
     if !status.is_success() {
         let message = match upstream_response.bytes().await {
@@ -2768,6 +2773,52 @@ mod tests {
         addr
     }
 
+    async fn spawn_slow_streaming_upstream() -> SocketAddr {
+        async fn handler() -> Response<Body> {
+            let stream = futures_util::stream::unfold(0usize, |step| async move {
+                let item = match step {
+                    0 => Some((
+                        Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                            b"data: {\"type\":\"response.created\"}\n\n",
+                        )),
+                        1,
+                    )),
+                    1 => {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        Some((
+                            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"slow\"}\n\n",
+                            )),
+                            2,
+                        ))
+                    }
+                    2 => Some((
+                        Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                            b"data: {\"type\":\"response.completed\"}\n\n",
+                        )),
+                        3,
+                    )),
+                    _ => None,
+                };
+                item
+            });
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+
+        let app = Router::new().route("/v1/responses", post(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
     async fn spawn_json_upstream() -> SocketAddr {
         async fn handler() -> Json<Value> {
             Json(json!({
@@ -3170,6 +3221,46 @@ mod tests {
             response.headers().get(CONTENT_TYPE).unwrap(),
             "text/event-stream"
         );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("response.output_text.delta"));
+        assert!(text.contains("response.completed"));
+    }
+
+    #[tokio::test]
+    async fn responses_stream_is_not_cut_off_by_global_request_timeout() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_slow_streaming_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 1,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        seed_database(&config.database_url, upstream_addr).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.4",
+                    "stream": true,
+                    "input": "ping"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();

@@ -23,6 +23,7 @@ use crate::{
 pub struct AppState {
     pub store: SqliteStore,
     pub upstream_client: Client,
+    pub upstream_stream_client: Client,
     pub master_key: Option<String>,
     pub cooldown_policy: CooldownPolicy,
     pub manual_intervention_policy: ManualInterventionPolicy,
@@ -30,19 +31,27 @@ pub struct AppState {
 
 pub async fn build_state(config: &Config) -> Result<AppState, crate::error::AppError> {
     let store = SqliteStore::connect(config).await?;
-    let upstream_client = Client::builder()
-        .timeout(Duration::from_secs(config.request_timeout_secs))
-        .build()
-        .map_err(|error| {
-            crate::error::AppError::Internal(format!("failed to build http client: {error}"))
-        })?;
+    let upstream_client =
+        build_upstream_client(Some(Duration::from_secs(config.request_timeout_secs)))?;
+    let upstream_stream_client = build_upstream_client(None)?;
 
     Ok(AppState {
         store,
         upstream_client,
+        upstream_stream_client,
         master_key: config.master_key.clone(),
         cooldown_policy: config.cooldown_policy.clone(),
         manual_intervention_policy: config.manual_intervention_policy.clone(),
+    })
+}
+
+fn build_upstream_client(timeout: Option<Duration>) -> Result<Client, crate::error::AppError> {
+    let mut builder = Client::builder();
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
+    builder.build().map_err(|error| {
+        crate::error::AppError::Internal(format!("failed to build http client: {error}"))
     })
 }
 
