@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    error::Error as StdError,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -96,8 +97,7 @@ fn build_upstream_url(base_url: &str, protocol: Protocol) -> String {
             }
         }
         Protocol::ChatCompletions => {
-            if trimmed.ends_with("/v1/chat/completions") || trimmed.ends_with("/chat/completions")
-            {
+            if trimmed.ends_with("/v1/chat/completions") || trimmed.ends_with("/chat/completions") {
                 trimmed.to_string()
             } else if trimmed.ends_with("/v1") || trimmed.ends_with("/openai") {
                 format!("{trimmed}/chat/completions")
@@ -508,7 +508,9 @@ async fn proxy_request(
     let candidates = routing::inspect_candidates(channels, Some(downstream_protocol), now_ts());
     let ordered_channels = routing::ordered_eligible_channels(&candidates);
     if ordered_channels.is_empty() {
-        if let Some(selected) = select_last_chance_channel(&candidates, downstream_protocol, now_ts()) {
+        if let Some(selected) =
+            select_last_chance_channel(&candidates, downstream_protocol, now_ts())
+        {
             return attempt_proxy_request(
                 state,
                 route,
@@ -576,7 +578,11 @@ async fn attempt_proxy_request(
     .map_err(|_| AppError::UpstreamTransport(first_token_timeout_message("response headers")))
     .and_then(|response| {
         response.map_err(|error| {
-            AppError::UpstreamTransport(format!("upstream transport error: {error}"))
+            AppError::UpstreamTransport(describe_reqwest_error(
+                "send_upstream_request",
+                Some(&upstream_url),
+                &error,
+            ))
         })
     });
 
@@ -609,8 +615,14 @@ async fn attempt_proxy_request(
         .unwrap_or(false);
 
     if !status.is_success() {
-        let body = upstream_response.bytes().await.unwrap_or_default();
-        let message = truncate(String::from_utf8_lossy(&body).as_ref(), 800);
+        let message = match upstream_response.bytes().await {
+            Ok(body) => truncate(String::from_utf8_lossy(&body).as_ref(), 800),
+            Err(error) => format!(
+                "upstream returned status={} but failed to read error body: {}",
+                status.as_u16(),
+                describe_reqwest_error("read_error_response_body", Some(&upstream_url), &error)
+            ),
+        };
         record_failure(
             &state,
             &route,
@@ -655,8 +667,8 @@ async fn attempt_proxy_request(
             upstream_response,
             started_at,
             dispatch.upstream_protocol,
-            )
-            .await;
+        )
+        .await;
     }
 
     let body = match read_response_body(upstream_response).await {
@@ -718,23 +730,34 @@ async fn attempt_proxy_request(
 }
 
 async fn read_response_body(upstream_response: reqwest::Response) -> Result<Vec<u8>, String> {
+    let upstream_url = upstream_response.url().to_string();
     let mut upstream_stream = upstream_response.bytes_stream();
-    let first_chunk = await_first_upstream_chunk(&mut upstream_stream).await?;
+    let first_chunk = await_first_upstream_chunk(
+        "read_nonstream_first_chunk",
+        &upstream_url,
+        &mut upstream_stream,
+    )
+    .await?;
     let mut body = Vec::new();
     if let Some(chunk) = first_chunk {
         body.extend_from_slice(&chunk);
     }
 
     while let Some(next_chunk) = upstream_stream.next().await {
-        let chunk =
-            next_chunk.map_err(|error| format!("failed to read upstream body chunk: {error}"))?;
+        let chunk = next_chunk.map_err(|error| {
+            describe_reqwest_error("read_nonstream_body_chunk", Some(&upstream_url), &error)
+        })?;
         body.extend_from_slice(&chunk);
     }
 
     Ok(body)
 }
 
-async fn await_first_upstream_chunk<S>(upstream_stream: &mut S) -> Result<Option<Bytes>, String>
+async fn await_first_upstream_chunk<S>(
+    stage: &str,
+    upstream_url: &str,
+    upstream_stream: &mut S,
+) -> Result<Option<Bytes>, String>
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
 {
@@ -747,7 +770,7 @@ where
 
     match first_chunk {
         Some(Ok(chunk)) => Ok(Some(chunk)),
-        Some(Err(error)) => Err(format!("upstream stream error: {error}")),
+        Some(Err(error)) => Err(describe_reqwest_error(stage, Some(upstream_url), &error)),
         None => Ok(None),
     }
 }
@@ -777,8 +800,15 @@ async fn proxy_passthrough_stream(
     upstream_protocol: Protocol,
     capture_usage: bool,
 ) -> Result<Response<Body>, AppError> {
+    let upstream_url = upstream_response.url().to_string();
     let mut upstream_stream = upstream_response.bytes_stream();
-    let first_chunk = match await_first_upstream_chunk(&mut upstream_stream).await {
+    let first_chunk = match await_first_upstream_chunk(
+        "read_passthrough_first_chunk",
+        &upstream_url,
+        &mut upstream_stream,
+    )
+    .await
+    {
         Ok(chunk) => chunk,
         Err(message) => {
             record_failure(
@@ -831,7 +861,11 @@ async fn proxy_passthrough_stream(
                         }
                     }
                     Err(error) => {
-                        let message = format!("upstream stream error: {error}");
+                        let message = describe_reqwest_error(
+                            "read_passthrough_stream_chunk",
+                            Some(&upstream_url),
+                            &error,
+                        );
                         let _ = tx.send(Err(std::io::Error::other(message.clone()))).await;
                         stream_error = Some(message);
                         break;
@@ -900,8 +934,15 @@ async fn proxy_chat_completions_stream(
     started_at: Instant,
     upstream_protocol: Protocol,
 ) -> Result<Response<Body>, AppError> {
+    let upstream_url = upstream_response.url().to_string();
     let mut upstream_stream = upstream_response.bytes_stream();
-    let first_chunk = match await_first_upstream_chunk(&mut upstream_stream).await {
+    let first_chunk = match await_first_upstream_chunk(
+        "read_chat_adapter_first_chunk",
+        &upstream_url,
+        &mut upstream_stream,
+    )
+    .await
+    {
         Ok(chunk) => chunk,
         Err(message) => {
             record_failure(
@@ -1007,7 +1048,11 @@ async fn proxy_chat_completions_stream(
                         }
                     }
                     Err(error) => {
-                        let message = format!("upstream stream error: {error}");
+                        let message = describe_reqwest_error(
+                            "read_chat_adapter_stream_chunk",
+                            Some(&upstream_url),
+                            &error,
+                        );
                         let _ = tx.send(Err(std::io::Error::other(message.clone()))).await;
                         stream_error = Some(message);
                         break;
@@ -1476,7 +1521,11 @@ async fn background_recover_channel(
         Ok(http_status) => {
             state
                 .store
-                .mark_channel_success(channel.channel_id, http_status, Some(started_at.elapsed().as_millis() as i64))
+                .mark_channel_success(
+                    channel.channel_id,
+                    http_status,
+                    Some(started_at.elapsed().as_millis() as i64),
+                )
                 .await?;
             Ok(true)
         }
@@ -1484,10 +1533,8 @@ async fn background_recover_channel(
             let error_message = outcome
                 .error_message
                 .unwrap_or_else(|| "background recovery probe failed".to_string());
-            let (error_kind, _) = classify_upstream_error(
-                outcome.http_status.map(i64::from),
-                Some(&error_message),
-            );
+            let (error_kind, _) =
+                classify_upstream_error(outcome.http_status.map(i64::from), Some(&error_message));
             let (cooldown_until, manual_blocked) = failure_disposition(
                 &state.cooldown_policy,
                 &state.manual_intervention_policy,
@@ -1510,7 +1557,10 @@ async fn background_recover_channel(
     }
 }
 
-fn select_background_recovery_candidate(channels: &[ChannelRow], now_ts: i64) -> Option<ChannelRow> {
+fn select_background_recovery_candidate(
+    channels: &[ChannelRow],
+    now_ts: i64,
+) -> Option<ChannelRow> {
     let mut candidates = channels
         .iter()
         .filter(|channel| {
@@ -1568,7 +1618,8 @@ pub async fn run_background_recovery_cycle_with_memory(
             continue;
         };
 
-        if background_recover_channel(&state, &route_admin_to_model_route(&route), &channel).await? {
+        if background_recover_channel(&state, &route_admin_to_model_route(&route), &channel).await?
+        {
             recovered_count += 1;
         }
     }
@@ -1592,7 +1643,11 @@ async fn run_upstream_probe(
         .await
         .map_err(|error| ProbeOutcome {
             http_status: None,
-            error_message: Some(format!("transport error: {error}")),
+            error_message: Some(describe_reqwest_error(
+                "probe_send_upstream_request",
+                Some(&probe_url),
+                &error,
+            )),
         })?;
 
     if response.status().is_success() {
@@ -1600,8 +1655,14 @@ async fn run_upstream_probe(
     }
 
     let status = response.status();
-    let body = response.bytes().await.unwrap_or_default();
-    let message = truncate(String::from_utf8_lossy(&body).as_ref(), 400);
+    let message = match response.bytes().await {
+        Ok(body) => truncate(String::from_utf8_lossy(&body).as_ref(), 400),
+        Err(error) => format!(
+            "status={} but failed to read probe error body: {}",
+            status.as_u16(),
+            describe_reqwest_error("read_probe_error_body", Some(&probe_url), &error)
+        ),
+    };
     let (kind, hint) = classify_upstream_error(Some(i64::from(status.as_u16())), Some(&message));
     let hint_suffix = hint
         .as_deref()
@@ -1790,7 +1851,8 @@ fn select_last_chance_channel(
             }
 
             let channel_protocol = Protocol::parse(&channel.protocol).ok()?;
-            let protocol_cost = crate::protocol::compatibility_cost(channel_protocol, request_protocol)?;
+            let protocol_cost =
+                crate::protocol::compatibility_cost(channel_protocol, request_protocol)?;
 
             Some((channel.clone(), protocol_cost, cooldown_until))
         })
@@ -2579,6 +2641,71 @@ fn now_ts() -> i64 {
         .unwrap_or_default()
 }
 
+fn describe_reqwest_error(
+    stage: &str,
+    request_url: Option<&str>,
+    error: &reqwest::Error,
+) -> String {
+    let mut flags = Vec::new();
+    if error.is_timeout() {
+        flags.push("timeout");
+    }
+    if error.is_connect() {
+        flags.push("connect");
+    }
+    if error.is_body() {
+        flags.push("body");
+    }
+    if error.is_decode() {
+        flags.push("decode");
+    }
+    if error.is_request() {
+        flags.push("request");
+    }
+    if error.is_redirect() {
+        flags.push("redirect");
+    }
+    if error.is_status() {
+        flags.push("status");
+    }
+    if flags.is_empty() {
+        flags.push("other");
+    }
+
+    let status = error
+        .status()
+        .map(|status| status.as_u16().to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let url = error
+        .url()
+        .map(|url| url.as_str().to_string())
+        .or_else(|| request_url.map(str::to_string))
+        .unwrap_or_else(|| "-".to_string());
+
+    let mut sources = Vec::new();
+    let mut current = error.source();
+    while let Some(source) = current {
+        sources.push(source.to_string());
+        current = source.source();
+        if sources.len() >= 6 {
+            break;
+        }
+    }
+    let sources = if sources.is_empty() {
+        String::new()
+    } else {
+        format!("; sources={}", truncate(&sources.join(" <- "), 280))
+    };
+
+    truncate(
+        &format!(
+            "upstream transport error [stage={stage} flags={} status={status} url={url}]: {error}{sources}",
+            flags.join(","),
+        ),
+        800,
+    )
+}
+
 fn truncate(message: &str, max_len: usize) -> String {
     if message.len() <= max_len {
         return message.to_string();
@@ -2676,9 +2803,7 @@ mod tests {
                 Ok::<Bytes, std::io::Error>(Bytes::from_static(
                     b"{\"id\":\"resp_broken\",\"output\":[",
                 )),
-                Err::<Bytes, std::io::Error>(std::io::Error::other(
-                    "error decoding response body",
-                )),
+                Err::<Bytes, std::io::Error>(std::io::Error::other("error decoding response body")),
             ];
             Response::builder()
                 .status(StatusCode::OK)
@@ -2875,9 +3000,7 @@ mod tests {
                 return Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
                     .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{"error":{"message":"missing bearer auth"}}"#,
-                    ))
+                    .body(Body::from(r#"{"error":{"message":"missing bearer auth"}}"#))
                     .unwrap();
             }
 
@@ -3279,11 +3402,12 @@ mod tests {
                 .unwrap();
         assert_eq!(first_status, Some(401));
 
-        let first_cooldown_until =
-            sqlx::query_scalar::<_, Option<i64>>("select cooldown_until from channels where id = 1")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let first_cooldown_until = sqlx::query_scalar::<_, Option<i64>>(
+            "select cooldown_until from channels where id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert!(first_cooldown_until.is_none());
 
         let first_fail_count = sqlx::query_scalar::<_, i64>(
@@ -3503,6 +3627,9 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(!error_message.trim().is_empty());
+        assert!(error_message.contains("stage="));
+        assert!(error_message.contains("flags="));
+        assert!(error_message.contains("url="));
     }
 
     #[tokio::test]
@@ -4606,10 +4733,7 @@ mod tests {
     #[test]
     fn build_upstream_url_supports_openai_compatible_prefixes() {
         assert_eq!(
-            super::build_upstream_url(
-                "https://api.example.com",
-                Protocol::ChatCompletions
-            ),
+            super::build_upstream_url("https://api.example.com", Protocol::ChatCompletions),
             "https://api.example.com/v1/chat/completions"
         );
         assert_eq!(

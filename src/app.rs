@@ -31,7 +31,6 @@ pub struct AppState {
 pub async fn build_state(config: &Config) -> Result<AppState, crate::error::AppError> {
     let store = SqliteStore::connect(config).await?;
     let upstream_client = Client::builder()
-        .http1_only()
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .build()
         .map_err(|error| {
