@@ -3225,7 +3225,7 @@ fn pane_title<'a>(label: &'a str, focused: bool) -> Line<'a> {
         Line::from(vec![
             Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" "),
-            Span::styled("已聚焦", Style::default().fg(Color::Cyan)),
+            Span::styled("focused", Style::default().fg(Color::Cyan)),
         ])
     } else {
         Line::from(label)
