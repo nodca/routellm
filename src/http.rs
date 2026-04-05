@@ -508,6 +508,18 @@ async fn proxy_request(
     let candidates = routing::inspect_candidates(channels, Some(downstream_protocol), now_ts());
     let ordered_channels = routing::ordered_eligible_channels(&candidates);
     if ordered_channels.is_empty() {
+        if let Some(selected) = select_last_chance_channel(&candidates, downstream_protocol, now_ts()) {
+            return attempt_proxy_request(
+                state,
+                route,
+                selected,
+                &request_id,
+                &requested_model,
+                payload,
+                downstream_protocol,
+            )
+            .await;
+        }
         return Err(AppError::NoRoute(format!(
             "no eligible channel for model: {requested_model}"
         )));
@@ -1375,22 +1387,13 @@ async fn record_failure(
 ) -> Result<(), AppError> {
     let (error_kind, _) = classify_upstream_error(http_status.map(i64::from), Some(&error_message));
     let next_fail_count = selected.consecutive_fail_count + 1;
-    let manual_intervention_required =
-        requires_manual_intervention(&state.manual_intervention_policy, error_kind);
-    let cooldown_until =
-        if manual_intervention_required || !should_enter_cooldown(next_fail_count) {
-            None
-        } else {
-            Some(
-                now_ts()
-                    + resolve_cooldown_seconds(
-                        &state.cooldown_policy,
-                        route.cooldown_seconds,
-                        error_kind,
-                        cooldown_fail_count(next_fail_count),
-                    ),
-            )
-        };
+    let (cooldown_until, manual_intervention_required) = failure_disposition(
+        &state.cooldown_policy,
+        &state.manual_intervention_policy,
+        route.cooldown_seconds,
+        error_kind,
+        next_fail_count,
+    );
     let log = RequestLogWrite {
         request_id: request_id.to_string(),
         downstream_path: downstream_protocol.path().to_string(),
@@ -1418,6 +1421,32 @@ async fn record_failure(
     Ok(())
 }
 
+fn failure_disposition(
+    cooldown_policy: &CooldownPolicy,
+    manual_policy: &ManualInterventionPolicy,
+    route_cooldown_seconds: i64,
+    error_kind: &str,
+    next_fail_count: i64,
+) -> (Option<i64>, bool) {
+    let manual_intervention_required = requires_immediate_manual_block(error_kind)
+        || requires_manual_intervention(manual_policy, error_kind);
+    let cooldown_until = if manual_intervention_required || !should_enter_cooldown(next_fail_count)
+    {
+        None
+    } else {
+        Some(
+            now_ts()
+                + resolve_cooldown_seconds(
+                    cooldown_policy,
+                    route_cooldown_seconds,
+                    error_kind,
+                    cooldown_fail_count(next_fail_count),
+                ),
+        )
+    };
+    (cooldown_until, manual_intervention_required)
+}
+
 async fn execute_channel_probe(
     state: &AppState,
     channel: &ChannelRow,
@@ -1435,6 +1464,116 @@ async fn execute_channel_probe(
         protocol,
     )
     .await
+}
+
+async fn background_recover_channel(
+    state: &AppState,
+    route: &ModelRouteRow,
+    channel: &ChannelRow,
+) -> Result<bool, AppError> {
+    let started_at = Instant::now();
+    match execute_channel_probe(state, channel).await {
+        Ok(http_status) => {
+            state
+                .store
+                .mark_channel_success(channel.channel_id, http_status, Some(started_at.elapsed().as_millis() as i64))
+                .await?;
+            Ok(true)
+        }
+        Err(outcome) => {
+            let error_message = outcome
+                .error_message
+                .unwrap_or_else(|| "background recovery probe failed".to_string());
+            let (error_kind, _) = classify_upstream_error(
+                outcome.http_status.map(i64::from),
+                Some(&error_message),
+            );
+            let (cooldown_until, manual_blocked) = failure_disposition(
+                &state.cooldown_policy,
+                &state.manual_intervention_policy,
+                route.cooldown_seconds,
+                error_kind,
+                channel.consecutive_fail_count + 1,
+            );
+            state
+                .store
+                .mark_channel_failure(
+                    channel.channel_id,
+                    outcome.http_status,
+                    &error_message,
+                    cooldown_until,
+                    manual_blocked,
+                )
+                .await?;
+            Ok(false)
+        }
+    }
+}
+
+fn select_background_recovery_candidate(channels: &[ChannelRow], now_ts: i64) -> Option<ChannelRow> {
+    let mut candidates = channels
+        .iter()
+        .filter(|channel| {
+            channel.enabled != 0
+                && channel.manual_blocked == 0
+                && channel.account_status == "active"
+                && channel.site_status == "active"
+                && channel.cooldown_until.is_some_and(|until| until > now_ts)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    candidates.sort_by_key(|channel| {
+        (
+            channel.priority,
+            channel.avg_latency_ms.unwrap_or(i64::MAX),
+            channel.cooldown_until.unwrap_or(i64::MAX),
+            channel.channel_id,
+        )
+    });
+
+    candidates.into_iter().next()
+}
+
+fn route_admin_to_model_route(route: &AdminRouteRow) -> ModelRouteRow {
+    ModelRouteRow {
+        id: route.id,
+        model_pattern: route.model_pattern.clone(),
+        enabled: route.enabled,
+        routing_strategy: route.routing_strategy.clone(),
+        cooldown_seconds: route.cooldown_seconds,
+    }
+}
+
+pub async fn run_background_recovery_cycle_with_memory(
+    state: AppState,
+    zero_ready_probed_routes: &mut HashSet<i64>,
+) -> Result<usize, AppError> {
+    let now = now_ts();
+    let routes = state.store.list_routes(now).await?;
+    let mut recovered_count = 0usize;
+
+    for route in routes {
+        if route.ready_channel_count > 0 {
+            zero_ready_probed_routes.remove(&route.id);
+            continue;
+        }
+
+        if !zero_ready_probed_routes.insert(route.id) {
+            continue;
+        }
+
+        let channels = state.store.load_channels(route.id).await?;
+        let Some(channel) = select_background_recovery_candidate(&channels, now) else {
+            continue;
+        };
+
+        if background_recover_channel(&state, &route_admin_to_model_route(&route), &channel).await? {
+            recovered_count += 1;
+        }
+    }
+
+    Ok(recovered_count)
 }
 
 async fn run_upstream_probe(
@@ -1607,6 +1746,13 @@ fn cooldown_fail_count(consecutive_fail_count: i64) -> i64 {
     (consecutive_fail_count - AUTO_COOLDOWN_FAILURE_THRESHOLD + 1).max(1)
 }
 
+fn requires_immediate_manual_block(error_kind: &str) -> bool {
+    matches!(
+        error_kind,
+        "auth_error" | "upstream_path_error" | "edge_blocked"
+    )
+}
+
 fn requires_manual_intervention(policy: &ManualInterventionPolicy, error_kind: &str) -> bool {
     match error_kind {
         "first_token_timeout" => false,
@@ -1619,6 +1765,51 @@ fn requires_manual_intervention(policy: &ManualInterventionPolicy, error_kind: &
         "unknown_error" => policy.unknown_error,
         _ => false,
     }
+}
+
+fn select_last_chance_channel(
+    candidates: &[routing::CandidateEvaluation],
+    request_protocol: Protocol,
+    now_ts: i64,
+) -> Option<ChannelRow> {
+    let mut cooling_candidates = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let channel = &candidate.channel;
+            if channel.enabled == 0
+                || channel.manual_blocked != 0
+                || channel.account_status != "active"
+                || channel.site_status != "active"
+            {
+                return None;
+            }
+
+            let cooldown_until = channel.cooldown_until?;
+            if cooldown_until <= now_ts {
+                return None;
+            }
+
+            let channel_protocol = Protocol::parse(&channel.protocol).ok()?;
+            let protocol_cost = crate::protocol::compatibility_cost(channel_protocol, request_protocol)?;
+
+            Some((channel.clone(), protocol_cost, cooldown_until))
+        })
+        .collect::<Vec<_>>();
+
+    cooling_candidates.sort_by_key(|(channel, protocol_cost, cooldown_until)| {
+        (
+            channel.priority,
+            *protocol_cost,
+            channel.avg_latency_ms.unwrap_or(i64::MAX),
+            *cooldown_until,
+            channel.channel_id,
+        )
+    });
+
+    cooling_candidates
+        .into_iter()
+        .map(|(channel, _, _)| channel)
+        .next()
 }
 
 fn chat_completions_to_responses_payload(payload: &Value) -> Result<Value, AppError> {
@@ -2397,7 +2588,7 @@ fn truncate(message: &str, max_len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, path::PathBuf};
+    use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
     use axum::{
         Json, Router,
@@ -2530,6 +2721,26 @@ mod tests {
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"error":{"message":"invalid api key","type":"invalid_request_error"}}"#,
+                ))
+                .unwrap()
+        }
+
+        let app = Router::new().route("/v1/responses", post(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    async fn spawn_server_error_upstream() -> SocketAddr {
+        async fn handler() -> Response<Body> {
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"error":{"message":"upstream unavailable","type":"server_error"}}"#,
                 ))
                 .unwrap()
         }
@@ -3085,10 +3296,117 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn channel_only_enters_cooldown_after_third_consecutive_failure() {
+    async fn hard_failures_are_blocked_on_first_hit() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
         let upstream_addr = spawn_auth_error_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        seed_database(&config.database_url, upstream_addr).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.4",
+                    "input": "ping"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+        let row = sqlx::query_as::<_, (i64, Option<i64>, i64)>(
+            "select manual_blocked, cooldown_until, consecutive_fail_count from channels where id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 1);
+        assert!(row.1.is_none());
+        assert_eq!(row.2, 1);
+    }
+
+    #[tokio::test]
+    async fn last_chance_attempt_can_recover_route_with_zero_ready_channels() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_json_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        seed_database(&config.database_url, upstream_addr).await;
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+        sqlx::query(
+            r#"
+            update channels
+            set cooldown_until = ?,
+                consecutive_fail_count = 3,
+                last_status = 503,
+                last_error = 'temporary upstream failure'
+            where id = 1
+            "#,
+        )
+        .bind(super::now_ts() + 600)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.4",
+                    "input": "ping"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let row = sqlx::query_as::<_, (Option<i64>, i64, Option<i64>)>(
+            "select cooldown_until, consecutive_fail_count, last_status from channels where id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(row.0.is_none());
+        assert_eq!(row.1, 0);
+        assert_eq!(row.2, Some(200));
+    }
+
+    #[tokio::test]
+    async fn channel_only_enters_cooldown_after_third_consecutive_failure() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_server_error_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             database_url: database_url(db_path),
@@ -3118,7 +3436,7 @@ mod tests {
                 .unwrap();
 
             let response = app.clone().oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
             let fail_count = sqlx::query_scalar::<_, i64>(
                 "select consecutive_fail_count from channels where id = 1",

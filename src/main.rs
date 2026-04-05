@@ -1,7 +1,8 @@
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf, time::Duration};
 
 use llmrouter::{app, bootstrap, config::Config};
 use tokio::net::TcpListener;
+use tokio::time::{self, MissedTickBehavior};
 use tracing_subscriber::fmt;
 
 #[tokio::main]
@@ -24,6 +25,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "config topology sync completed"
                 );
             }
+            let recovery_state = state.clone();
+            tokio::spawn(async move {
+                let mut ticker = time::interval(Duration::from_secs(15));
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                let mut zero_ready_probed_routes = HashSet::new();
+
+                loop {
+                    ticker.tick().await;
+                    match llmrouter::http::run_background_recovery_cycle_with_memory(
+                        recovery_state.clone(),
+                        &mut zero_ready_probed_routes,
+                    )
+                    .await
+                    {
+                        Ok(recovered) if recovered > 0 => {
+                            tracing::info!(recovered, "background recovery probe restored channel(s)");
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!("background recovery cycle failed: {error}");
+                        }
+                    }
+                }
+            });
+
             let app = app::build_router(state);
             let listener = TcpListener::bind(config.bind_addr).await?;
 
