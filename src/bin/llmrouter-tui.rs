@@ -33,7 +33,8 @@ use llmrouter::cc_switch::{
     load_cc_switch_import,
 };
 
-const ROUTE_REFRESH_DEBOUNCE_MS: u64 = 150;
+const ROUTE_REFRESH_DEBOUNCE_MS: u64 = 80;
+const ROUTE_REFRESH_TICK_MS: u64 = 20;
 
 #[derive(Debug, Deserialize, Clone)]
 struct ApiResponse<T> {
@@ -161,8 +162,17 @@ struct BackgroundRefreshSnapshot {
 }
 
 #[derive(Debug, Clone)]
+struct RouteRefreshSnapshot {
+    route_id: i64,
+    route_detail: RouteDetail,
+    channels: Vec<ChannelSummary>,
+    logs: Vec<RequestLogSummary>,
+}
+
+#[derive(Debug, Clone)]
 enum RefreshEvent {
-    Completed(Result<BackgroundRefreshSnapshot, String>),
+    BackgroundCompleted(Result<BackgroundRefreshSnapshot, String>),
+    RouteCompleted(Result<RouteRefreshSnapshot, String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -943,6 +953,7 @@ struct App {
     probing_channels: HashSet<i64>,
     pending_route_refresh_at: Option<Instant>,
     background_refresh_in_flight: bool,
+    route_refresh_in_flight: bool,
 }
 
 impl App {
@@ -972,6 +983,7 @@ impl App {
             probing_channels: HashSet::new(),
             pending_route_refresh_at: None,
             background_refresh_in_flight: false,
+            route_refresh_in_flight: false,
         }
     }
 
@@ -1012,63 +1024,97 @@ impl App {
         tokio::spawn(async move {
             let result =
                 fetch_background_snapshot(client, base_url, auth_key, selected_route_id).await;
-            let _ = tx.send(RefreshEvent::Completed(result));
+            let _ = tx.send(RefreshEvent::BackgroundCompleted(result));
         });
     }
 
     fn handle_refresh_event(&mut self, event: RefreshEvent) {
-        self.background_refresh_in_flight = false;
+        match event {
+            RefreshEvent::BackgroundCompleted(result) => {
+                self.background_refresh_in_flight = false;
+                let snapshot = match result {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        self.status = error;
+                        return;
+                    }
+                };
 
-        let RefreshEvent::Completed(result) = event;
-        let snapshot = match result {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                self.status = error;
-                return;
+                let current_selected_route_id = self.selected_route_ref().map(|route| route.id);
+                self.routes = snapshot.routes;
+                if self.routes.is_empty() {
+                    self.selected_route = 0;
+                    self.channels.clear();
+                    self.logs.clear();
+                    self.route_detail = None;
+                    self.selected_channel = 0;
+                    self.selected_log = 0;
+                    return;
+                }
+
+                if let Some(route_id) = current_selected_route_id {
+                    if let Some(index) = self.routes.iter().position(|route| route.id == route_id) {
+                        self.selected_route = index;
+                    } else {
+                        self.selected_route = self.selected_route.min(self.routes.len() - 1);
+                    }
+                } else {
+                    self.selected_route = self.selected_route.min(self.routes.len() - 1);
+                }
+
+                let selected_route_id = self.selected_route_ref().map(|route| route.id);
+                if selected_route_id != snapshot.requested_route_id {
+                    return;
+                }
+
+                if let Some(route_detail) = snapshot.route_detail {
+                    self.route_detail = Some(route_detail);
+                    self.channels = snapshot.channels;
+                    self.logs =
+                        self.merge_route_logs(selected_route_id.unwrap_or_default(), snapshot.logs);
+                    self.selected_channel = if self.channels.is_empty() {
+                        0
+                    } else {
+                        self.selected_channel.min(self.channels.len() - 1)
+                    };
+                    self.selected_log = if self.logs.is_empty() {
+                        0
+                    } else {
+                        self.selected_log.min(self.logs.len() - 1)
+                    };
+                }
             }
-        };
+            RefreshEvent::RouteCompleted(result) => {
+                self.route_refresh_in_flight = false;
+                let snapshot = match result {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        self.status = error;
+                        return;
+                    }
+                };
 
-        let current_selected_route_id = self.selected_route_ref().map(|route| route.id);
-        self.routes = snapshot.routes;
-        if self.routes.is_empty() {
-            self.selected_route = 0;
-            self.channels.clear();
-            self.logs.clear();
-            self.route_detail = None;
-            self.selected_channel = 0;
-            self.selected_log = 0;
-            return;
-        }
+                if self
+                    .selected_route_ref()
+                    .is_none_or(|route| route.id != snapshot.route_id)
+                {
+                    return;
+                }
 
-        if let Some(route_id) = current_selected_route_id {
-            if let Some(index) = self.routes.iter().position(|route| route.id == route_id) {
-                self.selected_route = index;
-            } else {
-                self.selected_route = self.selected_route.min(self.routes.len() - 1);
+                self.route_detail = Some(snapshot.route_detail);
+                self.channels = snapshot.channels;
+                self.logs = self.merge_route_logs(snapshot.route_id, snapshot.logs);
+                self.selected_channel = if self.channels.is_empty() {
+                    0
+                } else {
+                    self.selected_channel.min(self.channels.len() - 1)
+                };
+                self.selected_log = if self.logs.is_empty() {
+                    0
+                } else {
+                    self.selected_log.min(self.logs.len() - 1)
+                };
             }
-        } else {
-            self.selected_route = self.selected_route.min(self.routes.len() - 1);
-        }
-
-        let selected_route_id = self.selected_route_ref().map(|route| route.id);
-        if selected_route_id != snapshot.requested_route_id {
-            return;
-        }
-
-        if let Some(route_detail) = snapshot.route_detail {
-            self.route_detail = Some(route_detail);
-            self.channels = snapshot.channels;
-            self.logs = self.merge_route_logs(selected_route_id.unwrap_or_default(), snapshot.logs);
-            self.selected_channel = if self.channels.is_empty() {
-                0
-            } else {
-                self.selected_channel.min(self.channels.len() - 1)
-            };
-            self.selected_log = if self.logs.is_empty() {
-                0
-            } else {
-                self.selected_log.min(self.logs.len() - 1)
-            };
         }
     }
 
@@ -1105,11 +1151,16 @@ impl App {
         };
         let route_id = route.id;
 
-        let envelope = self.fetch_route_channels(route_id).await?;
-        let logs_envelope = self.fetch_route_logs(route_id).await?;
-        self.route_detail = Some(envelope.route);
-        self.channels = envelope.channels;
-        self.logs = self.merge_route_logs(route_id, logs_envelope.logs);
+        let snapshot = fetch_route_snapshot(
+            self.client.clone(),
+            self.base_url.clone(),
+            self.auth_key.clone(),
+            route_id,
+        )
+        .await?;
+        self.route_detail = Some(snapshot.route_detail);
+        self.channels = snapshot.channels;
+        self.logs = self.merge_route_logs(route_id, snapshot.logs);
         self.selected_channel = if self.channels.is_empty() {
             0
         } else {
@@ -1128,14 +1179,6 @@ impl App {
         self.get_json(
             &format!("/api/routes/{route_id}/channels"),
             "load route channels",
-        )
-        .await
-    }
-
-    async fn fetch_route_logs(&self, route_id: i64) -> Result<RouteLogsEnvelope, String> {
-        self.get_json(
-            &format!("/api/routes/{route_id}/logs?limit=12"),
-            "load route logs",
         )
         .await
     }
@@ -1324,25 +1367,35 @@ impl App {
         }
     }
 
-    async fn flush_pending_route_refresh(&mut self) {
-        if self.pending_route_refresh_at.is_none() {
+    fn trigger_route_refresh(&mut self, refresh_tx: &mpsc::UnboundedSender<RefreshEvent>) {
+        let Some(route_id) = self.selected_route_ref().map(|route| route.id) else {
+            return;
+        };
+        if self.route_refresh_in_flight {
             return;
         }
-        if let Err(error) = self.refresh_channels().await {
-            self.status = error;
-        }
+        self.pending_route_refresh_at = None;
+        self.route_refresh_in_flight = true;
+
+        let client = self.client.clone();
+        let base_url = self.base_url.clone();
+        let auth_key = self.auth_key.clone();
+        let tx = refresh_tx.clone();
+
+        tokio::spawn(async move {
+            let result = fetch_route_snapshot(client, base_url, auth_key, route_id).await;
+            let _ = tx.send(RefreshEvent::RouteCompleted(result));
+        });
     }
 
-    async fn refresh_selected_route_if_due(&mut self) {
+    fn refresh_selected_route_if_due(&mut self, refresh_tx: &mpsc::UnboundedSender<RefreshEvent>) {
         let Some(due_at) = self.pending_route_refresh_at else {
             return;
         };
         if Instant::now() < due_at {
             return;
         }
-        if let Err(error) = self.refresh_channels().await {
-            self.status = error;
-        }
+        self.trigger_route_refresh(refresh_tx);
     }
 
     async fn move_down(&mut self) {
@@ -1456,10 +1509,12 @@ impl App {
         };
     }
 
-    async fn move_focus_right(&mut self) {
+    fn move_focus_right(&mut self, refresh_tx: &mpsc::UnboundedSender<RefreshEvent>) {
         self.focus = match self.focus {
             FocusPane::Routes => {
-                self.flush_pending_route_refresh().await;
+                if self.pending_route_refresh_at.is_some() {
+                    self.trigger_route_refresh(refresh_tx);
+                }
                 FocusPane::Channels
             }
             FocusPane::Channels => FocusPane::Logs,
@@ -1507,10 +1562,12 @@ impl App {
         self.mode = AppMode::EditChannel(EditChannelForm::new(&channel, &route, prefill));
     }
 
-    async fn open_detail(&mut self) {
+    fn open_detail(&mut self, refresh_tx: &mpsc::UnboundedSender<RefreshEvent>) {
         match self.focus {
             FocusPane::Routes => {
-                self.flush_pending_route_refresh().await;
+                if self.pending_route_refresh_at.is_some() {
+                    self.trigger_route_refresh(refresh_tx);
+                }
                 self.focus = FocusPane::Channels;
             }
             FocusPane::Channels => {
@@ -2515,27 +2572,44 @@ async fn fetch_background_snapshot(
         });
     };
 
-    let channels_envelope: RouteDetailEnvelope = get_json_with(
-        &client,
-        &base_url,
-        auth_key.as_deref(),
-        &format!("/api/routes/{route_id}/channels"),
-        "load route channels",
-    )
-    .await?;
-    let logs_envelope: RouteLogsEnvelope = get_json_with(
-        &client,
-        &base_url,
-        auth_key.as_deref(),
-        &format!("/api/routes/{route_id}/logs?limit=12"),
-        "load route logs",
-    )
-    .await?;
+    let snapshot = fetch_route_snapshot(client, base_url, auth_key, route_id).await?;
 
     Ok(BackgroundRefreshSnapshot {
         requested_route_id: Some(route_id),
         routes,
-        route_detail: Some(channels_envelope.route),
+        route_detail: Some(snapshot.route_detail),
+        channels: snapshot.channels,
+        logs: snapshot.logs,
+    })
+}
+
+async fn fetch_route_snapshot(
+    client: Client,
+    base_url: String,
+    auth_key: Option<String>,
+    route_id: i64,
+) -> Result<RouteRefreshSnapshot, String> {
+    let channels_path = format!("/api/routes/{route_id}/channels");
+    let logs_path = format!("/api/routes/{route_id}/logs?limit=12");
+    let channels_future = get_json_with::<RouteDetailEnvelope>(
+        &client,
+        &base_url,
+        auth_key.as_deref(),
+        &channels_path,
+        "load route channels",
+    );
+    let logs_future = get_json_with::<RouteLogsEnvelope>(
+        &client,
+        &base_url,
+        auth_key.as_deref(),
+        &logs_path,
+        "load route logs",
+    );
+    let (channels_envelope, logs_envelope) = tokio::try_join!(channels_future, logs_future)?;
+
+    Ok(RouteRefreshSnapshot {
+        route_id,
+        route_detail: channels_envelope.route,
         channels: channels_envelope.channels,
         logs: logs_envelope.logs,
     })
@@ -2772,7 +2846,7 @@ async fn run_app(
     let mut events = EventStream::new();
     let mut ticker = time::interval(Duration::from_secs(5));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut route_refresh_ticker = time::interval(Duration::from_millis(50));
+    let mut route_refresh_ticker = time::interval(Duration::from_millis(ROUTE_REFRESH_TICK_MS));
     route_refresh_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
@@ -2814,10 +2888,10 @@ async fn run_app(
                         KeyCode::Char('K') => app.copy_auth_key(),
                         KeyCode::Char('?') => app.show_help = !app.show_help,
                         KeyCode::Left => app.move_focus_left(),
-                        KeyCode::Right => app.move_focus_right().await,
+                        KeyCode::Right => app.move_focus_right(refresh_tx),
                         KeyCode::Down => app.move_down().await,
                         KeyCode::Up => app.move_up().await,
-                        KeyCode::Enter => app.open_detail().await,
+                        KeyCode::Enter => app.open_detail(refresh_tx),
                         _ => {}
                     }
                 }
@@ -2836,7 +2910,7 @@ async fn run_app(
                 app.trigger_background_refresh(refresh_tx);
             }
             _ = route_refresh_ticker.tick() => {
-                app.refresh_selected_route_if_due().await;
+                app.refresh_selected_route_if_due(refresh_tx);
             }
         }
     }
