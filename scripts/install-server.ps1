@@ -170,6 +170,10 @@ if (-not $SkipAutostart) {
 
     if (-not $SkipStart) {
         try {
+            try {
+                Stop-ScheduledTask -TaskName $StartupTaskName -ErrorAction SilentlyContinue | Out-Null
+            } catch {
+            }
             Start-ScheduledTask -TaskName $StartupTaskName
         } catch {
             Write-Warning "已创建开机启动任务，但立即启动失败：$($_.Exception.Message)"

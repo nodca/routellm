@@ -256,7 +256,12 @@ EOF
 
   systemctl daemon-reload
   if [[ "$SKIP_START" -eq 0 ]]; then
-    systemctl enable --now "${SERVICE_NAME}.service"
+    systemctl enable "${SERVICE_NAME}.service"
+    if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+      systemctl restart "${SERVICE_NAME}.service"
+    else
+      systemctl start "${SERVICE_NAME}.service"
+    fi
   fi
 fi
 
