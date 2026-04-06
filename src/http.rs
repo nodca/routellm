@@ -6,7 +6,7 @@ use std::{
 
 use axum::{
     Json,
-    body::{Body, Bytes},
+    body::{Body, Bytes, to_bytes},
     extract::{Path, Query, State},
     http::{
         HeaderMap, StatusCode,
@@ -45,6 +45,11 @@ pub struct RouteDecisionQuery {
 #[derive(Debug, Deserialize)]
 pub struct RouteLogsQuery {
     limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct GeminiNativeQuery {
+    alt: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -510,6 +515,30 @@ pub async fn create_message(
     proxy_request(state, requested_model, payload, Protocol::Messages).await
 }
 
+pub async fn create_gemini_content(
+    State(state): State<AppState>,
+    Path(tail): Path<String>,
+    Query(query): Query<GeminiNativeQuery>,
+    Json(payload): Json<Value>,
+) -> Result<Response<Body>, AppError> {
+    let (requested_model, stream) = parse_gemini_content_target(&tail)?;
+    let chat_payload = gemini_generate_content_to_chat_payload(&requested_model, &payload)?;
+    let proxy_response = proxy_request(
+        state,
+        requested_model.clone(),
+        chat_payload,
+        Protocol::ChatCompletions,
+    )
+    .await?;
+
+    if stream {
+        return build_gemini_stream_response(proxy_response, &requested_model, query.alt.as_deref())
+            .await;
+    }
+
+    build_gemini_json_response(proxy_response, &requested_model).await
+}
+
 async fn proxy_request(
     state: AppState,
     requested_model: String,
@@ -656,6 +685,23 @@ async fn attempt_proxy_request(
         )
         .await?;
         return Err(AppError::UpstreamStatus(message, status));
+    }
+
+    if dispatch.response_adapter == ResponseAdapter::Passthrough && !is_stream {
+        return proxy_nonstream_passthrough_json(
+            state,
+            route,
+            selected,
+            request_id.to_string(),
+            requested_model.to_string(),
+            status,
+            headers,
+            upstream_response,
+            started_at,
+            downstream_protocol,
+            dispatch.upstream_protocol,
+        )
+        .await;
     }
 
     if dispatch.response_adapter == ResponseAdapter::Passthrough {
@@ -941,6 +987,78 @@ async fn proxy_passthrough_stream(
     });
 
     build_response(status, &headers, Body::from_stream(ReceiverStream::new(rx)))
+}
+
+async fn proxy_nonstream_passthrough_json(
+    state: AppState,
+    route: ModelRouteRow,
+    selected: ChannelRow,
+    request_id: String,
+    requested_model: String,
+    status: StatusCode,
+    headers: HeaderMap,
+    upstream_response: reqwest::Response,
+    started_at: Instant,
+    downstream_protocol: Protocol,
+    upstream_protocol: Protocol,
+) -> Result<Response<Body>, AppError> {
+    let body = match read_response_body(upstream_response).await {
+        Ok(body) => body,
+        Err(error) => {
+            let message = format!("failed to read upstream body: {error}");
+            record_failure(
+                &state,
+                &route,
+                &selected,
+                &request_id,
+                &requested_model,
+                downstream_protocol,
+                upstream_protocol,
+                Some(status.as_u16()),
+                started_at.elapsed().as_millis() as i64,
+                message.clone(),
+            )
+            .await?;
+            return Err(AppError::UpstreamTransport(message));
+        }
+    };
+
+    let response_value: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            let message = format!("invalid upstream json body: {error}");
+            record_failure(
+                &state,
+                &route,
+                &selected,
+                &request_id,
+                &requested_model,
+                downstream_protocol,
+                upstream_protocol,
+                Some(status.as_u16()),
+                started_at.elapsed().as_millis() as i64,
+                message.clone(),
+            )
+            .await?;
+            return Err(AppError::UpstreamTransport(message));
+        }
+    };
+
+    let token_usage = extract_usage_from_value(upstream_protocol, &response_value);
+    record_success(
+        &state,
+        &selected,
+        &request_id,
+        &requested_model,
+        downstream_protocol,
+        upstream_protocol,
+        status.as_u16(),
+        started_at.elapsed().as_millis() as i64,
+        token_usage,
+    )
+    .await?;
+
+    build_response(status, &headers, Body::from(body))
 }
 
 async fn proxy_chat_completions_stream(
@@ -1941,6 +2059,267 @@ fn chat_completions_to_responses_payload(payload: &Value) -> Result<Value, AppEr
     }
 
     Ok(Value::Object(body))
+}
+
+fn parse_gemini_content_target(tail: &str) -> Result<(String, bool), AppError> {
+    if let Some(model) = tail.strip_suffix(":generateContent") {
+        return Ok((model.to_string(), false));
+    }
+    if let Some(model) = tail.strip_suffix(":streamGenerateContent") {
+        return Ok((model.to_string(), true));
+    }
+
+    Err(AppError::NotFound(format!(
+        "unsupported gemini path target: {tail}"
+    )))
+}
+
+fn gemini_generate_content_to_chat_payload(
+    requested_model: &str,
+    payload: &Value,
+) -> Result<Value, AppError> {
+    let mut messages = Vec::new();
+    if let Some(system_instruction) = payload.get("systemInstruction") {
+        let system_text = gemini_instruction_to_text(system_instruction)?;
+        if !system_text.is_empty() {
+            messages.push(json!({
+                "role": "system",
+                "content": system_text
+            }));
+        }
+    }
+
+    let contents = payload
+        .get("contents")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::BadRequest("field `contents` is required".to_string()))?;
+    for content in contents {
+        messages.push(gemini_content_to_chat_message(content)?);
+    }
+
+    let mut body = Map::new();
+    body.insert(
+        "model".to_string(),
+        Value::String(requested_model.to_string()),
+    );
+    body.insert("messages".to_string(), Value::Array(messages));
+
+    if let Some(config) = payload.get("generationConfig").and_then(Value::as_object) {
+        copy_object_field(config, &mut body, "temperature", "temperature");
+        copy_object_field(config, &mut body, "topP", "top_p");
+        copy_object_field(config, &mut body, "maxOutputTokens", "max_tokens");
+    }
+
+    if let Some(tools) = payload.get("tools") {
+        body.insert("tools".to_string(), gemini_tools_to_chat_tools(tools)?);
+    }
+
+    if let Some(tool_config) = payload.get("toolConfig") {
+        if let Some(tool_choice) = gemini_tool_config_to_chat_tool_choice(tool_config)? {
+            body.insert("tool_choice".to_string(), tool_choice);
+        }
+    }
+
+    Ok(Value::Object(body))
+}
+
+fn gemini_instruction_to_text(instruction: &Value) -> Result<String, AppError> {
+    let parts = instruction
+        .get("parts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::BadRequest("systemInstruction.parts must be an array".to_string()))?;
+    gemini_parts_to_text(parts)
+}
+
+fn gemini_content_to_chat_message(content: &Value) -> Result<Value, AppError> {
+    let role = match content.get("role").and_then(Value::as_str).unwrap_or("user") {
+        "user" => "user",
+        "model" => "assistant",
+        "assistant" => "assistant",
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unsupported gemini content role: {other}"
+            )));
+        }
+    };
+    let parts = content
+        .get("parts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::BadRequest("gemini content parts must be an array".to_string()))?;
+    let text = gemini_parts_to_text(parts)?;
+    Ok(json!({
+        "role": role,
+        "content": text
+    }))
+}
+
+fn gemini_parts_to_text(parts: &[Value]) -> Result<String, AppError> {
+    let mut segments = Vec::new();
+    for part in parts {
+        if let Some(text) = part.get("text").and_then(Value::as_str) {
+            segments.push(text.to_string());
+            continue;
+        }
+        return Err(AppError::BadRequest(
+            "only gemini text parts are supported right now".to_string(),
+        ));
+    }
+    Ok(segments.join("\n"))
+}
+
+fn gemini_tools_to_chat_tools(tools: &Value) -> Result<Value, AppError> {
+    let tools = tools
+        .as_array()
+        .ok_or_else(|| AppError::BadRequest("field `tools` must be an array".to_string()))?;
+    let mut chat_tools = Vec::new();
+    for tool in tools {
+        let Some(declarations) = tool.get("functionDeclarations").and_then(Value::as_array) else {
+            continue;
+        };
+        for declaration in declarations {
+            let name = declaration
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AppError::BadRequest("gemini function declaration name is required".to_string()))?;
+            let mut function = Map::new();
+            function.insert("name".to_string(), Value::String(name.to_string()));
+            if let Some(description) = declaration.get("description").cloned() {
+                function.insert("description".to_string(), description);
+            }
+            if let Some(parameters) = declaration.get("parameters").cloned() {
+                function.insert("parameters".to_string(), parameters);
+            }
+            chat_tools.push(json!({
+                "type": "function",
+                "function": Value::Object(function)
+            }));
+        }
+    }
+    Ok(Value::Array(chat_tools))
+}
+
+fn gemini_tool_config_to_chat_tool_choice(tool_config: &Value) -> Result<Option<Value>, AppError> {
+    let Some(config) = tool_config
+        .get("functionCallingConfig")
+        .and_then(Value::as_object)
+    else {
+        return Ok(None);
+    };
+    let mode = config
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("AUTO");
+    let mapped = match mode {
+        "AUTO" => Value::String("auto".to_string()),
+        "NONE" => Value::String("none".to_string()),
+        "ANY" => Value::String("required".to_string()),
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unsupported gemini functionCallingConfig mode: {other}"
+            )));
+        }
+    };
+    Ok(Some(mapped))
+}
+
+async fn build_gemini_json_response(
+    response: Response<Body>,
+    requested_model: &str,
+) -> Result<Response<Body>, AppError> {
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map_err(|error| AppError::Internal(format!("failed to read proxied body: {error}")))?;
+    let chat_value: Value = serde_json::from_slice(&body)
+        .map_err(|error| AppError::Internal(format!("failed to parse proxied json body: {error}")))?;
+    let gemini_value = chat_completion_to_gemini_response(&chat_value, requested_model);
+    build_json_response(status, &gemini_value)
+}
+
+async fn build_gemini_stream_response(
+    response: Response<Body>,
+    requested_model: &str,
+    alt: Option<&str>,
+) -> Result<Response<Body>, AppError> {
+    let gemini_response = build_gemini_json_response(response, requested_model).await?;
+    let body = to_bytes(gemini_response.into_body(), usize::MAX)
+        .await
+        .map_err(|error| AppError::Internal(format!("failed to read gemini body: {error}")))?;
+    let payload = String::from_utf8(body.to_vec())
+        .map_err(|error| AppError::Internal(format!("failed to encode gemini stream payload: {error}")))?;
+    let mut headers = HeaderMap::new();
+    if alt == Some("sse") || alt.is_none() {
+        headers.insert(CONTENT_TYPE, "text/event-stream".parse().unwrap());
+        return build_response(
+            StatusCode::OK,
+            &headers,
+            Body::from(format!("data: {payload}\n\n")),
+        );
+    }
+
+    headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+    build_response(StatusCode::OK, &headers, Body::from(payload))
+}
+
+fn chat_completion_to_gemini_response(chat: &Value, requested_model: &str) -> Value {
+    let choice = chat
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .cloned()
+        .unwrap_or(Value::Null);
+    let message = choice.get("message").cloned().unwrap_or(Value::Null);
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("stop");
+    let text = match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    };
+
+    json!({
+        "modelVersion": requested_model,
+        "candidates": [{
+            "index": choice.get("index").and_then(Value::as_i64).unwrap_or(0),
+            "content": {
+                "role": "model",
+                "parts": [{
+                    "text": text
+                }]
+            },
+            "finishReason": map_chat_finish_reason_to_gemini(finish_reason)
+        }],
+        "usageMetadata": {
+            "promptTokenCount": chat.get("usage").and_then(|usage| usage.get("prompt_tokens")).and_then(Value::as_i64).unwrap_or(0),
+            "candidatesTokenCount": chat.get("usage").and_then(|usage| usage.get("completion_tokens")).and_then(Value::as_i64).unwrap_or(0),
+            "totalTokenCount": chat.get("usage").and_then(|usage| usage.get("total_tokens")).and_then(Value::as_i64).unwrap_or(0)
+        }
+    })
+}
+
+fn map_chat_finish_reason_to_gemini(finish_reason: &str) -> &'static str {
+    match finish_reason {
+        "length" => "MAX_TOKENS",
+        "content_filter" => "SAFETY",
+        _ => "STOP",
+    }
+}
+
+fn copy_object_field(
+    source: &Map<String, Value>,
+    target: &mut Map<String, Value>,
+    source_key: &str,
+    target_key: &str,
+) {
+    if let Some(value) = source.get(source_key).cloned() {
+        target.insert(target_key.to_string(), value);
+    }
 }
 
 fn chat_messages_to_responses_input(messages: &[Value]) -> Result<Vec<Value>, AppError> {
@@ -4640,6 +5019,236 @@ mod tests {
         assert_eq!(
             proxy_value["choices"][0]["message"]["content"],
             "hello from gemini-compatible upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn downstream_openai_alias_without_v1_proxies_chat_completions() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_gemini_openai_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+        sqlx::query("insert into model_routes (model_pattern, enabled, routing_strategy, cooldown_seconds) values ('gemini-2.5-pro', 1, 'weighted', 300)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let create_channel_request = Request::builder()
+            .method("POST")
+            .uri("/api/routes/1/channels")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "base_url": format!("http://{upstream_addr}/v1beta/openai"),
+                    "api_key": "test-key",
+                    "upstream_model": "gemini-2.5-pro",
+                    "protocol": "chat_completions"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let create_response = app.clone().oneshot(create_channel_request).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+
+        let proxy_request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "gemini-2.5-pro",
+                    "messages": [{ "role": "user", "content": "ping" }]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
+        assert_eq!(proxy_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn downstream_anthropic_alias_without_v1_proxies_messages() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_claude_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+        sqlx::query("insert into model_routes (model_pattern, enabled, routing_strategy, cooldown_seconds) values ('claude-sonnet-4', 1, 'weighted', 300)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let create_channel_request = Request::builder()
+            .method("POST")
+            .uri("/api/routes/1/channels")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "base_url": format!("http://{upstream_addr}"),
+                    "api_key": "test-key",
+                    "upstream_model": "claude-sonnet-4",
+                    "protocol": "messages"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let create_response = app.clone().oneshot(create_channel_request).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+
+        let proxy_request = Request::builder()
+            .method("POST")
+            .uri("/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "claude-sonnet-4",
+                    "messages": [{ "role": "user", "content": "ping" }],
+                    "max_tokens": 64
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
+        assert_eq!(proxy_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn downstream_gemini_native_generate_content_proxies() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_gemini_openai_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+        sqlx::query("insert into model_routes (model_pattern, enabled, routing_strategy, cooldown_seconds) values ('gemini-2.5-pro', 1, 'weighted', 300)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let create_channel_request = Request::builder()
+            .method("POST")
+            .uri("/api/routes/1/channels")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "base_url": format!("http://{upstream_addr}/v1beta/openai"),
+                    "api_key": "test-key",
+                    "upstream_model": "gemini-2.5-pro",
+                    "protocol": "chat_completions"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let create_response = app.clone().oneshot(create_channel_request).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+
+        let proxy_request = Request::builder()
+            .method("POST")
+            .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "contents": [{
+                        "role": "user",
+                        "parts": [{ "text": "ping" }]
+                    }]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
+        assert_eq!(proxy_response.status(), StatusCode::OK);
+        let proxy_body = to_bytes(proxy_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let proxy_value: Value = serde_json::from_slice(&proxy_body).unwrap();
+        assert_eq!(proxy_value["candidates"][0]["content"]["parts"][0]["text"], "hello from gemini-compatible upstream");
+    }
+
+    #[tokio::test]
+    async fn downstream_gemini_native_stream_generate_content_proxies() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_gemini_openai_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+        sqlx::query("insert into model_routes (model_pattern, enabled, routing_strategy, cooldown_seconds) values ('gemini-2.5-pro', 1, 'weighted', 300)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let create_channel_request = Request::builder()
+            .method("POST")
+            .uri("/api/routes/1/channels")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "base_url": format!("http://{upstream_addr}/v1beta/openai"),
+                    "api_key": "test-key",
+                    "upstream_model": "gemini-2.5-pro",
+                    "protocol": "chat_completions"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let create_response = app.clone().oneshot(create_channel_request).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+
+        let proxy_request = Request::builder()
+            .method("POST")
+            .uri("/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "contents": [{
+                        "role": "user",
+                        "parts": [{ "text": "ping" }]
+                    }]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
+        assert_eq!(proxy_response.status(), StatusCode::OK);
+        assert_eq!(
+            proxy_response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/event-stream"
         );
     }
 

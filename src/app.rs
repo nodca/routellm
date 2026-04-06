@@ -106,13 +106,29 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::post(http::create_chat_completion),
         )
         .route("/messages", axum::routing::post(http::create_message));
-
-    Router::new()
-        .route("/healthz", axum::routing::get(http::healthz))
+    let compat_router = Router::new()
+        .route("/responses", axum::routing::post(http::create_response))
+        .route(
+            "/chat/completions",
+            axum::routing::post(http::create_chat_completion),
+        )
+        .route("/messages", axum::routing::post(http::create_message))
         .route(
             "/v1beta/openai/chat/completions",
             axum::routing::post(http::create_chat_completion),
         )
+        .route(
+            "/v1beta/models/{tail}",
+            axum::routing::post(http::create_gemini_content),
+        )
+        .route(
+            "/v1/models/{tail}",
+            axum::routing::post(http::create_gemini_content),
+        );
+
+    Router::new()
+        .route("/healthz", axum::routing::get(http::healthz))
+        .merge(compat_router.route_layer(auth_layer.clone()))
         .nest("/api", api_router.route_layer(auth_layer.clone()))
         .nest("/v1", v1_router.route_layer(auth_layer))
         .with_state(state)
