@@ -8,18 +8,11 @@
 - 同一个模型在不同上游名字不统一
 - 不想上重型平台，只想快速部署和运维
 
-它不是 Web 平台，也不是多租户 AI 网关。它更像一个单二进制、可解释、可运维的路由器。
-
 ## 特点
 
-- 单二进制部署，Linux / Windows 都可用
-- 显式协议绑定：`responses` / `chat_completions` / `messages`
-- 确定性选路：优先看 `priority`
+- 单二进制部署，Linux / Windows 都用
 - 同一次请求内可自动切到下一个可用 channel
-- 支持流式与非流式转发
-- 支持 `tools / tool_calls`
 - 支持 TUI 管理、主动测活、运行状态查看
-- 支持 `master_key` 保护 `/v1/*` 和 `/api/*`
 
 ## 核心概念
 
@@ -27,26 +20,16 @@
 | --- | --- |
 | Route | 稳定的下游模型名，例如 `gpt-5.4` |
 | Channel | Route 下的一条具体上游通道，包含 `base_url`、`api_key`、`upstream_model`、`protocol`、`priority` |
-| Protocol | 上游协议类型，只能是 `responses` / `chat_completions` / `messages` |
 | Priority | 越小越优先，只在最小 `priority` 组内继续选路 |
 | Cooldown | 请求失败后的自动冷却状态，带倒计时 |
 
-## 安装
+## 快速开始
 
-Release：
-
-- <https://github.com/nodca/routellm/releases>
-
-安装脚本默认拉取最新 release。
+### 本机模式
 
 ### Linux
 
 ```bash
-# server，systemd 开机自启动
-curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.sh | sudo bash
-
-# TUI
-curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.sh | bash
 
 # 单机模式：server + tui，一次装好
 curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-local.sh | sudo bash
@@ -57,14 +40,9 @@ curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/uninsta
 
 ### Windows
 
-请在管理员 PowerShell 中运行 `server` 和单机安装命令。
+请在管理员 PowerShell 中运行单机安装命令。
 
 ```powershell
-# server，注册开机自启动任务
-irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-server.ps1 | iex
-
-# TUI
-irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.ps1 | iex
 
 # 单机模式：server + tui，一次装好
 irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-local.ps1 | iex
@@ -88,16 +66,6 @@ lrtui --import cc-switch
 lrtui --import /path/to/cc-switch.db
 ```
 
-## 快速开始
-
-### 本机模式
-
-最简单的方式是单机安装，然后：
-
-1. 编辑 `llmrouter.toml`，加入 route 和 channel
-2. server 自动启动或重启服务
-3. 用 `lrtui` 进入 TUI 管理
-4. 下游客户端把 Base URL 指向 `http://127.0.0.1:1290/v1`
 
 ### 服务器 + 本机 TUI 模式
 
@@ -375,8 +343,7 @@ channel 字段：
 
 - 没有 Web UI
 - 没有多用户、计费、配额、多租户
-- 没有复杂智能调度和黑盒负载均衡
-- `T` 目前是顺序 probe，不是独立异步批任务
+- 没有复杂智能调度和负载均衡
 - 还没有自动协议探测
 - 仍然依赖 SQLite 保存运行态
 - Windows 可用，但主支持平台仍更偏 Linux
