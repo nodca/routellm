@@ -143,19 +143,85 @@ async fn require_bearer_auth(
         return Ok(next.run(request).await);
     };
 
-    let token = parse_bearer_token(request.headers().get(AUTHORIZATION));
-    if token == Some(expected) {
+    let token = parse_request_token(&request);
+    if token.as_deref() == Some(expected) {
         return Ok(next.run(request).await);
     }
 
     Err(crate::error::AppError::Unauthorized(
-        "missing or invalid bearer token".to_string(),
+        "missing or invalid authorization token".to_string(),
     ))
 }
 
 fn parse_bearer_token(header: Option<&HeaderValue>) -> Option<&str> {
     let value = header?.to_str().ok()?;
     value.strip_prefix("Bearer ")?.trim().into()
+}
+
+fn parse_request_token(request: &Request<Body>) -> Option<String> {
+    parse_bearer_token(request.headers().get(AUTHORIZATION))
+        .map(ToString::to_string)
+        .or_else(|| parse_header_token(request.headers().get("x-api-key")).map(ToString::to_string))
+        .or_else(|| {
+            parse_header_token(request.headers().get("x-goog-api-key")).map(ToString::to_string)
+        })
+        .or_else(|| parse_query_token(request.uri().query(), "key"))
+}
+
+fn parse_header_token(header: Option<&HeaderValue>) -> Option<&str> {
+    header?.to_str().ok().map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn parse_query_token(query: Option<&str>, key: &str) -> Option<String> {
+    query?
+        .split('&')
+        .filter_map(|segment| segment.split_once('='))
+        .find_map(|(name, value)| {
+            if name == key && !value.is_empty() {
+                Some(percent_decode(value))
+            } else {
+                None
+            }
+        })
+}
+
+fn percent_decode(value: &str) -> String {
+    let mut bytes = Vec::with_capacity(value.len());
+    let raw = value.as_bytes();
+    let mut index = 0usize;
+    while index < raw.len() {
+        match raw[index] {
+            b'+' => {
+                bytes.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < raw.len() => {
+                let hi = hex_value(raw[index + 1]);
+                let lo = hex_value(raw[index + 2]);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    bytes.push((hi << 4) | lo);
+                    index += 3;
+                } else {
+                    bytes.push(raw[index]);
+                    index += 1;
+                }
+            }
+            other => {
+                bytes.push(other);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 pub async fn build_app(config: &Config) -> Result<Router, crate::error::AppError> {
@@ -208,7 +274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_and_v1_routes_require_matching_bearer_token_when_master_key_is_set() {
+    async fn api_and_v1_routes_require_matching_supported_auth_tokens_when_master_key_is_set() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
         let config = Config {
@@ -245,7 +311,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/routes")
-                    .header("Authorization", "Bearer sk-llmrouter-test")
+                    .header("x-api-key", "sk-llmrouter-test")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -268,11 +334,12 @@ mod tests {
         assert_eq!(v1_unauthorized.status(), StatusCode::UNAUTHORIZED);
 
         let v1_authorized = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/v1/responses")
-                    .header("Authorization", "Bearer sk-llmrouter-test")
+                    .header("x-goog-api-key", "sk-llmrouter-test")
                     .header("Content-Type", "application/json")
                     .body(Body::from(r#"{"model":"gpt-5.4","input":"ping"}"#))
                     .unwrap(),
@@ -280,5 +347,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v1_authorized.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let query_authorized = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses?key=sk-llmrouter-test")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"model":"gpt-5.4","input":"ping"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(query_authorized.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
