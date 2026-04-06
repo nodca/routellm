@@ -4578,6 +4578,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn downstream_gemini_openai_path_alias_proxies_chat_completions() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_gemini_openai_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+        sqlx::query("insert into model_routes (model_pattern, enabled, routing_strategy, cooldown_seconds) values ('gemini-2.5-pro', 1, 'weighted', 300)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let create_channel_request = Request::builder()
+            .method("POST")
+            .uri("/api/routes/1/channels")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "base_url": format!("http://{upstream_addr}/v1beta/openai"),
+                    "api_key": "test-key",
+                    "upstream_model": "gemini-2.5-pro",
+                    "protocol": "chat_completions"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let create_response = app.clone().oneshot(create_channel_request).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+
+        let proxy_request = Request::builder()
+            .method("POST")
+            .uri("/v1beta/openai/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "gemini-2.5-pro",
+                    "messages": [{ "role": "user", "content": "ping" }]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
+        assert_eq!(proxy_response.status(), StatusCode::OK);
+        let proxy_body = to_bytes(proxy_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let proxy_value: Value = serde_json::from_slice(&proxy_body).unwrap();
+        assert_eq!(proxy_value["object"], "chat.completion");
+        assert_eq!(
+            proxy_value["choices"][0]["message"]["content"],
+            "hello from gemini-compatible upstream"
+        );
+    }
+
+    #[tokio::test]
     async fn create_route_then_add_channels_keeps_one_route() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");

@@ -109,6 +109,10 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", axum::routing::get(http::healthz))
+        .route(
+            "/v1beta/openai/chat/completions",
+            axum::routing::post(http::create_chat_completion),
+        )
         .nest("/api", api_router.route_layer(auth_layer.clone()))
         .nest("/v1", v1_router.route_layer(auth_layer))
         .with_state(state)
