@@ -169,7 +169,11 @@ fn parse_request_token(request: &Request<Body>) -> Option<String> {
 }
 
 fn parse_header_token(header: Option<&HeaderValue>) -> Option<&str> {
-    header?.to_str().ok().map(str::trim).filter(|value| !value.is_empty())
+    header?
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn parse_query_token(query: Option<&str>, key: &str) -> Option<String> {

@@ -7,11 +7,7 @@ use serde_json::Value as JsonValue;
 use sqlx::{Row, SqlitePool};
 use toml::Value as TomlValue;
 
-use crate::{
-    config::Config,
-    error::AppError,
-    store::SqliteStore,
-};
+use crate::{config::Config, error::AppError, store::SqliteStore};
 
 const IMPORT_ROUTE_COOLDOWN_SECS: i64 = 300;
 pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
@@ -148,11 +144,10 @@ async fn load_candidates(path: &Path) -> Result<LoadedCandidates, AppError> {
     let database_url = format!("sqlite://{}", path.display());
     let pool = SqlitePool::connect(&database_url).await?;
 
-    let endpoint_rows = sqlx::query(
-        "select provider_id, app_type, url from provider_endpoints order by id asc",
-    )
-    .fetch_all(&pool)
-    .await?;
+    let endpoint_rows =
+        sqlx::query("select provider_id, app_type, url from provider_endpoints order by id asc")
+            .fetch_all(&pool)
+            .await?;
     let mut endpoint_map: HashMap<(String, String), String> = HashMap::new();
     for row in endpoint_rows {
         let provider_id: String = row.try_get("provider_id")?;

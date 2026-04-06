@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     error::Error as StdError,
+    sync::OnceLock,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -82,11 +83,65 @@ enum ResponseAdapter {
     ResponsesToChatCompletions,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DispatchPayloadKind {
+    Original,
+    ChatCompletionsToResponses,
+}
+
 #[derive(Debug)]
 struct UpstreamDispatch {
     upstream_protocol: Protocol,
-    payload: Value,
+    payload_kind: DispatchPayloadKind,
     response_adapter: ResponseAdapter,
+}
+
+#[derive(Debug)]
+struct PreparedPayloads {
+    original_value: Value,
+    original_json: OnceLock<Bytes>,
+    chat_to_responses_json: OnceLock<Bytes>,
+}
+
+impl PreparedPayloads {
+    fn new(payload: Value) -> Self {
+        Self {
+            original_value: payload,
+            original_json: OnceLock::new(),
+            chat_to_responses_json: OnceLock::new(),
+        }
+    }
+
+    fn is_stream(&self) -> bool {
+        self.original_value
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn bytes_for(&self, kind: DispatchPayloadKind) -> Result<Bytes, AppError> {
+        match kind {
+            DispatchPayloadKind::Original => {
+                if let Some(bytes) = self.original_json.get() {
+                    return Ok(bytes.clone());
+                }
+
+                let bytes = serialize_json_bytes(&self.original_value)?;
+                let _ = self.original_json.set(bytes.clone());
+                Ok(bytes)
+            }
+            DispatchPayloadKind::ChatCompletionsToResponses => {
+                if let Some(bytes) = self.chat_to_responses_json.get() {
+                    return Ok(bytes.clone());
+                }
+
+                let adapted = chat_completions_to_responses_payload(&self.original_value)?;
+                let bytes = serialize_json_bytes(&adapted)?;
+                let _ = self.chat_to_responses_json.set(bytes.clone());
+                Ok(bytes)
+            }
+        }
+    }
 }
 
 fn build_upstream_url(base_url: &str, protocol: Protocol) -> String {
@@ -568,22 +623,22 @@ async fn proxy_request(
     payload: Value,
     downstream_protocol: Protocol,
 ) -> Result<Response<Body>, AppError> {
+    let payloads = PreparedPayloads::new(payload);
     let route = state.store.find_route(&requested_model).await?;
     let channels = state.store.load_channels(route.id).await?;
+    let now = now_ts();
     let request_id = Uuid::new_v4().to_string();
-    let candidates = routing::inspect_candidates(channels, Some(downstream_protocol), now_ts());
-    let ordered_channels = routing::ordered_eligible_channels(&candidates);
+    let ordered_channels =
+        routing::ordered_eligible_channel_refs(&channels, downstream_protocol, now);
     if ordered_channels.is_empty() {
-        if let Some(selected) =
-            select_last_chance_channel(&candidates, downstream_protocol, now_ts())
-        {
+        if let Some(selected) = select_last_chance_channel(&channels, downstream_protocol, now) {
             return attempt_proxy_request(
-                state,
-                route,
+                &state,
+                &route,
                 selected,
                 &request_id,
                 &requested_model,
-                payload,
+                &payloads,
                 downstream_protocol,
             )
             .await;
@@ -596,12 +651,12 @@ async fn proxy_request(
     let mut last_error: Option<AppError> = None;
     for selected in ordered_channels {
         match attempt_proxy_request(
-            state.clone(),
-            route.clone(),
+            &state,
+            &route,
             selected,
             &request_id,
             &requested_model,
-            payload.clone(),
+            &payloads,
             downstream_protocol,
         )
         .await
@@ -617,22 +672,19 @@ async fn proxy_request(
 }
 
 async fn attempt_proxy_request(
-    state: AppState,
-    route: ModelRouteRow,
-    selected: ChannelRow,
+    state: &AppState,
+    route: &ModelRouteRow,
+    selected: &ChannelRow,
     request_id: &str,
     requested_model: &str,
-    payload: Value,
+    payloads: &PreparedPayloads,
     downstream_protocol: Protocol,
 ) -> Result<Response<Body>, AppError> {
     let channel_protocol = Protocol::parse(&selected.protocol)?;
-    let dispatch = build_upstream_dispatch(payload, downstream_protocol, channel_protocol)?;
+    let dispatch = build_upstream_dispatch(downstream_protocol, channel_protocol)?;
     let started_at = Instant::now();
-    let is_stream = dispatch
-        .payload
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let is_stream = payloads.is_stream();
+    let payload_bytes = payloads.bytes_for(dispatch.payload_kind)?;
 
     let upstream_url = build_upstream_url(&selected.site_base_url, dispatch.upstream_protocol);
     let upstream_client = if is_stream {
@@ -647,7 +699,8 @@ async fn attempt_proxy_request(
             dispatch.upstream_protocol,
             &selected.account_api_key,
         )
-        .json(&dispatch.payload)
+        .header(CONTENT_TYPE, "application/json")
+        .body(payload_bytes.clone())
         .send(),
     )
     .await
@@ -876,9 +929,9 @@ fn first_token_timeout_cooldown_seconds(consecutive_fail_count: i64) -> i64 {
 }
 
 async fn proxy_passthrough_stream(
-    state: AppState,
-    route: ModelRouteRow,
-    selected: ChannelRow,
+    state: &AppState,
+    route: &ModelRouteRow,
+    selected: &ChannelRow,
     request_id: String,
     requested_model: String,
     status: StatusCode,
@@ -919,6 +972,7 @@ async fn proxy_passthrough_stream(
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     let state_for_task = state.clone();
+    let route_for_task = route.clone();
     let selected_for_task = selected.clone();
     let request_id_for_task = request_id.clone();
     let requested_model_for_task = requested_model.clone();
@@ -969,7 +1023,7 @@ async fn proxy_passthrough_stream(
         if let Some(message) = stream_error {
             if let Err(error) = record_failure(
                 &state_for_task,
-                &route,
+                &route_for_task,
                 &selected_for_task,
                 &request_id_for_task,
                 &requested_model_for_task,
@@ -994,7 +1048,7 @@ async fn proxy_passthrough_stream(
 
         if let Err(error) = record_success_with_note(
             &state_for_task,
-            &route,
+            &route_for_task,
             &selected_for_task,
             &request_id_for_task,
             &requested_model_for_task,
@@ -1015,9 +1069,9 @@ async fn proxy_passthrough_stream(
 }
 
 async fn proxy_nonstream_passthrough_json(
-    state: AppState,
-    route: ModelRouteRow,
-    selected: ChannelRow,
+    state: &AppState,
+    route: &ModelRouteRow,
+    selected: &ChannelRow,
     request_id: String,
     requested_model: String,
     status: StatusCode,
@@ -1088,9 +1142,9 @@ async fn proxy_nonstream_passthrough_json(
 }
 
 async fn proxy_chat_completions_stream(
-    state: AppState,
-    route: ModelRouteRow,
-    selected: ChannelRow,
+    state: &AppState,
+    route: &ModelRouteRow,
+    selected: &ChannelRow,
     request_id: String,
     requested_model: String,
     upstream_response: reqwest::Response,
@@ -1127,6 +1181,7 @@ async fn proxy_chat_completions_stream(
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     let state_for_task = state.clone();
+    let route_for_task = route.clone();
     let selected_for_task = selected.clone();
     let request_id_for_task = request_id.clone();
     let requested_model_for_task = requested_model.clone();
@@ -1247,7 +1302,7 @@ async fn proxy_chat_completions_stream(
         if let Some(message) = stream_error {
             if let Err(error) = record_failure(
                 &state_for_task,
-                &route,
+                &route_for_task,
                 &selected_for_task,
                 &request_id_for_task,
                 &requested_model_for_task,
@@ -1269,7 +1324,7 @@ async fn proxy_chat_completions_stream(
 
         if let Err(error) = record_success_with_note(
             &state_for_task,
-            &route,
+            &route_for_task,
             &selected_for_task,
             &request_id_for_task,
             &requested_model_for_task,
@@ -1476,7 +1531,6 @@ fn channel_state(channel: &ChannelRow, now_ts: i64) -> &'static str {
 }
 
 fn build_upstream_dispatch(
-    payload: Value,
     downstream_protocol: Protocol,
     channel_protocol: Protocol,
 ) -> Result<UpstreamDispatch, AppError> {
@@ -1485,12 +1539,12 @@ fn build_upstream_dispatch(
         | (Protocol::ChatCompletions, Protocol::ChatCompletions)
         | (Protocol::Messages, Protocol::Messages) => Ok(UpstreamDispatch {
             upstream_protocol: channel_protocol,
-            payload,
+            payload_kind: DispatchPayloadKind::Original,
             response_adapter: ResponseAdapter::Passthrough,
         }),
         (Protocol::ChatCompletions, Protocol::Responses) => Ok(UpstreamDispatch {
             upstream_protocol: Protocol::Responses,
-            payload: chat_completions_to_responses_payload(&payload)?,
+            payload_kind: DispatchPayloadKind::ChatCompletionsToResponses,
             response_adapter: ResponseAdapter::ResponsesToChatCompletions,
         }),
         _ => Err(AppError::NoRoute(format!(
@@ -1501,10 +1555,14 @@ fn build_upstream_dispatch(
     }
 }
 
+fn serialize_json_bytes(value: &Value) -> Result<Bytes, AppError> {
+    serde_json::to_vec(value)
+        .map(Bytes::from)
+        .map_err(|error| AppError::Internal(format!("failed to serialize json body: {error}")))
+}
+
 fn build_json_response(status: StatusCode, body: &Value) -> Result<Response<Body>, AppError> {
-    let bytes = serde_json::to_vec(body).map_err(|error| {
-        AppError::Internal(format!("failed to serialize json response: {error}"))
-    })?;
+    let bytes = serialize_json_bytes(body)?;
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
     build_response(status, &headers, Body::from(bytes))
@@ -1766,8 +1824,8 @@ async fn background_recover_channel(
 fn select_background_recovery_candidate(
     channels: &[ChannelRow],
     now_ts: i64,
-) -> Option<ChannelRow> {
-    let mut candidates = channels
+) -> Option<&ChannelRow> {
+    channels
         .iter()
         .filter(|channel| {
             channel.enabled != 0
@@ -1776,19 +1834,14 @@ fn select_background_recovery_candidate(
                 && channel.site_status == "active"
                 && channel.cooldown_until.is_some_and(|until| until > now_ts)
         })
-        .cloned()
-        .collect::<Vec<_>>();
-
-    candidates.sort_by_key(|channel| {
-        (
-            channel.priority,
-            channel.avg_latency_ms.unwrap_or(i64::MAX),
-            channel.cooldown_until.unwrap_or(i64::MAX),
-            channel.channel_id,
-        )
-    });
-
-    candidates.into_iter().next()
+        .min_by_key(|channel| {
+            (
+                channel.priority,
+                channel.avg_latency_ms.unwrap_or(i64::MAX),
+                channel.cooldown_until.unwrap_or(i64::MAX),
+                channel.channel_id,
+            )
+        })
 }
 
 fn route_admin_to_model_route(route: &AdminRouteRow) -> ModelRouteRow {
@@ -2027,14 +2080,13 @@ fn requires_manual_intervention(policy: &ManualInterventionPolicy, error_kind: &
 }
 
 fn select_last_chance_channel(
-    candidates: &[routing::CandidateEvaluation],
+    channels: &[ChannelRow],
     request_protocol: Protocol,
     now_ts: i64,
-) -> Option<ChannelRow> {
-    let mut cooling_candidates = candidates
+) -> Option<&ChannelRow> {
+    channels
         .iter()
-        .filter_map(|candidate| {
-            let channel = &candidate.channel;
+        .filter_map(|channel| {
             if channel.enabled == 0
                 || channel.manual_blocked != 0
                 || channel.account_status != "active"
@@ -2052,24 +2104,18 @@ fn select_last_chance_channel(
             let protocol_cost =
                 crate::protocol::compatibility_cost(channel_protocol, request_protocol)?;
 
-            Some((channel.clone(), protocol_cost, cooldown_until))
+            Some((channel, protocol_cost, cooldown_until))
         })
-        .collect::<Vec<_>>();
-
-    cooling_candidates.sort_by_key(|(channel, protocol_cost, cooldown_until)| {
-        (
-            channel.priority,
-            *protocol_cost,
-            channel.avg_latency_ms.unwrap_or(i64::MAX),
-            *cooldown_until,
-            channel.channel_id,
-        )
-    });
-
-    cooling_candidates
-        .into_iter()
+        .min_by_key(|(channel, protocol_cost, cooldown_until)| {
+            (
+                channel.priority,
+                *protocol_cost,
+                channel.avg_latency_ms.unwrap_or(i64::MAX),
+                *cooldown_until,
+                channel.channel_id,
+            )
+        })
         .map(|(channel, _, _)| channel)
-        .next()
 }
 
 fn chat_completions_to_responses_payload(payload: &Value) -> Result<Value, AppError> {

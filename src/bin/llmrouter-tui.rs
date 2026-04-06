@@ -340,8 +340,8 @@ impl ProviderSelectDialog {
     }
 
     fn previous(&mut self) {
-        self.selected = (self.selected + ChannelProvider::all().len() - 1)
-            % ChannelProvider::all().len();
+        self.selected =
+            (self.selected + ChannelProvider::all().len() - 1) % ChannelProvider::all().len();
     }
 }
 
@@ -1006,10 +1006,7 @@ impl App {
         }
     }
 
-    fn trigger_background_refresh(
-        &mut self,
-        refresh_tx: &mpsc::UnboundedSender<RefreshEvent>,
-    ) {
+    fn trigger_background_refresh(&mut self, refresh_tx: &mpsc::UnboundedSender<RefreshEvent>) {
         if self.background_refresh_in_flight {
             return;
         }
@@ -1778,10 +1775,7 @@ impl App {
             let result =
                 probe_channel_request(client, base_url, auth_key, outcome.channel_id).await;
             let _ = tx.send(ProbeEvent::Single {
-                outcome: ProbeChannelOutcome {
-                    result,
-                    ..outcome
-                },
+                outcome: ProbeChannelOutcome { result, ..outcome },
                 select_channel: true,
             });
         });
@@ -2439,7 +2433,10 @@ impl App {
             .await
     }
 
-    async fn import_cc_switch(&self, source_path: Option<&Path>) -> Result<ImportExecutionSummary, String> {
+    async fn import_cc_switch(
+        &self,
+        source_path: Option<&Path>,
+    ) -> Result<ImportExecutionSummary, String> {
         let parsed = load_cc_switch_import(source_path)
             .await
             .map_err(|error| error.to_string())?;
@@ -2490,7 +2487,10 @@ impl App {
             {
                 skipped.push(format!(
                     "{} skipped: duplicate channel {} {} {}",
-                    candidate.route_model, candidate.protocol, candidate.upstream_model, candidate.base_url
+                    candidate.route_model,
+                    candidate.protocol,
+                    candidate.upstream_model,
+                    candidate.base_url
                 ));
                 continue;
             }
@@ -2544,9 +2544,14 @@ async fn fetch_background_snapshot(
     auth_key: Option<String>,
     selected_route_id: Option<i64>,
 ) -> Result<BackgroundRefreshSnapshot, String> {
-    let routes: Vec<RouteSummary> =
-        get_json_with(&client, &base_url, auth_key.as_deref(), "/api/routes", "load routes")
-            .await?;
+    let routes: Vec<RouteSummary> = get_json_with(
+        &client,
+        &base_url,
+        auth_key.as_deref(),
+        "/api/routes",
+        "load routes",
+    )
+    .await?;
 
     if routes.is_empty() {
         return Ok(BackgroundRefreshSnapshot {
@@ -3173,7 +3178,8 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     ];
     lines.extend(shortcut_hint_lines(app));
 
-    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Status"));
+    let paragraph =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Status"));
     frame.render_widget(paragraph, area);
 }
 
@@ -3344,7 +3350,10 @@ fn compact_error_excerpt(message: &str, max_width: usize) -> String {
         .replace("failed to read upstream body chunk: ", "")
         .replace("failed to read upstream body: ", "")
         .replace("error decoding response body", "decode-body")
-        .replace("connection closed before message completed", "stream-closed")
+        .replace(
+            "connection closed before message completed",
+            "stream-closed",
+        )
         .replace('\n', " ");
     truncate_text(compact.trim(), max_width)
 }
@@ -3413,15 +3422,18 @@ fn pane_label(base: &str, count: usize, query: Option<&str>) -> String {
 
 fn shortcut_hint_lines(app: &App) -> Vec<Line<'static>> {
     match app.mode {
-        AppMode::SelectProvider(_) | AppMode::SelectProtocol(_) => vec![shortcut_hint_line(&[
-            ("选择", &[("Up/Down", "选择"), ("Enter", "确认"), ("Esc", "取消")]),
-        ])],
-        AppMode::OnboardRoute(_) | AppMode::EditChannel(_) => vec![shortcut_hint_line(&[
-            ("表单", &[("Up/Down", "字段"), ("Enter", "提交"), ("Esc", "取消")]),
-        ])],
-        AppMode::Confirm(_) => vec![shortcut_hint_line(&[
-            ("确认", &[("Enter / Y", "是"), ("Esc / N", "否")]),
-        ])],
+        AppMode::SelectProvider(_) | AppMode::SelectProtocol(_) => vec![shortcut_hint_line(&[(
+            "选择",
+            &[("Up/Down", "选择"), ("Enter", "确认"), ("Esc", "取消")],
+        )])],
+        AppMode::OnboardRoute(_) | AppMode::EditChannel(_) => vec![shortcut_hint_line(&[(
+            "表单",
+            &[("Up/Down", "字段"), ("Enter", "提交"), ("Esc", "取消")],
+        )])],
+        AppMode::Confirm(_) => vec![shortcut_hint_line(&[(
+            "确认",
+            &[("Enter / Y", "是"), ("Esc / N", "否")],
+        )])],
         AppMode::Search(_) => vec![shortcut_hint_line(&[(
             "搜索",
             &[
@@ -3431,18 +3443,22 @@ fn shortcut_hint_lines(app: &App) -> Vec<Line<'static>> {
                 ("Esc", "取消"),
             ],
         )])],
-        AppMode::Detail(_) => vec![shortcut_hint_line(&[(
-            "详情",
-            &[("Enter / Esc", "关闭")],
-        )])],
+        AppMode::Detail(_) => vec![shortcut_hint_line(&[("详情", &[("Enter / Esc", "关闭")])])],
         AppMode::Browse => match app.focus {
             FocusPane::Routes => vec![
                 shortcut_hint_line(&[
                     (
                         "导航",
-                        &[("Up/Down", "移动"), ("Enter", "进入"), ("Right", "Channels")],
+                        &[
+                            ("Up/Down", "移动"),
+                            ("Enter", "进入"),
+                            ("Right", "Channels"),
+                        ],
                     ),
-                    ("操作", &[("a", "新增"), ("T", "测活"), ("x", "删除"), ("/", "过滤")]),
+                    (
+                        "操作",
+                        &[("a", "新增"), ("T", "测活"), ("x", "删除"), ("/", "过滤")],
+                    ),
                 ]),
                 shortcut_hint_line(&[("信息", &[("u", "URL"), ("K", "Key")])]),
             ],
@@ -3452,7 +3468,15 @@ fn shortcut_hint_lines(app: &App) -> Vec<Line<'static>> {
                         "导航",
                         &[("Up/Down", "移动"), ("Left", "Routes"), ("Right", "Logs")],
                     ),
-                    ("操作", &[("Space", "切换"), ("t", "测活"), ("T", "整组"), ("c", "恢复")]),
+                    (
+                        "操作",
+                        &[
+                            ("Space", "切换"),
+                            ("t", "测活"),
+                            ("T", "整组"),
+                            ("c", "恢复"),
+                        ],
+                    ),
                 ]),
                 shortcut_hint_line(&[
                     ("编辑", &[("a", "新增"), ("i", "编辑"), ("x", "删除")]),
@@ -3965,9 +3989,10 @@ fn draw_provider_select_modal(frame: &mut Frame, dialog: &ProviderSelectDialog) 
         .iter()
         .map(|provider| {
             ListItem::new(vec![
-                Line::from(vec![
-                    Span::styled(provider.label(), Style::default().add_modifier(Modifier::BOLD)),
-                ]),
+                Line::from(vec![Span::styled(
+                    provider.label(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )]),
                 Line::from(Span::styled(
                     provider.description(),
                     Style::default().fg(Color::Gray),
@@ -4014,13 +4039,11 @@ fn draw_protocol_select_modal(frame: &mut Frame, dialog: &ProtocolSelectDialog) 
 
     let mut state = ListState::default().with_selected(Some(dialog.selected));
     let list = List::new(items)
-        .block(
-            Block::default().borders(Borders::ALL).title(format!(
-                "Select Protocol ({}, {})",
-                dialog.route_model,
-                dialog.provider.label()
-            )),
-        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            "Select Protocol ({}, {})",
+            dialog.route_model,
+            dialog.provider.label()
+        )))
         .highlight_style(list_highlight_style())
         .highlight_symbol("┃ ");
     frame.render_stateful_widget(list, area, &mut state);
@@ -4252,13 +4275,17 @@ mod tests {
     #[test]
     fn provider_normalizes_base_url_prefixes() {
         assert_eq!(
-            ChannelProvider::OpenAiCompatible
-                .normalize_base_url("https://api.example.com/v1/chat/completions", "chat_completions"),
+            ChannelProvider::OpenAiCompatible.normalize_base_url(
+                "https://api.example.com/v1/chat/completions",
+                "chat_completions"
+            ),
             "https://api.example.com"
         );
         assert_eq!(
-            ChannelProvider::Gemini
-                .normalize_base_url("https://generativelanguage.googleapis.com", "chat_completions"),
+            ChannelProvider::Gemini.normalize_base_url(
+                "https://generativelanguage.googleapis.com",
+                "chat_completions"
+            ),
             "https://generativelanguage.googleapis.com/v1beta/openai"
         );
         assert_eq!(

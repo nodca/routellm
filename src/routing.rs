@@ -18,6 +18,15 @@ pub struct RouteDecision {
     pub candidates: Vec<CandidateEvaluation>,
 }
 
+fn route_rank_key(channel: &ChannelRow, protocol_cost: u8) -> (i64, u8, i64, i64) {
+    (
+        channel.priority,
+        protocol_cost,
+        channel.avg_latency_ms.unwrap_or(i64::MAX),
+        channel.channel_id,
+    )
+}
+
 pub fn decide_route(
     requested_model: &str,
     _route: &ModelRouteRow,
@@ -36,18 +45,45 @@ pub fn decide_route(
     })
 }
 
+pub fn ordered_eligible_channel_refs(
+    channels: &[ChannelRow],
+    request_protocol: Protocol,
+    now_ts: i64,
+) -> Vec<&ChannelRow> {
+    let mut eligible = channels
+        .iter()
+        .filter_map(|channel| {
+            if channel.enabled == 0
+                || channel.account_status != "active"
+                || channel.site_status != "active"
+                || channel.manual_blocked != 0
+                || channel.cooldown_until.is_some_and(|until| until > now_ts)
+            {
+                return None;
+            }
+
+            let channel_protocol = Protocol::parse(&channel.protocol).ok()?;
+            let protocol_cost = compatibility_cost(channel_protocol, request_protocol)?;
+            Some((channel, protocol_cost))
+        })
+        .collect::<Vec<_>>();
+
+    eligible
+        .sort_unstable_by_key(|(channel, protocol_cost)| route_rank_key(channel, *protocol_cost));
+
+    eligible.into_iter().map(|(channel, _)| channel).collect()
+}
+
 pub fn ordered_eligible_channels(candidates: &[CandidateEvaluation]) -> Vec<ChannelRow> {
     let mut eligible = candidates
         .iter()
         .filter(|candidate| candidate.eligible)
         .collect::<Vec<_>>();
 
-    eligible.sort_by_key(|candidate| {
-        (
-            candidate.channel.priority,
+    eligible.sort_unstable_by_key(|candidate| {
+        route_rank_key(
+            &candidate.channel,
             candidate.protocol_cost.unwrap_or(u8::MAX),
-            candidate.channel.avg_latency_ms.unwrap_or(i64::MAX),
-            candidate.channel.channel_id,
         )
     });
 
@@ -132,11 +168,15 @@ pub fn inspect_candidates(
 }
 
 fn choose_candidate(candidates: &[CandidateEvaluation]) -> Option<&ChannelRow> {
-    let ordered = ordered_eligible_channels(candidates);
-    let selected_id = ordered.first()?.channel_id;
     candidates
         .iter()
-        .find(|candidate| candidate.channel.channel_id == selected_id)
+        .filter(|candidate| candidate.eligible)
+        .min_by_key(|candidate| {
+            route_rank_key(
+                &candidate.channel,
+                candidate.protocol_cost.unwrap_or(u8::MAX),
+            )
+        })
         .map(|candidate| &candidate.channel)
 }
 
