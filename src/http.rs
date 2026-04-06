@@ -97,7 +97,21 @@ fn build_upstream_url(base_url: &str, protocol: Protocol) -> String {
             }
         }
         Protocol::ChatCompletions => {
-            if trimmed.ends_with("/v1/chat/completions") || trimmed.ends_with("/chat/completions") {
+            if trimmed.contains("generativelanguage.googleapis.com") {
+                if trimmed.ends_with("/v1beta/openai/chat/completions")
+                    || trimmed.ends_with("/chat/completions")
+                {
+                    trimmed.to_string()
+                } else if trimmed.ends_with("/v1beta/openai") {
+                    format!("{trimmed}/chat/completions")
+                } else if trimmed.ends_with("/v1beta") {
+                    format!("{trimmed}/openai/chat/completions")
+                } else {
+                    format!("{trimmed}/v1beta/openai/chat/completions")
+                }
+            } else if trimmed.ends_with("/v1/chat/completions")
+                || trimmed.ends_with("/chat/completions")
+            {
                 trimmed.to_string()
             } else if trimmed.ends_with("/v1") || trimmed.ends_with("/openai") {
                 format!("{trimmed}/chat/completions")
@@ -4826,6 +4840,20 @@ mod tests {
         assert_eq!(
             super::build_upstream_url("https://api.example.com", Protocol::ChatCompletions),
             "https://api.example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            super::build_upstream_url(
+                "https://generativelanguage.googleapis.com",
+                Protocol::ChatCompletions
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        );
+        assert_eq!(
+            super::build_upstream_url(
+                "https://generativelanguage.googleapis.com/v1beta",
+                Protocol::ChatCompletions
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         );
         assert_eq!(
             super::build_upstream_url(
