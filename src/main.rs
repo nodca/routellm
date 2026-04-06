@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::PathBuf, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 use llmrouter::{app, bootstrap, config::Config};
 use tokio::net::TcpListener;
@@ -29,18 +29,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::spawn(async move {
                 let mut ticker = time::interval(Duration::from_secs(15));
                 ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                let mut zero_ready_probed_routes = HashSet::new();
-
                 loop {
                     ticker.tick().await;
-                    match llmrouter::http::run_background_recovery_cycle_with_memory(
-                        recovery_state.clone(),
-                        &mut zero_ready_probed_routes,
-                    )
-                    .await
+                    match llmrouter::http::run_background_recovery_cycle(recovery_state.clone())
+                        .await
                     {
                         Ok(recovered) if recovered > 0 => {
-                            tracing::info!(recovered, "background recovery probe restored channel(s)");
+                            tracing::info!(
+                                recovered,
+                                "background recovery probe restored channel(s)"
+                            );
                         }
                         Ok(_) => {}
                         Err(error) => {

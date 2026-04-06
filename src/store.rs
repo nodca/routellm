@@ -528,21 +528,29 @@ impl SqliteStore {
               downstream_path,
               upstream_path,
               model_requested,
+              route_id,
               channel_id,
+              channel_label,
+              site_name,
+              upstream_model,
               http_status,
               latency_ms,
               error_message,
               input_tokens,
               output_tokens,
               total_tokens
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&log.request_id)
         .bind(&log.downstream_path)
         .bind(&log.upstream_path)
         .bind(&log.model_requested)
+        .bind(log.route_id)
         .bind(log.channel_id)
+        .bind(&log.channel_label)
+        .bind(&log.site_name)
+        .bind(&log.upstream_model)
         .bind(log.http_status)
         .bind(log.latency_ms)
         .bind(&log.error_message)
@@ -645,14 +653,14 @@ impl SqliteStore {
               rl.output_tokens,
               rl.total_tokens,
               rl.created_at,
-              c.label as channel_label,
-              s.name as site_name,
-              c.upstream_model
+              coalesce(rl.channel_label, c.label, '') as channel_label,
+              coalesce(rl.site_name, s.name, '') as site_name,
+              coalesce(rl.upstream_model, c.upstream_model, '') as upstream_model
             from request_logs rl
-            join channels c on c.id = rl.channel_id
-            join accounts a on a.id = c.account_id
-            join sites s on s.id = a.site_id
-            where c.route_id = ?
+            left join channels c on c.id = rl.channel_id
+            left join accounts a on a.id = c.account_id
+            left join sites s on s.id = a.site_id
+            where coalesce(rl.route_id, c.route_id) = ?
             order by rl.id desc
             limit ?
             "#,
@@ -699,35 +707,59 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub async fn mark_channel_failure(
+    pub async fn apply_channel_failure<F>(
         &self,
         channel_id: i64,
         http_status: Option<u16>,
         error_message: &str,
-        cooldown_until: Option<i64>,
-        manual_blocked: bool,
-    ) -> Result<(), AppError> {
-        sqlx::query(
-            r#"
-            update channels
-            set cooldown_until = ?,
-                manual_blocked = ?,
-                consecutive_fail_count = consecutive_fail_count + 1,
-                last_status = ?,
-                last_error = ?,
-                updated_at = current_timestamp
-            where id = ?
-            "#,
-        )
-        .bind(cooldown_until)
-        .bind(if manual_blocked { 1_i64 } else { 0_i64 })
-        .bind(http_status.map(i64::from))
-        .bind(error_message)
-        .bind(channel_id)
-        .execute(&self.pool)
-        .await?;
+        mut disposition: F,
+    ) -> Result<(), AppError>
+    where
+        F: FnMut(i64) -> (Option<i64>, bool),
+    {
+        loop {
+            let Some(current_fail_count) = sqlx::query_scalar::<_, i64>(
+                "select consecutive_fail_count from channels where id = ? limit 1",
+            )
+            .bind(channel_id)
+            .fetch_optional(&self.pool)
+            .await?
+            else {
+                return Err(AppError::NotFound(format!(
+                    "channel not found: {channel_id}"
+                )));
+            };
 
-        Ok(())
+            let next_fail_count = current_fail_count + 1;
+            let (cooldown_until, manual_blocked) = disposition(next_fail_count);
+            let affected = sqlx::query(
+                r#"
+                update channels
+                set cooldown_until = ?,
+                    manual_blocked = ?,
+                    consecutive_fail_count = ?,
+                    last_status = ?,
+                    last_error = ?,
+                    updated_at = current_timestamp
+                where id = ?
+                  and consecutive_fail_count = ?
+                "#,
+            )
+            .bind(cooldown_until)
+            .bind(if manual_blocked { 1_i64 } else { 0_i64 })
+            .bind(next_fail_count)
+            .bind(http_status.map(i64::from))
+            .bind(error_message)
+            .bind(channel_id)
+            .bind(current_fail_count)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+
+            if affected == 1 {
+                return Ok(());
+            }
+        }
     }
 }
 

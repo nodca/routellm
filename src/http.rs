@@ -292,6 +292,7 @@ pub async fn probe_channel(
     Path(channel_id): Path<i64>,
 ) -> Result<Response<Body>, AppError> {
     let channel = state.store.load_channel(channel_id).await?;
+    let route = state.store.get_route(channel.route_id).await?;
     let started_at = Instant::now();
     let outcome = execute_channel_probe(&state, &channel).await;
     let latency_ms = started_at.elapsed().as_millis() as i64;
@@ -320,16 +321,14 @@ pub async fn probe_channel(
             )
         }
         Err(outcome) => {
-            state
-                .store
-                .mark_channel_failure(
-                    channel_id,
-                    outcome.http_status,
-                    outcome.error_message.as_deref().unwrap_or("probe failed"),
-                    None,
-                    true,
-                )
-                .await?;
+            apply_channel_failure_state(
+                &state,
+                &route,
+                channel_id,
+                outcome.http_status,
+                outcome.error_message.as_deref().unwrap_or("probe failed"),
+            )
+            .await?;
             let updated = state.store.load_channel(channel_id).await?;
             let now = now_ts();
 
@@ -805,6 +804,7 @@ async fn attempt_proxy_request(
         responses_json_to_chat_completion(&response_value, requested_model, request_id);
     record_success(
         &state,
+        &route,
         &selected,
         request_id,
         requested_model,
@@ -994,6 +994,7 @@ async fn proxy_passthrough_stream(
 
         if let Err(error) = record_success_with_note(
             &state_for_task,
+            &route,
             &selected_for_task,
             &request_id_for_task,
             &requested_model_for_task,
@@ -1071,6 +1072,7 @@ async fn proxy_nonstream_passthrough_json(
     let token_usage = extract_usage_from_value(upstream_protocol, &response_value);
     record_success(
         &state,
+        &route,
         &selected,
         &request_id,
         &requested_model,
@@ -1267,6 +1269,7 @@ async fn proxy_chat_completions_stream(
 
         if let Err(error) = record_success_with_note(
             &state_for_task,
+            &route,
             &selected_for_task,
             &request_id_for_task,
             &requested_model_for_task,
@@ -1522,6 +1525,7 @@ fn apply_upstream_auth(
 
 async fn record_success(
     state: &AppState,
+    route: &ModelRouteRow,
     selected: &ChannelRow,
     request_id: &str,
     requested_model: &str,
@@ -1533,6 +1537,7 @@ async fn record_success(
 ) -> Result<(), AppError> {
     record_success_with_note(
         state,
+        route,
         selected,
         request_id,
         requested_model,
@@ -1548,6 +1553,7 @@ async fn record_success(
 
 async fn record_success_with_note(
     state: &AppState,
+    route: &ModelRouteRow,
     selected: &ChannelRow,
     request_id: &str,
     requested_model: &str,
@@ -1558,19 +1564,18 @@ async fn record_success_with_note(
     error_message: Option<String>,
     token_usage: Option<TokenUsage>,
 ) -> Result<(), AppError> {
-    let log = RequestLogWrite {
-        request_id: request_id.to_string(),
-        downstream_path: downstream_protocol.path().to_string(),
-        upstream_path: upstream_protocol.path().to_string(),
-        model_requested: requested_model.to_string(),
-        channel_id: selected.channel_id,
-        http_status: Some(i64::from(http_status)),
+    let log = build_request_log_write(
+        route,
+        selected,
+        request_id,
+        requested_model,
+        downstream_protocol,
+        upstream_protocol,
+        Some(i64::from(http_status)),
         latency_ms,
         error_message,
-        input_tokens: token_usage.map(|usage| usage.input_tokens),
-        output_tokens: token_usage.map(|usage| usage.output_tokens),
-        total_tokens: token_usage.map(|usage| usage.total_tokens),
-    };
+        token_usage,
+    );
     state.store.record_request(&log).await?;
     state
         .store
@@ -1591,40 +1596,91 @@ async fn record_failure(
     latency_ms: i64,
     error_message: String,
 ) -> Result<(), AppError> {
-    let (error_kind, _) = classify_upstream_error(http_status.map(i64::from), Some(&error_message));
-    let next_fail_count = selected.consecutive_fail_count + 1;
-    let (cooldown_until, manual_intervention_required) = failure_disposition(
-        &state.cooldown_policy,
-        &state.manual_intervention_policy,
-        route.cooldown_seconds,
-        error_kind,
-        next_fail_count,
+    let log = build_request_log_write(
+        route,
+        selected,
+        request_id,
+        requested_model,
+        downstream_protocol,
+        upstream_protocol,
+        http_status.map(i64::from),
+        latency_ms,
+        Some(error_message.clone()),
+        None,
     );
-    let log = RequestLogWrite {
+    state.store.record_request(&log).await?;
+    apply_channel_failure_state(
+        state,
+        route,
+        selected.channel_id,
+        http_status,
+        &error_message,
+    )
+    .await?;
+    Ok(())
+}
+
+fn build_request_log_write(
+    route: &ModelRouteRow,
+    selected: &ChannelRow,
+    request_id: &str,
+    requested_model: &str,
+    downstream_protocol: Protocol,
+    upstream_protocol: Protocol,
+    http_status: Option<i64>,
+    latency_ms: i64,
+    error_message: Option<String>,
+    token_usage: Option<TokenUsage>,
+) -> RequestLogWrite {
+    let (input_tokens, output_tokens, total_tokens) = token_usage
+        .map(|usage| {
+            (
+                Some(usage.input_tokens),
+                Some(usage.output_tokens),
+                Some(usage.total_tokens),
+            )
+        })
+        .unwrap_or((None, None, None));
+
+    RequestLogWrite {
         request_id: request_id.to_string(),
         downstream_path: downstream_protocol.path().to_string(),
         upstream_path: upstream_protocol.path().to_string(),
         model_requested: requested_model.to_string(),
+        route_id: route.id,
         channel_id: selected.channel_id,
-        http_status: http_status.map(i64::from),
+        channel_label: selected.channel_label.clone(),
+        site_name: selected.site_name.clone(),
+        upstream_model: selected.upstream_model.clone(),
+        http_status,
         latency_ms,
-        error_message: Some(error_message.clone()),
-        input_tokens: None,
-        output_tokens: None,
-        total_tokens: None,
-    };
-    state.store.record_request(&log).await?;
+        error_message,
+        input_tokens,
+        output_tokens,
+        total_tokens,
+    }
+}
+
+async fn apply_channel_failure_state(
+    state: &AppState,
+    route: &ModelRouteRow,
+    channel_id: i64,
+    http_status: Option<u16>,
+    error_message: &str,
+) -> Result<(), AppError> {
+    let (error_kind, _) = classify_upstream_error(http_status.map(i64::from), Some(error_message));
     state
         .store
-        .mark_channel_failure(
-            selected.channel_id,
-            http_status,
-            &error_message,
-            cooldown_until,
-            manual_intervention_required,
-        )
-        .await?;
-    Ok(())
+        .apply_channel_failure(channel_id, http_status, error_message, |next_fail_count| {
+            failure_disposition(
+                &state.cooldown_policy,
+                &state.manual_intervention_policy,
+                route.cooldown_seconds,
+                error_kind,
+                next_fail_count,
+            )
+        })
+        .await
 }
 
 fn failure_disposition(
@@ -1694,25 +1750,14 @@ async fn background_recover_channel(
             let error_message = outcome
                 .error_message
                 .unwrap_or_else(|| "background recovery probe failed".to_string());
-            let (error_kind, _) =
-                classify_upstream_error(outcome.http_status.map(i64::from), Some(&error_message));
-            let (cooldown_until, manual_blocked) = failure_disposition(
-                &state.cooldown_policy,
-                &state.manual_intervention_policy,
-                route.cooldown_seconds,
-                error_kind,
-                channel.consecutive_fail_count + 1,
-            );
-            state
-                .store
-                .mark_channel_failure(
-                    channel.channel_id,
-                    outcome.http_status,
-                    &error_message,
-                    cooldown_until,
-                    manual_blocked,
-                )
-                .await?;
+            apply_channel_failure_state(
+                state,
+                route,
+                channel.channel_id,
+                outcome.http_status,
+                &error_message,
+            )
+            .await?;
             Ok(false)
         }
     }
@@ -1756,21 +1801,13 @@ fn route_admin_to_model_route(route: &AdminRouteRow) -> ModelRouteRow {
     }
 }
 
-pub async fn run_background_recovery_cycle_with_memory(
-    state: AppState,
-    zero_ready_probed_routes: &mut HashSet<i64>,
-) -> Result<usize, AppError> {
+pub async fn run_background_recovery_cycle(state: AppState) -> Result<usize, AppError> {
     let now = now_ts();
     let routes = state.store.list_routes(now).await?;
     let mut recovered_count = 0usize;
 
     for route in routes {
         if route.ready_channel_count > 0 {
-            zero_ready_probed_routes.remove(&route.id);
-            continue;
-        }
-
-        if !zero_ready_probed_routes.insert(route.id) {
             continue;
         }
 
@@ -3426,7 +3463,15 @@ fn truncate(message: &str, max_len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, path::PathBuf, time::Duration};
+    use std::{
+        net::SocketAddr,
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use axum::{
         Json, Router,
@@ -3435,6 +3480,7 @@ mod tests {
         response::Response,
         routing::post,
     };
+    use futures_util::future::join_all;
     use serde_json::{Value, json};
     use sqlx::SqlitePool;
     use tempfile::tempdir;
@@ -3628,6 +3674,64 @@ mod tests {
         }
 
         let app = Router::new().route("/v1/responses", post(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    async fn spawn_delayed_server_error_upstream(delay: Duration) -> SocketAddr {
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move || async move {
+                tokio::time::sleep(delay).await;
+                Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"error":{"message":"upstream unavailable","type":"server_error"}}"#,
+                    ))
+                    .unwrap()
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    async fn spawn_flaky_probe_upstream() -> SocketAddr {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/v1/responses",
+            post({
+                let attempts = attempts.clone();
+                move || {
+                    let attempts = attempts.clone();
+                    async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            return Response::builder()
+                                .status(StatusCode::SERVICE_UNAVAILABLE)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Body::from(
+                                    r#"{"error":{"message":"upstream unavailable","type":"server_error"}}"#,
+                                ))
+                                .unwrap();
+                        }
+
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from("{}"))
+                            .unwrap()
+                    }
+                }
+            }),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -3985,13 +4089,17 @@ mod tests {
               downstream_path,
               upstream_path,
               model_requested,
+              route_id,
               channel_id,
+              channel_label,
+              site_name,
+              upstream_model,
               http_status,
               latency_ms,
               error_message
             ) values
-              ('req-cooling', '/v1/responses', '/v1/responses', 'gpt-5.4', 1, 429, 812, 'rate limited'),
-              ('req-ready', '/v1/chat/completions', '/v1/responses', 'gpt-5.4', 2, 200, 145, null)
+              ('req-cooling', '/v1/responses', '/v1/responses', 'gpt-5.4', 1, 1, 'default', 'test-site', 'gpt-5.4', 429, 812, 'rate limited'),
+              ('req-ready', '/v1/chat/completions', '/v1/responses', 'gpt-5.4', 1, 2, 'backup', 'test-site', 'gpt-5.4-mini', 200, 145, null)
             "#,
         )
         .execute(&pool)
@@ -4434,6 +4542,119 @@ mod tests {
         assert!(row.0.is_none());
         assert_eq!(row.1, 0);
         assert_eq!(row.2, Some(200));
+    }
+
+    #[tokio::test]
+    async fn background_recovery_retries_each_cycle_until_a_channel_is_ready() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_flaky_probe_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let state = app::build_state(&config).await.unwrap();
+        seed_database(&config.database_url, upstream_addr).await;
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+        sqlx::query(
+            r#"
+            update channels
+            set cooldown_until = ?,
+                consecutive_fail_count = 3,
+                last_status = 503,
+                last_error = 'temporary upstream failure'
+            where id = 1
+            "#,
+        )
+        .bind(super::now_ts() + 600)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let first_cycle = super::run_background_recovery_cycle(state.clone())
+            .await
+            .unwrap();
+        assert_eq!(first_cycle, 0);
+
+        let first_cooldown = sqlx::query_scalar::<_, Option<i64>>(
+            "select cooldown_until from channels where id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(first_cooldown.is_some());
+
+        let second_cycle = super::run_background_recovery_cycle(state.clone())
+            .await
+            .unwrap();
+        assert_eq!(second_cycle, 1);
+
+        let row = sqlx::query_as::<_, (Option<i64>, i64, Option<i64>, Option<String>)>(
+            "select cooldown_until, consecutive_fail_count, last_status, last_error from channels where id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(row.0.is_none());
+        assert_eq!(row.1, 0);
+        assert_eq!(row.2, Some(200));
+        assert!(row.3.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_failures_enter_cooldown_once_threshold_is_reached() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_delayed_server_error_upstream(Duration::from_millis(100)).await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        seed_database(&config.database_url, upstream_addr).await;
+
+        let responses = join_all((0..3).map(|_| {
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "gpt-5.4",
+                            "input": "ping"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+        }))
+        .await;
+
+        for response in responses {
+            assert_eq!(response.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+        let row = sqlx::query_as::<_, (i64, Option<i64>)>(
+            "select consecutive_fail_count, cooldown_until from channels where id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 3);
+        assert!(row.1.is_some());
     }
 
     #[tokio::test]
@@ -5030,6 +5251,61 @@ mod tests {
         let channels = listed["data"]["channels"].as_array().unwrap();
         assert_eq!(channels.len(), 1);
         assert_eq!(channels[0]["channel_label"], "default");
+    }
+
+    #[tokio::test]
+    async fn route_logs_stay_visible_after_channel_is_deleted() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_json_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        seed_database(&config.database_url, upstream_addr).await;
+        seed_management_data(&config.database_url).await;
+
+        let delete_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/channels/2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_response.status(), StatusCode::OK);
+
+        let logs_response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/routes/1/logs?limit=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logs_response.status(), StatusCode::OK);
+
+        let body = to_bytes(logs_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let logs = value["data"]["logs"].as_array().unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0]["channel_id"], Value::Null);
+        assert_eq!(logs[0]["channel_label"], "backup");
+        assert_eq!(logs[0]["site_name"], "test-site");
+        assert_eq!(logs[0]["upstream_model"], "gpt-5.4-mini");
     }
 
     #[tokio::test]
@@ -6268,6 +6544,44 @@ mod tests {
         assert_eq!(value["data"]["eligible"], false);
         assert_eq!(value["data"]["last_status"], 403);
         assert_eq!(value["data"]["last_error_kind"], "edge_blocked");
+        assert!(value["data"]["cooldown_until"].is_null());
+    }
+
+    #[tokio::test]
+    async fn probe_channel_transient_failure_does_not_force_manual_block() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_server_error_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        seed_database(&config.database_url, upstream_addr).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/channels/1/probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["data"]["manual_blocked"], false);
+        assert_eq!(value["data"]["consecutive_fail_count"], 1);
+        assert_eq!(value["data"]["last_status"], 503);
+        assert_eq!(value["data"]["last_error_kind"], "upstream_server_error");
         assert!(value["data"]["cooldown_until"].is_null());
     }
 
