@@ -88,6 +88,7 @@ impl SqliteStore {
         cooldown_seconds: i64,
     ) -> Result<(ModelRouteRow, bool), AppError> {
         let route_model = normalize_route_model(route_model)?;
+        let cooldown_seconds = normalize_cooldown_seconds(cooldown_seconds)?;
 
         if let Some(existing) = sqlx::query_as::<_, ModelRouteRow>(
             r#"

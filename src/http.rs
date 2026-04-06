@@ -149,6 +149,18 @@ struct TokenUsage {
     total_tokens: i64,
 }
 
+#[derive(Debug, Default, Clone)]
+struct GeminiStreamState {
+    pending_tool_calls: HashMap<usize, GeminiPendingToolCall>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct GeminiPendingToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
 const FIRST_TOKEN_TIMEOUT_SECS: u64 = 50;
 const FIRST_TOKEN_TIMEOUT_INITIAL_COOLDOWN_SECS: i64 = 120;
 const FIRST_TOKEN_TIMEOUT_MAX_COOLDOWN_SECS: i64 = 1920;
@@ -522,7 +534,15 @@ pub async fn create_gemini_content(
     Json(payload): Json<Value>,
 ) -> Result<Response<Body>, AppError> {
     let (requested_model, stream) = parse_gemini_content_target(&tail)?;
-    let chat_payload = gemini_generate_content_to_chat_payload(&requested_model, &payload)?;
+    let mut chat_payload = gemini_generate_content_to_chat_payload(&requested_model, &payload)?;
+    if stream {
+        chat_payload
+            .as_object_mut()
+            .ok_or_else(|| {
+                AppError::Internal("gemini chat payload must be a json object".to_string())
+            })?
+            .insert("stream".to_string(), Value::Bool(true));
+    }
     let proxy_response = proxy_request(
         state,
         requested_model.clone(),
@@ -532,8 +552,12 @@ pub async fn create_gemini_content(
     .await?;
 
     if stream {
-        return build_gemini_stream_response(proxy_response, &requested_model, query.alt.as_deref())
-            .await;
+        return build_gemini_stream_response(
+            proxy_response,
+            &requested_model,
+            query.alt.as_deref(),
+        )
+        .await;
     }
 
     build_gemini_json_response(proxy_response, &requested_model).await
@@ -2127,12 +2151,18 @@ fn gemini_instruction_to_text(instruction: &Value) -> Result<String, AppError> {
     let parts = instruction
         .get("parts")
         .and_then(Value::as_array)
-        .ok_or_else(|| AppError::BadRequest("systemInstruction.parts must be an array".to_string()))?;
+        .ok_or_else(|| {
+            AppError::BadRequest("systemInstruction.parts must be an array".to_string())
+        })?;
     gemini_parts_to_text(parts)
 }
 
 fn gemini_content_to_chat_message(content: &Value) -> Result<Value, AppError> {
-    let role = match content.get("role").and_then(Value::as_str).unwrap_or("user") {
+    let role = match content
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("user")
+    {
         "user" => "user",
         "model" => "assistant",
         "assistant" => "assistant",
@@ -2180,7 +2210,9 @@ fn gemini_tools_to_chat_tools(tools: &Value) -> Result<Value, AppError> {
             let name = declaration
                 .get("name")
                 .and_then(Value::as_str)
-                .ok_or_else(|| AppError::BadRequest("gemini function declaration name is required".to_string()))?;
+                .ok_or_else(|| {
+                    AppError::BadRequest("gemini function declaration name is required".to_string())
+                })?;
             let mut function = Map::new();
             function.insert("name".to_string(), Value::String(name.to_string()));
             if let Some(description) = declaration.get("description").cloned() {
@@ -2205,10 +2237,7 @@ fn gemini_tool_config_to_chat_tool_choice(tool_config: &Value) -> Result<Option<
     else {
         return Ok(None);
     };
-    let mode = config
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("AUTO");
+    let mode = config.get("mode").and_then(Value::as_str).unwrap_or("AUTO");
     let mapped = match mode {
         "AUTO" => Value::String("auto".to_string()),
         "NONE" => Value::String("none".to_string()),
@@ -2230,8 +2259,9 @@ async fn build_gemini_json_response(
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .map_err(|error| AppError::Internal(format!("failed to read proxied body: {error}")))?;
-    let chat_value: Value = serde_json::from_slice(&body)
-        .map_err(|error| AppError::Internal(format!("failed to parse proxied json body: {error}")))?;
+    let chat_value: Value = serde_json::from_slice(&body).map_err(|error| {
+        AppError::Internal(format!("failed to parse proxied json body: {error}"))
+    })?;
     let gemini_value = chat_completion_to_gemini_response(&chat_value, requested_model);
     build_json_response(status, &gemini_value)
 }
@@ -2241,24 +2271,89 @@ async fn build_gemini_stream_response(
     requested_model: &str,
     alt: Option<&str>,
 ) -> Result<Response<Body>, AppError> {
-    let gemini_response = build_gemini_json_response(response, requested_model).await?;
-    let body = to_bytes(gemini_response.into_body(), usize::MAX)
-        .await
-        .map_err(|error| AppError::Internal(format!("failed to read gemini body: {error}")))?;
-    let payload = String::from_utf8(body.to_vec())
-        .map_err(|error| AppError::Internal(format!("failed to encode gemini stream payload: {error}")))?;
-    let mut headers = HeaderMap::new();
-    if alt == Some("sse") || alt.is_none() {
-        headers.insert(CONTENT_TYPE, "text/event-stream".parse().unwrap());
-        return build_response(
-            StatusCode::OK,
-            &headers,
-            Body::from(format!("data: {payload}\n\n")),
-        );
+    if alt != Some("sse") && alt.is_some() {
+        let gemini_response = build_gemini_json_response(response, requested_model).await?;
+        let body = to_bytes(gemini_response.into_body(), usize::MAX)
+            .await
+            .map_err(|error| AppError::Internal(format!("failed to read gemini body: {error}")))?;
+        let payload = String::from_utf8(body.to_vec()).map_err(|error| {
+            AppError::Internal(format!("failed to encode gemini stream payload: {error}"))
+        })?;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        return build_response(StatusCode::OK, &headers, Body::from(payload));
     }
 
-    headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-    build_response(StatusCode::OK, &headers, Body::from(payload))
+    let status = response.status();
+    let mut upstream_stream = response.into_body().into_data_stream();
+    let requested_model = requested_model.to_string();
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+
+    tokio::spawn(async move {
+        let mut buffer = String::new();
+        let mut stream_state = GeminiStreamState::default();
+
+        while let Some(next_chunk) = upstream_stream.next().await {
+            match next_chunk {
+                Ok(chunk) => {
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    for frame in drain_sse_frames(&mut buffer) {
+                        match transform_chat_frame_to_gemini_sse(
+                            &frame,
+                            &requested_model,
+                            &mut stream_state,
+                        ) {
+                            Ok(lines) => {
+                                for line in lines {
+                                    if tx.send(Ok(Bytes::from(line))).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let _ = tx.send(Err(std::io::Error::other(error))).await;
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::other(format!(
+                            "failed to read chat completion stream: {error}"
+                        ))))
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        if !buffer.trim().is_empty() {
+            for frame in drain_sse_frames(&mut buffer) {
+                match transform_chat_frame_to_gemini_sse(
+                    &frame,
+                    &requested_model,
+                    &mut stream_state,
+                ) {
+                    Ok(lines) => {
+                        for line in lines {
+                            if tx.send(Ok(Bytes::from(line))).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(std::io::Error::other(error))).await;
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    build_response(status, &headers, Body::from_stream(ReceiverStream::new(rx)))
 }
 
 fn chat_completion_to_gemini_response(chat: &Value, requested_model: &str) -> Value {
@@ -2273,15 +2368,7 @@ fn chat_completion_to_gemini_response(chat: &Value, requested_model: &str) -> Va
         .get("finish_reason")
         .and_then(Value::as_str)
         .unwrap_or("stop");
-    let text = match message.get("content") {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
-    };
+    let parts = chat_message_to_gemini_parts(&message);
 
     json!({
         "modelVersion": requested_model,
@@ -2289,9 +2376,7 @@ fn chat_completion_to_gemini_response(chat: &Value, requested_model: &str) -> Va
             "index": choice.get("index").and_then(Value::as_i64).unwrap_or(0),
             "content": {
                 "role": "model",
-                "parts": [{
-                    "text": text
-                }]
+                "parts": parts
             },
             "finishReason": map_chat_finish_reason_to_gemini(finish_reason)
         }],
@@ -2309,6 +2394,69 @@ fn map_chat_finish_reason_to_gemini(finish_reason: &str) -> &'static str {
         "content_filter" => "SAFETY",
         _ => "STOP",
     }
+}
+
+fn chat_message_to_gemini_parts(message: &Value) -> Vec<Value> {
+    let mut parts = chat_content_to_gemini_parts(message.get("content"));
+    parts.extend(chat_tool_calls_to_gemini_parts(message.get("tool_calls")));
+    parts
+}
+
+fn chat_content_to_gemini_parts(content: Option<&Value>) -> Vec<Value> {
+    match content {
+        Some(Value::String(text)) if !text.is_empty() => vec![json!({ "text": text })],
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| json!({ "text": text }))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn chat_tool_calls_to_gemini_parts(tool_calls: Option<&Value>) -> Vec<Value> {
+    tool_calls
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(chat_tool_call_to_gemini_part)
+        .collect()
+}
+
+fn chat_tool_call_to_gemini_part(tool_call: &Value) -> Option<Value> {
+    let function = tool_call.get("function")?.as_object()?;
+    let name = function.get("name")?.as_str()?;
+    let arguments = function
+        .get("arguments")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    let mut function_call = Map::new();
+    function_call.insert("name".to_string(), Value::String(name.to_string()));
+    if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+        function_call.insert("id".to_string(), Value::String(id.to_string()));
+    }
+    function_call.insert(
+        "args".to_string(),
+        parse_chat_tool_call_arguments(arguments),
+    );
+
+    Some(json!({
+        "functionCall": Value::Object(function_call)
+    }))
+}
+
+fn parse_chat_tool_call_arguments(arguments: &str) -> Value {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return Value::Object(Map::new());
+    }
+
+    serde_json::from_str(trimmed).unwrap_or_else(|_| Value::String(trimmed.to_string()))
 }
 
 fn copy_object_field(
@@ -2720,6 +2868,171 @@ fn extract_sse_data(frame: &str) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     (!data.is_empty()).then_some(data)
+}
+
+fn transform_chat_frame_to_gemini_sse(
+    frame: &str,
+    requested_model: &str,
+    stream_state: &mut GeminiStreamState,
+) -> Result<Vec<String>, String> {
+    let Some(data) = extract_sse_data(frame) else {
+        return Ok(Vec::new());
+    };
+
+    if data == "[DONE]" {
+        return Ok(finalize_pending_gemini_tool_calls(
+            requested_model,
+            stream_state,
+            None,
+        ));
+    }
+
+    let event: Value =
+        serde_json::from_str(&data).map_err(|error| format!("invalid chat sse json: {error}"))?;
+    let choice = event
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .cloned()
+        .unwrap_or(Value::Null);
+    let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+    let delta = choice.get("delta").cloned().unwrap_or(Value::Null);
+
+    let mut lines = Vec::new();
+    lines.extend(chat_delta_to_gemini_sse(
+        &delta,
+        requested_model,
+        stream_state,
+    ));
+    if finish_reason.is_some() {
+        lines.extend(finalize_pending_gemini_tool_calls(
+            requested_model,
+            stream_state,
+            finish_reason,
+        ));
+    }
+    Ok(lines)
+}
+
+fn chat_delta_to_gemini_sse(
+    delta: &Value,
+    requested_model: &str,
+    stream_state: &mut GeminiStreamState,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    let text_parts = chat_content_to_gemini_parts(delta.get("content"));
+    if !text_parts.is_empty() {
+        lines.push(gemini_sse_data_line(
+            requested_model,
+            text_parts,
+            None,
+            None,
+        ));
+    }
+
+    if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+        for tool_call in tool_calls {
+            let index = tool_call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let pending = stream_state.pending_tool_calls.entry(index).or_default();
+
+            if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+                pending.id = Some(id.to_string());
+            }
+
+            if let Some(function) = tool_call.get("function").and_then(Value::as_object) {
+                if let Some(name) = function.get("name").and_then(Value::as_str) {
+                    pending.name = Some(name.to_string());
+                }
+                if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                    pending.arguments.push_str(arguments);
+                }
+            }
+        }
+    }
+
+    lines
+}
+
+fn finalize_pending_gemini_tool_calls(
+    requested_model: &str,
+    stream_state: &mut GeminiStreamState,
+    finish_reason: Option<&str>,
+) -> Vec<String> {
+    let mut indices = stream_state
+        .pending_tool_calls
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    indices.sort_unstable();
+
+    let mut lines = Vec::new();
+    for (position, index) in indices.iter().enumerate() {
+        let Some(pending) = stream_state.pending_tool_calls.remove(index) else {
+            continue;
+        };
+        let Some(name) = pending.name else {
+            continue;
+        };
+
+        let mut function_call = Map::new();
+        function_call.insert("name".to_string(), Value::String(name));
+        if let Some(id) = pending.id {
+            function_call.insert("id".to_string(), Value::String(id));
+        }
+        function_call.insert(
+            "args".to_string(),
+            parse_chat_tool_call_arguments(&pending.arguments),
+        );
+
+        let current_finish_reason = if position + 1 == indices.len() {
+            finish_reason
+        } else {
+            None
+        };
+        lines.push(gemini_sse_data_line(
+            requested_model,
+            vec![json!({
+                "functionCall": Value::Object(function_call)
+            })],
+            current_finish_reason,
+            Some(*index as i64),
+        ));
+    }
+
+    lines
+}
+
+fn gemini_sse_data_line(
+    requested_model: &str,
+    parts: Vec<Value>,
+    finish_reason: Option<&str>,
+    index: Option<i64>,
+) -> String {
+    let mut candidate = Map::new();
+    candidate.insert(
+        "content".to_string(),
+        json!({
+            "role": "model",
+            "parts": parts
+        }),
+    );
+    candidate.insert("index".to_string(), Value::from(index.unwrap_or(0)));
+    if let Some(finish_reason) = finish_reason {
+        candidate.insert(
+            "finishReason".to_string(),
+            Value::String(map_chat_finish_reason_to_gemini(finish_reason).to_string()),
+        );
+    }
+
+    format!(
+        "data: {}\n\n",
+        serde_json::to_string(&json!({
+            "modelVersion": requested_model,
+            "candidates": [Value::Object(candidate)]
+        }))
+        .unwrap()
+    )
 }
 
 fn transform_responses_frame_to_chat_sse(
@@ -3463,6 +3776,119 @@ mod tests {
                                 "content": "hello from gemini-compatible upstream"
                             },
                             "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 9,
+                            "completion_tokens": 6,
+                            "total_tokens": 15
+                        }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap()
+        }
+
+        let app = Router::new().route("/v1beta/openai/chat/completions", post(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    async fn spawn_gemini_openai_streaming_upstream() -> SocketAddr {
+        async fn handler(headers: HeaderMap, Json(payload): Json<Value>) -> Response<Body> {
+            let auth_ok = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                == Some("Bearer test-key");
+
+            if !auth_ok {
+                return Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"error":{"message":"missing bearer auth"}}"#))
+                    .unwrap();
+            }
+
+            if payload.get("stream").and_then(Value::as_bool) != Some(true) {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"error":{"message":"stream=true is required for this upstream"}}"#,
+                    ))
+                    .unwrap();
+            }
+
+            let chunks = vec![
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                    b"data: {\"id\":\"chatcmpl_gemini_stream\",\"object\":\"chat.completion.chunk\",\"model\":\"gemini-2.5-pro\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello \"},\"finish_reason\":null}]}\n\n",
+                )),
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                    b"data: {\"id\":\"chatcmpl_gemini_stream\",\"object\":\"chat.completion.chunk\",\"model\":\"gemini-2.5-pro\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"from stream\"},\"finish_reason\":null}]}\n\n",
+                )),
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                    b"data: {\"id\":\"chatcmpl_gemini_stream\",\"object\":\"chat.completion.chunk\",\"model\":\"gemini-2.5-pro\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                )),
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n")),
+            ];
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(tokio_stream::iter(chunks)))
+                .unwrap()
+        }
+
+        let app = Router::new().route("/v1beta/openai/chat/completions", post(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    async fn spawn_gemini_openai_tool_call_upstream() -> SocketAddr {
+        async fn handler(headers: HeaderMap) -> Response<Body> {
+            let auth_ok = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                == Some("Bearer test-key");
+
+            if !auth_ok {
+                return Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"error":{"message":"missing bearer auth"}}"#))
+                    .unwrap();
+            }
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "id": "chatcmpl_gemini_tool",
+                        "object": "chat.completion",
+                        "model": "gemini-2.5-pro",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": "call_weather",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": "{\"city\":\"Paris\"}"
+                                    }
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
                         }],
                         "usage": {
                             "prompt_tokens": 9,
@@ -5189,14 +5615,17 @@ mod tests {
             .await
             .unwrap();
         let proxy_value: Value = serde_json::from_slice(&proxy_body).unwrap();
-        assert_eq!(proxy_value["candidates"][0]["content"]["parts"][0]["text"], "hello from gemini-compatible upstream");
+        assert_eq!(
+            proxy_value["candidates"][0]["content"]["parts"][0]["text"],
+            "hello from gemini-compatible upstream"
+        );
     }
 
     #[tokio::test]
     async fn downstream_gemini_native_stream_generate_content_proxies() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
-        let upstream_addr = spawn_gemini_openai_upstream().await;
+        let upstream_addr = spawn_gemini_openai_streaming_upstream().await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             database_url: database_url(db_path),
@@ -5250,6 +5679,97 @@ mod tests {
             proxy_response.headers().get(CONTENT_TYPE).unwrap(),
             "text/event-stream"
         );
+        let proxy_body = to_bytes(proxy_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let proxy_text = String::from_utf8(proxy_body.to_vec()).unwrap();
+        assert!(proxy_text.contains("\"text\":\"hello \""));
+        assert!(proxy_text.contains("\"text\":\"from stream\""));
+        assert!(!proxy_text.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn downstream_gemini_native_generate_content_preserves_function_calls() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_gemini_openai_tool_call_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+        sqlx::query("insert into model_routes (model_pattern, enabled, routing_strategy, cooldown_seconds) values ('gemini-2.5-pro', 1, 'weighted', 300)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let create_channel_request = Request::builder()
+            .method("POST")
+            .uri("/api/routes/1/channels")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "base_url": format!("http://{upstream_addr}/v1beta/openai"),
+                    "api_key": "test-key",
+                    "upstream_model": "gemini-2.5-pro",
+                    "protocol": "chat_completions"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let create_response = app.clone().oneshot(create_channel_request).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+
+        let proxy_request = Request::builder()
+            .method("POST")
+            .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "tools": [{
+                        "functionDeclarations": [{
+                            "name": "get_weather",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "city": { "type": "string" }
+                                }
+                            }
+                        }]
+                    }],
+                    "contents": [{
+                        "role": "user",
+                        "parts": [{ "text": "ping" }]
+                    }]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
+        assert_eq!(proxy_response.status(), StatusCode::OK);
+        let proxy_body = to_bytes(proxy_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let proxy_value: Value = serde_json::from_slice(&proxy_body).unwrap();
+        assert_eq!(
+            proxy_value["candidates"][0]["content"]["parts"][0]["functionCall"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            proxy_value["candidates"][0]["content"]["parts"][0]["functionCall"]["id"],
+            "call_weather"
+        );
+        assert_eq!(
+            proxy_value["candidates"][0]["content"]["parts"][0]["functionCall"]["args"]["city"],
+            "Paris"
+        );
+        assert_eq!(proxy_value["candidates"][0]["finishReason"], "STOP");
     }
 
     #[tokio::test]
@@ -5427,6 +5947,48 @@ mod tests {
             .unwrap();
         let routes_value: Value = serde_json::from_slice(&routes_body).unwrap();
         assert_eq!(routes_value["data"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_route_rejects_negative_cooldown_seconds() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let create_request = Request::builder()
+            .method("POST")
+            .uri("/api/routes")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "route_model": "gpt-5.4",
+                    "cooldown_seconds": -1
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let create_response = app.clone().oneshot(create_request).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::BAD_REQUEST);
+        let create_body = to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_value: Value = serde_json::from_slice(&create_body).unwrap();
+        assert!(
+            create_value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("cooldown_seconds")
+        );
     }
 
     #[tokio::test]
