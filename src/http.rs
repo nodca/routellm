@@ -4729,6 +4729,26 @@ mod tests {
         addr
     }
 
+    async fn spawn_bad_gateway_upstream() -> SocketAddr {
+        async fn handler() -> Response<Body> {
+            Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"error":{"message":"claude-shaped request tripped upstream 502","type":"server_error"}}"#,
+                ))
+                .unwrap()
+        }
+
+        let app = Router::new().route("/v1/responses", post(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
     async fn spawn_delayed_server_error_upstream(delay: Duration) -> SocketAddr {
         let app = Router::new().route(
             "/v1/responses",
@@ -7394,6 +7414,338 @@ mod tests {
             proxy_value["content"][0]["text"],
             "hello from claude upstream"
         );
+    }
+
+    #[tokio::test]
+    async fn messages_auth_failure_returns_anthropic_error_with_request_id() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: Some("sk-llmrouter-test".to_string()),
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "claude-4-sonnet",
+                            "messages": [{ "role": "user", "content": "ping" }],
+                            "max_tokens": 16
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get("request-id").is_some());
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "authentication_error");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("authorization token")
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_validation_failure_returns_anthropic_error_with_request_id() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "messages": [{ "role": "user", "content": "ping" }],
+                            "max_tokens": 16
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().get("request-id").is_some());
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert_eq!(value["error"]["message"], "field `model` is required");
+    }
+
+    #[tokio::test]
+    async fn claude_code_style_message_failures_log_redacted_fingerprint_and_correlation() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_bad_gateway_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path.clone()),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let create_route_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/routes")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "route_model": "claude-opus-4-1"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_route_response.status(), StatusCode::CREATED);
+        let create_route_body = to_bytes(create_route_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_route_value: Value = serde_json::from_slice(&create_route_body).unwrap();
+        let route_id = create_route_value["data"]["route"]["id"].as_i64().unwrap();
+
+        let create_channel_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/routes/{route_id}/channels"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "base_url": format!("http://{upstream_addr}"),
+                            "api_key": "test-key",
+                            "upstream_model": "gpt-5.4",
+                            "protocol": "responses"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_channel_response.status(), StatusCode::CREATED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("anthropic-beta", "claude-code-20250219,context-management-2025-06-27")
+                    .header("x-app", "claude-code")
+                    .header("x-client-app", "claude-code")
+                    .header("x-claude-code-session-id", "session-abc-123")
+                    .header("x-client-request-id", "client-request-xyz")
+                    .header("x-anthropic-additional-protection", "protection-token")
+                    .header("user-agent", "Claude-Code/1.0")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "claude-opus-4-1",
+                            "messages": [{ "role": "user", "content": "operator wants to debug a 502" }],
+                            "system": "system prompt that should stay out of logs",
+                            "tools": [{
+                                "name": "get_weather",
+                                "input_schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "city": { "type": "string" }
+                                    }
+                                }
+                            }],
+                            "tool_choice": { "type": "auto" },
+                            "metadata": { "trace": "opaque" },
+                            "thinking": { "type": "enabled", "budget_tokens": 128 },
+                            "context_management": { "type": "ephemeral" },
+                            "stream": true,
+                            "max_tokens": 64
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let request_id = response
+            .headers()
+            .get("request-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_string();
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "api_error");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("claude-shaped request tripped upstream 502")
+        );
+
+        let logs_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/routes/{route_id}/logs"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logs_response.status(), StatusCode::OK);
+        let logs_body = to_bytes(logs_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let logs_value: Value = serde_json::from_slice(&logs_body).unwrap();
+        let log = &logs_value["data"]["logs"][0];
+        assert_eq!(log["request_id"], request_id);
+        assert_eq!(log["downstream_client_request_id"], "client-request-xyz");
+        assert_eq!(
+            log["claude_request_fingerprint"]["headers"]["anthropic_beta"][0],
+            "claude-code-20250219"
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["headers"]["x_app"],
+            "claude-code"
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["headers"]["x_client_app"],
+            "claude-code"
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["headers"]["claude_code_session_id_present"],
+            true
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["headers"]["x_anthropic_additional_protection_present"],
+            true
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["body"]["tool_count"],
+            1
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["body"]["tool_choice_type"],
+            "auto"
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["body"]["system_present"],
+            true
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["body"]["thinking_present"],
+            true
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["body"]["context_management_present"],
+            true
+        );
+        assert_eq!(log["claude_request_fingerprint"]["body"]["stream"], true);
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+        let row = sqlx::query_as::<_, (String, String)>(
+            "select downstream_client_request_id, claude_request_fingerprint from request_logs where request_id = ? limit 1",
+        )
+        .bind(&request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "client-request-xyz");
+        assert!(row.1.contains("claude-code-20250219"));
+        assert!(!row.1.contains("operator wants to debug a 502"));
+        assert!(!row.1.contains("system prompt that should stay out of logs"));
+    }
+
+    #[tokio::test]
+    async fn responses_failures_keep_openai_error_shape() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_bad_gateway_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        seed_database(&config.database_url, upstream_addr).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "gpt-5.4",
+                            "input": "ping"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(value.get("type").is_none());
+        assert_eq!(value["error"]["type"], "upstream_error");
     }
 
     #[test]
