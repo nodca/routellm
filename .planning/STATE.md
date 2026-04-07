@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed quick task 260407-u8c for Claude fixtures and golden tests
-last_updated: "2026-04-07T13:52:00Z"
-last_activity: 2026-04-07 — Completed quick task 260407-u8c for Claude fixtures and golden tests
+stopped_at: Completed quick task 260407-ukd for Claude HTTP replay golden tests
+last_updated: "2026-04-07T14:23:41Z"
+last_activity: 2026-04-07 — Completed quick task 260407-ukd for Claude HTTP replay golden tests
 progress:
   total_phases: 4
   completed_phases: 0
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-04-03)
 Phase: 1 of 4 (Brownfield Baseline)
 Plan: 0 of 2 in current phase
 Status: Ready to plan
-Last activity: 2026-04-07 — Completed quick task 260407-u8c for Claude fixtures and golden tests
+Last activity: 2026-04-07 — Completed quick task 260407-ukd for Claude HTTP replay golden tests
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -80,6 +80,7 @@ Recent decisions affecting current work:
 | 260407-ts1 | 2026-04-07 | 基于 Claude Code 源码补充 Claude messages 原生 contract tests，覆盖 stream 终止、事件顺序与 tool use 语义 | Done |
 | 260407-txr | 2026-04-07 | 基于 Claude Code 源码继续补充 Claude messages contract tests，覆盖 interruption、synthetic error 与 tool_result 配对语义 | Done |
 | 260407-u8c | 2026-04-07 | 基于 Claude Code 源码沉淀真实 Claude messages request/stream fixtures，并补充 golden tests 验证原生兼容语义 | Done |
+| 260407-ukd | 2026-04-07 | 基于 Claude Code 源码补充 Claude `/v1/messages` HTTP 端到端 golden replay tests，覆盖 non-stream、stream 与 compat fallback 路径 | Done |
 
 ### Blockers/Concerns
 
@@ -88,6 +89,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-Last session: 2026-04-07T13:52:00Z
-Stopped at: Completed quick task 260407-u8c for Claude fixtures and golden tests
-Resume file: .planning/quick/260407-u8c-claude-code-claude-messages-request-stre/260407-u8c-SUMMARY.md
+Last session: 2026-04-07T14:23:41Z
+Stopped at: Completed quick task 260407-ukd for Claude HTTP replay golden tests
+Resume file: .planning/quick/260407-ukd-claude-code-claude-v1-messages-http-gold/260407-ukd-SUMMARY.md
