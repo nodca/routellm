@@ -956,6 +956,46 @@ mod tests {
     }
 
     #[test]
+    fn claude_responses_adapter_maps_tool_result_only_user_message_to_function_call_outputs() {
+        let request = ClaudeMessageRequest::parse_json(&json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_interrupt",
+                        "is_error": true,
+                        "content": "Interrupted by user"
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_json",
+                        "content": { "ok": true, "attempt": 2 }
+                    }
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let payload = ResponsesProviderAdapter::new()
+            .request_to_payload(&request)
+            .expect("tool_result-only request should map");
+        let input = payload["input"].as_array().expect("input should be array");
+
+        assert_eq!(input.len(), 2);
+        assert!(
+            input
+                .iter()
+                .all(|item| item["type"] == "function_call_output")
+        );
+        assert_eq!(input[0]["call_id"], "call_interrupt");
+        assert_eq!(input[0]["output"], "Interrupted by user");
+        assert_eq!(input[1]["call_id"], "call_json");
+        assert_eq!(input[1]["output"], "{\"attempt\":2,\"ok\":true}");
+    }
+
+    #[test]
     fn claude_responses_adapter_maps_responses_json_back_to_claude_message() {
         let response = ResponsesProviderAdapter::new()
             .response_to_message(
@@ -1024,6 +1064,32 @@ mod tests {
         assert!(done_text.contains("event: message_delta"));
         assert!(done_text.contains("\"stop_reason\":\"tool_use\""));
         assert!(done_text.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn claude_responses_adapter_surfaces_stream_failure_for_client_side_error_synthesis() {
+        let adapter = ResponsesProviderAdapter::new();
+        let mut stream = adapter.stream_event_adapter("claude-sonnet-4-6", "req_123");
+
+        let _ = stream
+            .translate_frame("data: {\"type\":\"response.created\"}\n\n")
+            .expect("created frame should map");
+        let _ = stream
+            .translate_frame("data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}\n\n")
+            .expect("tool call should map");
+
+        let failed = stream
+            .translate_frame(
+                "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"model runtime failed\"}}\n\n",
+            )
+            .expect_err("failed event should surface an error");
+        assert_eq!(failed, "model runtime failed");
+
+        let mut top_level_error = adapter.stream_event_adapter("claude-sonnet-4-6", "req_456");
+        let error = top_level_error
+            .translate_frame("data: {\"type\":\"error\",\"message\":\"gateway exploded\"}\n\n")
+            .expect_err("top-level error event should surface an error");
+        assert_eq!(error, "gateway exploded");
     }
 
     #[test]
