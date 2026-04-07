@@ -1,0 +1,16 @@
+{
+  "model": "claude-sonnet-4-6",
+  "input": [
+    {
+      "type": "function_call_output",
+      "call_id": "call_interrupt",
+      "output": "Interrupted by user"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_json",
+      "output": "{\"attempt\":2,\"ok\":true}"
+    }
+  ],
+  "stream": false
+}

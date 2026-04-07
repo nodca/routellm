@@ -841,67 +841,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn claude_responses_adapter_maps_semantic_request_to_responses_payload() {
-        let request = ClaudeMessageRequest::parse_json(&json!({
-            "model": "claude-sonnet-4-6",
-            "system": [{ "type": "text", "text": "be concise" }],
-            "stream": true,
-            "max_tokens": 64,
-            "temperature": 0.1,
-            "top_p": 0.8,
-            "betas": ["claude-code-20250219", "context-management-2025-06-27"],
-            "thinking": { "type": "enabled", "budget_tokens": 64 },
-            "context_management": { "type": "ephemeral" },
-            "metadata": { "tenant": "ops" },
-            "request_hints": { "service_tier": "priority" },
-            "tool_choice": { "type": "tool", "name": "lookup_weather" },
-            "tools": [{
-                "name": "lookup_weather",
-                "description": "Fetch weather",
-                "input_schema": { "type": "object" }
-            }],
-            "messages": [
-                { "role": "user", "content": [{ "type": "text", "text": "weather?" }] },
-                { "role": "assistant", "content": [{ "type": "text", "text": "calling tool" }] },
-                {
-                    "role": "assistant",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": "call_1",
-                        "name": "lookup_weather",
-                        "input": { "city": "Paris" }
-                    }]
-                },
-                {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": "call_1",
-                        "content": [{ "type": "text", "text": "sunny" }]
-                    }]
-                }
-            ]
-        }))
-        .unwrap();
+    fn claude_responses_adapter_matches_claude_code_tool_cycle_payload_golden() {
+        let request =
+            parse_fixture_request(include_str!("fixtures/claude_code_tool_cycle_request.json"));
 
         let payload = ResponsesProviderAdapter::new()
             .request_to_payload(&request)
             .expect("request should map");
+        let expected_payload: Value = serde_json::from_str(include_str!(
+            "fixtures/claude_code_tool_cycle_responses_payload.json"
+        ))
+        .expect("expected payload fixture should parse");
         let policy = ResponsesProviderAdapter::new().extension_policy(&request);
 
-        assert_eq!(payload["model"], "claude-sonnet-4-6");
-        assert_eq!(payload["instructions"], "be concise");
-        assert_eq!(payload["stream"], true);
-        assert_eq!(payload["max_output_tokens"], 64);
-        assert_eq!(payload["metadata"]["tenant"], "ops");
-        assert_eq!(payload["service_tier"], "priority");
-        assert_eq!(payload["tool_choice"]["name"], "lookup_weather");
-        assert_eq!(payload["tools"][0]["type"], "function");
-        assert_eq!(payload["input"][0]["type"], "message");
-        assert_eq!(payload["input"][0]["role"], "user");
-        assert_eq!(payload["input"][1]["role"], "assistant");
-        assert_eq!(payload["input"][2]["type"], "function_call");
-        assert_eq!(payload["input"][3]["type"], "function_call_output");
+        assert_eq!(payload, expected_payload);
         assert_eq!(policy.service_tier.forwarded.as_deref(), Some("priority"));
         assert_eq!(policy.requested_betas.len(), 2);
         assert_eq!(policy.unsupported_beta_hints.len(), 2);
@@ -956,43 +909,20 @@ mod tests {
     }
 
     #[test]
-    fn claude_responses_adapter_maps_tool_result_only_user_message_to_function_call_outputs() {
-        let request = ClaudeMessageRequest::parse_json(&json!({
-            "model": "claude-sonnet-4-6",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": "call_interrupt",
-                        "is_error": true,
-                        "content": "Interrupted by user"
-                    },
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": "call_json",
-                        "content": { "ok": true, "attempt": 2 }
-                    }
-                ]
-            }]
-        }))
-        .unwrap();
+    fn claude_responses_adapter_matches_interruption_tool_result_payload_golden() {
+        let request = parse_fixture_request(include_str!(
+            "fixtures/claude_code_interruption_tool_results_request.json"
+        ));
 
         let payload = ResponsesProviderAdapter::new()
             .request_to_payload(&request)
             .expect("tool_result-only request should map");
-        let input = payload["input"].as_array().expect("input should be array");
+        let expected_payload: Value = serde_json::from_str(include_str!(
+            "fixtures/claude_code_interruption_responses_payload.json"
+        ))
+        .expect("expected interruption payload should parse");
 
-        assert_eq!(input.len(), 2);
-        assert!(
-            input
-                .iter()
-                .all(|item| item["type"] == "function_call_output")
-        );
-        assert_eq!(input[0]["call_id"], "call_interrupt");
-        assert_eq!(input[0]["output"], "Interrupted by user");
-        assert_eq!(input[1]["call_id"], "call_json");
-        assert_eq!(input[1]["output"], "{\"attempt\":2,\"ok\":true}");
+        assert_eq!(payload, expected_payload);
     }
 
     #[test]
@@ -1067,6 +997,20 @@ mod tests {
     }
 
     #[test]
+    fn claude_responses_adapter_matches_claude_code_stream_golden() {
+        let adapter = ResponsesProviderAdapter::new();
+        let mut stream = adapter.stream_event_adapter("claude-sonnet-4-6", "req_fixture");
+        let actual = translate_fixture_stream(
+            &mut stream,
+            include_str!("fixtures/claude_code_responses_stream_tool_cycle.sse"),
+        )
+        .expect("fixture stream should translate");
+        let expected = include_str!("fixtures/claude_code_anthropic_stream_tool_cycle.sse");
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn claude_responses_adapter_surfaces_stream_failure_for_client_side_error_synthesis() {
         let adapter = ResponsesProviderAdapter::new();
         let mut stream = adapter.stream_event_adapter("claude-sonnet-4-6", "req_123");
@@ -1090,6 +1034,14 @@ mod tests {
             .translate_frame("data: {\"type\":\"error\",\"message\":\"gateway exploded\"}\n\n")
             .expect_err("top-level error event should surface an error");
         assert_eq!(error, "gateway exploded");
+
+        let mut fixture_stream = adapter.stream_event_adapter("claude-sonnet-4-6", "req_fixture");
+        let fixture_error = translate_fixture_stream(
+            &mut fixture_stream,
+            include_str!("fixtures/claude_code_responses_stream_failure.sse"),
+        )
+        .expect_err("failure fixture should surface an error");
+        assert_eq!(fixture_error, "model runtime failed");
     }
 
     #[test]
@@ -1184,5 +1136,28 @@ mod tests {
 
         assert!(text_stop_index < tool_start_index);
         assert!(tool_transition.contains("\"partial_json\":\"{\\\"city\\\":\\\"Paris\\\"}\""));
+    }
+
+    fn parse_fixture_request(raw: &str) -> ClaudeMessageRequest {
+        let value: Value = serde_json::from_str(raw).expect("fixture request should parse");
+        ClaudeMessageRequest::parse_json(&value).expect("fixture request should be valid")
+    }
+
+    fn translate_fixture_stream(
+        stream: &mut AnthropicStreamEventAdapter,
+        fixture: &str,
+    ) -> Result<String, String> {
+        let mut output = String::new();
+        for frame in fixture
+            .split("\n\n")
+            .filter(|frame| !frame.trim().is_empty())
+            .map(|frame| format!("{frame}\n\n"))
+        {
+            let lines = stream.translate_frame(&frame)?;
+            for line in lines {
+                output.push_str(&line);
+            }
+        }
+        Ok(output)
     }
 }

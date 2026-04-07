@@ -1,0 +1,24 @@
+{
+  "model": "claude-sonnet-4-6",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "call_interrupt",
+          "is_error": true,
+          "content": "Interrupted by user"
+        },
+        {
+          "type": "tool_result",
+          "tool_use_id": "call_json",
+          "content": {
+            "ok": true,
+            "attempt": 2
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+data: {"type":"response.created"}
+
+data: {"type":"response.output_text.delta","delta":"Hello"}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"lookup_weather","arguments":"{\"city\":\"Par"}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"is\"}"}
+
+data: {"type":"response.function_call_arguments.done","output_index":0}
+
+data: {"type":"response.completed"}
+
