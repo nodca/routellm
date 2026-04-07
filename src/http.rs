@@ -25,6 +25,10 @@ use uuid::Uuid;
 
 use crate::{
     app::AppState,
+    claude::{
+        responses_adapter::{ResponsesProviderAdapter, ResponsesRequestMode},
+        semantic_core::ClaudeMessageRequest,
+    },
     config::{CooldownPolicy, ManualInterventionPolicy},
     domain::{
         AdminRouteRow, ChannelRow, ChannelRuntimeStats, ModelRouteRow, RequestLogRow,
@@ -104,6 +108,15 @@ struct PreparedPayloads {
     original_value: Value,
     original_json: OnceLock<Bytes>,
     chat_to_responses_json: OnceLock<Bytes>,
+    claude_message: Option<ClaudeMessagePayloads>,
+}
+
+#[derive(Debug)]
+struct ClaudeMessagePayloads {
+    semantic_request: ClaudeMessageRequest,
+    response_adapter: ResponsesProviderAdapter,
+    compat_response_adapter: ResponsesProviderAdapter,
+    anthropic_to_responses_json: OnceLock<Bytes>,
     anthropic_compat_to_responses_json: OnceLock<Bytes>,
 }
 
@@ -120,7 +133,23 @@ impl PreparedPayloads {
             original_value: payload,
             original_json: OnceLock::new(),
             chat_to_responses_json: OnceLock::new(),
-            anthropic_compat_to_responses_json: OnceLock::new(),
+            claude_message: None,
+        }
+    }
+
+    fn for_claude_message(payload: Value, semantic_request: ClaudeMessageRequest) -> Self {
+        Self {
+            original_value: payload,
+            original_json: OnceLock::new(),
+            chat_to_responses_json: OnceLock::new(),
+            claude_message: Some(ClaudeMessagePayloads {
+                semantic_request,
+                response_adapter: ResponsesProviderAdapter::new(),
+                compat_response_adapter: ResponsesProviderAdapter::new()
+                    .with_request_mode(ResponsesRequestMode::AssistantHistoryCompat),
+                anthropic_to_responses_json: OnceLock::new(),
+                anthropic_compat_to_responses_json: OnceLock::new(),
+            }),
         }
     }
 
@@ -153,29 +182,64 @@ impl PreparedPayloads {
                 Ok(bytes)
             }
             DispatchPayloadKind::AnthropicMessagesToResponses => {
-                if let Some(bytes) = self.chat_to_responses_json.get() {
+                let Some(claude_message) = &self.claude_message else {
+                    return Err(AppError::Internal(
+                        "missing claude message adapter state".to_string(),
+                    ));
+                };
+                if let Some(bytes) = claude_message.anthropic_to_responses_json.get() {
                     return Ok(bytes.clone());
                 }
 
-                let adapted = anthropic_messages_to_responses_payload(&self.original_value)?;
+                let adapted = claude_message
+                    .response_adapter
+                    .request_to_payload(&claude_message.semantic_request)?;
                 let bytes = serialize_json_bytes(&adapted)?;
-                let _ = self.chat_to_responses_json.set(bytes.clone());
+                let _ = claude_message
+                    .anthropic_to_responses_json
+                    .set(bytes.clone());
                 Ok(bytes)
             }
             DispatchPayloadKind::AnthropicMessagesToResponsesAssistantHistoryCompat => {
-                if let Some(bytes) = self.anthropic_compat_to_responses_json.get() {
+                let Some(claude_message) = &self.claude_message else {
+                    return Err(AppError::Internal(
+                        "missing claude message adapter state".to_string(),
+                    ));
+                };
+                if let Some(bytes) = claude_message.anthropic_compat_to_responses_json.get() {
                     return Ok(bytes.clone());
                 }
 
-                let adapted =
-                    anthropic_messages_to_responses_payload_assistant_history_compat(
-                        &self.original_value,
-                    )?;
+                let adapted = claude_message
+                    .compat_response_adapter
+                    .request_to_payload(&claude_message.semantic_request)?;
                 let bytes = serialize_json_bytes(&adapted)?;
-                let _ = self.anthropic_compat_to_responses_json.set(bytes.clone());
+                let _ = claude_message
+                    .anthropic_compat_to_responses_json
+                    .set(bytes.clone());
                 Ok(bytes)
             }
         }
+    }
+
+    fn requested_model(&self) -> Option<&str> {
+        self.claude_message
+            .as_ref()
+            .map(|claude_message| claude_message.semantic_request.model.as_str())
+    }
+
+    fn should_retry_with_assistant_history_compat(&self) -> bool {
+        self.claude_message.as_ref().is_some_and(|claude_message| {
+            claude_message
+                .response_adapter
+                .should_retry_with_assistant_history_compat(&claude_message.semantic_request)
+        })
+    }
+
+    fn claude_response_adapter(&self) -> Option<ResponsesProviderAdapter> {
+        self.claude_message
+            .as_ref()
+            .map(|claude_message| claude_message.response_adapter.clone())
     }
 }
 
@@ -268,25 +332,6 @@ struct TokenUsage {
     input_tokens: i64,
     output_tokens: i64,
     total_tokens: i64,
-}
-
-#[derive(Debug, Default, Clone)]
-struct AnthropicStreamState {
-    sent_message_start: bool,
-    text_block_index: Option<usize>,
-    text_block_closed: bool,
-    saw_tool_use: bool,
-    next_block_index: usize,
-    tool_blocks: HashMap<i64, AnthropicToolBlockState>,
-}
-
-#[derive(Debug, Clone)]
-struct AnthropicToolBlockState {
-    block_index: usize,
-    call_id: String,
-    name: String,
-    started: bool,
-    closed: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -657,7 +702,7 @@ pub async fn create_response(
     proxy_request(
         state,
         requested_model,
-        payload,
+        PreparedPayloads::new(payload),
         Protocol::Responses,
         None,
         RequestLogContext::default(),
@@ -677,7 +722,7 @@ pub async fn create_chat_completion(
     proxy_request(
         state,
         requested_model,
-        payload,
+        PreparedPayloads::new(payload),
         Protocol::ChatCompletions,
         None,
         RequestLogContext::default(),
@@ -720,8 +765,8 @@ pub async fn create_message(
         Ok(context) => context,
         Err(error) => return error.into_anthropic_response(&request_id),
     };
-    let payload = match anthropic_payload_with_stream_hint(payload.clone()) {
-        Ok(payload) => payload,
+    let payloads = match build_claude_message_payloads(payload.clone()) {
+        Ok(payloads) => payloads,
         Err(error) => {
             if let Err(log_error) = record_message_ingress_failure(
                 &state,
@@ -739,10 +784,13 @@ pub async fn create_message(
             return error.into_anthropic_response(&request_id);
         }
     };
-    let requested_model = match payload.get("model").and_then(Value::as_str) {
-        Some(model) => model.to_string(),
-        None => {
-            let error = AppError::BadRequest("field `model` is required".to_string());
+    let requested_model = payloads
+        .requested_model()
+        .ok_or_else(|| AppError::BadRequest("field `model` is required".to_string()))
+        .map(ToString::to_string);
+    let requested_model = match requested_model {
+        Ok(model) => model,
+        Err(error) => {
             if let Err(log_error) = record_message_ingress_failure(
                 &state,
                 &request_id,
@@ -763,7 +811,7 @@ pub async fn create_message(
     match proxy_request(
         state,
         requested_model,
-        payload,
+        payloads,
         Protocol::Messages,
         Some(request_id.clone()),
         log_context,
@@ -775,16 +823,12 @@ pub async fn create_message(
     }
 }
 
-fn anthropic_payload_with_stream_hint(mut payload: Value) -> Result<Value, AppError> {
-    let stream = payload
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let object = payload.as_object_mut().ok_or_else(|| {
-        AppError::BadRequest("anthropic payload must be a json object".to_string())
-    })?;
-    object.insert("stream".to_string(), Value::Bool(stream));
-    Ok(payload)
+fn build_claude_message_payloads(payload: Value) -> Result<PreparedPayloads, AppError> {
+    let semantic_request = ClaudeMessageRequest::parse_json(&payload)?;
+    Ok(PreparedPayloads::for_claude_message(
+        payload,
+        semantic_request,
+    ))
 }
 
 fn build_claude_request_log_context(
@@ -1115,11 +1159,7 @@ fn summarize_anthropic_tools(payload: Option<&Value>) -> Value {
 }
 
 fn increment_json_counter(map: &mut Map<String, Value>, key: &str) {
-    let next = map
-        .get(key)
-        .and_then(Value::as_i64)
-        .unwrap_or_default()
-        + 1;
+    let next = map.get(key).and_then(Value::as_i64).unwrap_or_default() + 1;
     map.insert(key.to_string(), Value::from(next));
 }
 
@@ -1140,7 +1180,9 @@ fn json_value_contains_key(value: &Value, needle: &str) -> bool {
         Value::Object(object) => object
             .iter()
             .any(|(key, nested)| key == needle || json_value_contains_key(nested, needle)),
-        Value::Array(items) => items.iter().any(|item| json_value_contains_key(item, needle)),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| json_value_contains_key(item, needle)),
         _ => false,
     }
 }
@@ -1266,7 +1308,7 @@ pub async fn create_gemini_content(
     let proxy_response = proxy_request(
         state,
         requested_model.clone(),
-        chat_payload,
+        PreparedPayloads::new(chat_payload),
         Protocol::ChatCompletions,
         None,
         RequestLogContext::default(),
@@ -1288,12 +1330,11 @@ pub async fn create_gemini_content(
 async fn proxy_request(
     state: AppState,
     requested_model: String,
-    payload: Value,
+    payloads: PreparedPayloads,
     downstream_protocol: Protocol,
     request_id_override: Option<String>,
     log_context: RequestLogContext,
 ) -> Result<Response<Body>, AppError> {
-    let payloads = PreparedPayloads::new(payload);
     let request_id = request_id_override.unwrap_or_else(|| Uuid::new_v4().to_string());
     let route = match state.store.find_route(&requested_model).await {
         Ok(route) => route,
@@ -1471,7 +1512,7 @@ async fn attempt_proxy_request(
     let mut status = upstream_response.status();
     if status.is_server_error()
         && dispatch.payload_kind == DispatchPayloadKind::AnthropicMessagesToResponses
-        && should_retry_with_assistant_text_history_compat(&payloads.original_value)
+        && payloads.should_retry_with_assistant_history_compat()
     {
         tracing::warn!(
             request_id,
@@ -1606,6 +1647,9 @@ async fn attempt_proxy_request(
                     started_at,
                     dispatch.upstream_protocol,
                     log_context.clone(),
+                    payloads
+                        .claude_response_adapter()
+                        .unwrap_or_else(ResponsesProviderAdapter::new),
                 )
                 .await
             }
@@ -1712,9 +1756,10 @@ async fn attempt_proxy_request(
         ResponseAdapter::ResponsesToChatCompletions => {
             responses_json_to_chat_completion(&response_value, requested_model, request_id)
         }
-        ResponseAdapter::ResponsesToAnthropicMessages => {
-            responses_json_to_anthropic_message(&response_value, requested_model, request_id)?
-        }
+        ResponseAdapter::ResponsesToAnthropicMessages => payloads
+            .claude_response_adapter()
+            .unwrap_or_else(ResponsesProviderAdapter::new)
+            .response_to_message(&response_value, requested_model, request_id)?,
         ResponseAdapter::Passthrough => response_value.clone(),
     };
 
@@ -2246,6 +2291,7 @@ async fn proxy_anthropic_message_stream(
     started_at: Instant,
     upstream_protocol: Protocol,
     log_context: RequestLogContext,
+    response_adapter: ResponsesProviderAdapter,
 ) -> Result<Response<Body>, AppError> {
     if upstream_protocol != Protocol::Responses {
         let upstream_url = upstream_response.url().to_string();
@@ -2326,7 +2372,8 @@ async fn proxy_anthropic_message_stream(
 
     tokio::spawn(async move {
         let mut buffer = String::new();
-        let mut stream_state = AnthropicStreamState::default();
+        let mut stream_adapter =
+            response_adapter.stream_event_adapter(&requested_model_for_task, &request_id_for_task);
         let mut stream_error: Option<String> = None;
         let mut downstream_disconnected = false;
 
@@ -2334,12 +2381,7 @@ async fn proxy_anthropic_message_stream(
             buffer.push_str(&String::from_utf8_lossy(&chunk));
             let frames = drain_sse_frames(&mut buffer);
             'first_chunk: for frame in frames {
-                match transform_responses_frame_to_anthropic_sse(
-                    &frame,
-                    &requested_model_for_task,
-                    &request_id_for_task,
-                    &mut stream_state,
-                ) {
+                match stream_adapter.translate_frame(&frame) {
                     Ok(lines) => {
                         for line in lines {
                             if tx.send(Ok(Bytes::from(line))).await.is_err() {
@@ -2364,12 +2406,7 @@ async fn proxy_anthropic_message_stream(
                         buffer.push_str(&String::from_utf8_lossy(&chunk));
                         let frames = drain_sse_frames(&mut buffer);
                         for frame in frames {
-                            match transform_responses_frame_to_anthropic_sse(
-                                &frame,
-                                &requested_model_for_task,
-                                &request_id_for_task,
-                                &mut stream_state,
-                            ) {
+                            match stream_adapter.translate_frame(&frame) {
                                 Ok(lines) => {
                                     for line in lines {
                                         if tx.send(Ok(Bytes::from(line))).await.is_err() {
@@ -3251,372 +3288,6 @@ fn select_last_chance_channel(
         .map(|(channel, _, _)| channel)
 }
 
-fn anthropic_messages_to_responses_payload(payload: &Value) -> Result<Value, AppError> {
-    anthropic_messages_to_responses_payload_with_mode(payload, AssistantTextHistoryMode::NativeRole)
-}
-
-fn anthropic_messages_to_responses_payload_assistant_history_compat(
-    payload: &Value,
-) -> Result<Value, AppError> {
-    anthropic_messages_to_responses_payload_with_mode(
-        payload,
-        AssistantTextHistoryMode::TranscriptUser,
-    )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AssistantTextHistoryMode {
-    NativeRole,
-    TranscriptUser,
-}
-
-fn anthropic_messages_to_responses_payload_with_mode(
-    payload: &Value,
-    assistant_text_mode: AssistantTextHistoryMode,
-) -> Result<Value, AppError> {
-    let model = payload
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or_else(|| AppError::BadRequest("field `model` is required".to_string()))?;
-    let messages = payload
-        .get("messages")
-        .and_then(Value::as_array)
-        .ok_or_else(|| AppError::BadRequest("field `messages` is required".to_string()))?;
-
-    let mut body = Map::new();
-    body.insert("model".to_string(), Value::String(model.to_string()));
-    body.insert(
-        "input".to_string(),
-        Value::Array(anthropic_messages_to_responses_input(
-            messages,
-            assistant_text_mode,
-        )?),
-    );
-
-    copy_optional_field(payload, &mut body, "stream");
-    copy_optional_field(payload, &mut body, "temperature");
-    copy_optional_field(payload, &mut body, "top_p");
-
-    if let Some(system) = payload.get("system") {
-        let system_text = anthropic_system_to_text(system)?;
-        if !system_text.is_empty() {
-            body.insert("instructions".to_string(), Value::String(system_text));
-        }
-    }
-
-    if let Some(max_tokens) = payload.get("max_tokens").cloned() {
-        body.insert("max_output_tokens".to_string(), max_tokens);
-    }
-
-    if let Some(tools) = payload.get("tools") {
-        let tools = tools
-            .as_array()
-            .ok_or_else(|| AppError::BadRequest("field `tools` must be an array".to_string()))?
-            .iter()
-            .map(anthropic_tool_to_responses_tool)
-            .collect::<Result<Vec<_>, _>>()?;
-        body.insert("tools".to_string(), Value::Array(tools));
-    }
-
-    if let Some(tool_choice) = payload.get("tool_choice") {
-        body.insert(
-            "tool_choice".to_string(),
-            anthropic_tool_choice_to_responses_tool_choice(tool_choice)?,
-        );
-    }
-
-    Ok(Value::Object(body))
-}
-
-fn anthropic_messages_to_responses_input(
-    messages: &[Value],
-    assistant_text_mode: AssistantTextHistoryMode,
-) -> Result<Vec<Value>, AppError> {
-    let mut items = Vec::new();
-    for message in messages {
-        items.extend(anthropic_message_to_responses_items(
-            message,
-            assistant_text_mode,
-        )?);
-    }
-    Ok(items)
-}
-
-fn anthropic_message_to_responses_items(
-    message: &Value,
-    assistant_text_mode: AssistantTextHistoryMode,
-) -> Result<Vec<Value>, AppError> {
-    let role = message
-        .get("role")
-        .and_then(Value::as_str)
-        .ok_or_else(|| AppError::BadRequest("anthropic message role is required".to_string()))?;
-    let content = message
-        .get("content")
-        .ok_or_else(|| AppError::BadRequest("anthropic message content is required".to_string()))?;
-
-    match role {
-        "user" | "assistant" => {
-            anthropic_content_to_responses_items(role, content, assistant_text_mode)
-        }
-        other => Err(AppError::BadRequest(format!(
-            "unsupported anthropic message role: {other}"
-        ))),
-    }
-}
-
-fn anthropic_content_to_responses_items(
-    role: &str,
-    content: &Value,
-    assistant_text_mode: AssistantTextHistoryMode,
-) -> Result<Vec<Value>, AppError> {
-    match content {
-        Value::String(text) => Ok(vec![responses_message_item(
-            role,
-            vec![json!({
-                "type": "input_text",
-                "text": transcript_safe_message_text(role, vec![text.to_string()], assistant_text_mode)
-            })],
-            assistant_text_mode,
-        )]),
-        Value::Array(blocks) => {
-            let mut items = Vec::new();
-            let mut text_parts = Vec::new();
-            let mut text_fragments = Vec::new();
-            for block in blocks {
-                let block_type = block.get("type").and_then(Value::as_str).ok_or_else(|| {
-                    AppError::BadRequest("anthropic content block type is required".to_string())
-                })?;
-                match block_type {
-                    "text" => {
-                        let text = block.get("text").and_then(Value::as_str).ok_or_else(|| {
-                            AppError::BadRequest(
-                                "anthropic text block text is required".to_string(),
-                            )
-                        })?;
-                        text_fragments.push(text.to_string());
-                        text_parts.push(json!({ "type": "input_text", "text": text }));
-                    }
-                    "tool_use" => {
-                        let id = block.get("id").and_then(Value::as_str).ok_or_else(|| {
-                            AppError::BadRequest("anthropic tool_use id is required".to_string())
-                        })?;
-                        let name = block.get("name").and_then(Value::as_str).ok_or_else(|| {
-                            AppError::BadRequest("anthropic tool_use name is required".to_string())
-                        })?;
-                        let arguments = block.get("input").cloned().unwrap_or_else(|| json!({}));
-                        items.push(json!({
-                            "type": "function_call",
-                            "call_id": id,
-                            "name": name,
-                            "arguments": serde_json::to_string(&arguments).unwrap()
-                        }));
-                    }
-                    "tool_result" => {
-                        let id = block
-                            .get("tool_use_id")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| {
-                                AppError::BadRequest(
-                                    "anthropic tool_result tool_use_id is required".to_string(),
-                                )
-                            })?;
-                        let output = anthropic_tool_result_to_string(block.get("content"))?;
-                        items.push(json!({
-                            "type": "function_call_output",
-                            "call_id": id,
-                            "output": output
-                        }));
-                    }
-                    other => {
-                        return Err(AppError::BadRequest(format!(
-                            "unsupported anthropic content block type: {other}"
-                        )));
-                    }
-                }
-            }
-
-            if !text_parts.is_empty() {
-                items.insert(
-                    0,
-                    responses_message_item(
-                        role,
-                        if role == "assistant"
-                            && assistant_text_mode == AssistantTextHistoryMode::TranscriptUser
-                        {
-                            vec![json!({
-                                "type": "input_text",
-                                "text": transcript_safe_message_text(
-                                    role,
-                                    text_fragments,
-                                    assistant_text_mode,
-                                )
-                            })]
-                        } else {
-                            text_parts
-                        },
-                        assistant_text_mode,
-                    ),
-                );
-            }
-
-            Ok(items)
-        }
-        _ => Err(AppError::BadRequest(
-            "anthropic message content must be a string or array".to_string(),
-        )),
-    }
-}
-
-fn responses_message_item(
-    role: &str,
-    content: Vec<Value>,
-    assistant_text_mode: AssistantTextHistoryMode,
-) -> Value {
-    let mapped_role =
-        if role == "assistant" && assistant_text_mode == AssistantTextHistoryMode::TranscriptUser {
-            "user"
-        } else {
-            role
-        };
-    json!({
-        "type": "message",
-        "role": mapped_role,
-        "content": content
-    })
-}
-
-fn transcript_safe_message_text(
-    role: &str,
-    text_fragments: Vec<String>,
-    assistant_text_mode: AssistantTextHistoryMode,
-) -> String {
-    let joined = text_fragments.join("\n");
-    if role == "assistant" && assistant_text_mode == AssistantTextHistoryMode::TranscriptUser {
-        format!("Assistant: {joined}")
-    } else {
-        joined
-    }
-}
-
-fn should_retry_with_assistant_text_history_compat(payload: &Value) -> bool {
-    payload
-        .get("messages")
-        .and_then(Value::as_array)
-        .is_some_and(|messages| {
-            messages
-                .iter()
-                .any(anthropic_message_has_plaintext_assistant_history)
-        })
-}
-
-fn anthropic_message_has_plaintext_assistant_history(message: &Value) -> bool {
-    if message.get("role").and_then(Value::as_str) != Some("assistant") {
-        return false;
-    }
-
-    match message.get("content") {
-        Some(Value::String(text)) => !text.trim().is_empty(),
-        Some(Value::Array(blocks)) => {
-            !blocks.is_empty()
-                && blocks.iter().all(|block| {
-                    block.get("type").and_then(Value::as_str) == Some("text")
-                        && block
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .is_some_and(|text| !text.trim().is_empty())
-                })
-        }
-        _ => false,
-    }
-}
-
-fn anthropic_system_to_text(system: &Value) -> Result<String, AppError> {
-    match system {
-        Value::String(text) => Ok(text.to_string()),
-        Value::Array(blocks) => blocks
-            .iter()
-            .map(|block| {
-                block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-                    .ok_or_else(|| {
-                        AppError::BadRequest(
-                            "anthropic system blocks must contain text".to_string(),
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(|parts| parts.join("\n")),
-        _ => Err(AppError::BadRequest(
-            "field `system` must be a string or array".to_string(),
-        )),
-    }
-}
-
-fn anthropic_tool_to_responses_tool(tool: &Value) -> Result<Value, AppError> {
-    let name = tool
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| AppError::BadRequest("anthropic tool name is required".to_string()))?;
-    let mut mapped = Map::new();
-    mapped.insert("type".to_string(), Value::String("function".to_string()));
-    mapped.insert("name".to_string(), Value::String(name.to_string()));
-    if let Some(description) = tool.get("description").cloned() {
-        mapped.insert("description".to_string(), description);
-    }
-    if let Some(schema) = tool.get("input_schema").cloned() {
-        mapped.insert("parameters".to_string(), schema);
-    }
-    Ok(Value::Object(mapped))
-}
-
-fn anthropic_tool_choice_to_responses_tool_choice(tool_choice: &Value) -> Result<Value, AppError> {
-    let Some(tool_type) = tool_choice.get("type").and_then(Value::as_str) else {
-        return Err(AppError::BadRequest(
-            "anthropic tool_choice.type is required".to_string(),
-        ));
-    };
-
-    match tool_type {
-        "auto" => Ok(Value::String("auto".to_string())),
-        "any" => Ok(Value::String("required".to_string())),
-        "tool" => {
-            let name = tool_choice
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    AppError::BadRequest("anthropic tool_choice.name is required".to_string())
-                })?;
-            Ok(json!({ "type": "function", "name": name }))
-        }
-        other => Err(AppError::BadRequest(format!(
-            "unsupported anthropic tool_choice.type: {other}"
-        ))),
-    }
-}
-
-fn anthropic_tool_result_to_string(content: Option<&Value>) -> Result<String, AppError> {
-    match content {
-        None | Some(Value::Null) => Ok(String::new()),
-        Some(Value::String(text)) => Ok(text.to_string()),
-        Some(Value::Array(blocks)) => {
-            let mut parts = Vec::new();
-            for block in blocks {
-                if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    parts.push(text.to_string());
-                }
-            }
-            Ok(parts.join("\n"))
-        }
-        Some(other) => serde_json::to_string(other).map_err(|error| {
-            AppError::Internal(format!(
-                "failed to serialize anthropic tool_result content: {error}"
-            ))
-        }),
-    }
-}
-
 fn chat_completions_to_responses_payload(payload: &Value) -> Result<Value, AppError> {
     let model = payload
         .get("model")
@@ -4327,66 +3998,6 @@ fn responses_json_to_chat_completion(
     })
 }
 
-fn responses_json_to_anthropic_message(
-    response: &Value,
-    requested_model: &str,
-    request_id: &str,
-) -> Result<Value, AppError> {
-    let id = response
-        .get("id")
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("msg_{request_id}"));
-    let content = extract_response_output_text(response);
-    let tool_calls = extract_response_tool_calls(response);
-    let stop_reason = if tool_calls.is_empty() {
-        "end_turn"
-    } else {
-        "tool_use"
-    };
-
-    let mut content_blocks = Vec::new();
-    if !content.is_empty() {
-        content_blocks.push(json!({
-            "type": "text",
-            "text": content
-        }));
-    }
-    for tool_call in tool_calls {
-        let name = tool_call
-            .get("function")
-            .and_then(|function| function.get("name"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let arguments = tool_call
-            .get("function")
-            .and_then(|function| function.get("arguments"))
-            .and_then(Value::as_str)
-            .unwrap_or("{}");
-        let input = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
-        content_blocks.push(json!({
-            "type": "tool_use",
-            "id": tool_call.get("id").and_then(Value::as_str).unwrap_or_default(),
-            "name": name,
-            "input": input
-        }));
-    }
-
-    Ok(json!({
-        "id": id,
-        "type": "message",
-        "role": "assistant",
-        "model": requested_model,
-        "content": content_blocks,
-        "stop_reason": stop_reason,
-        "stop_sequence": Value::Null,
-        "usage": {
-            "input_tokens": response.get("usage").and_then(|usage| usage.get("input_tokens")).and_then(Value::as_i64).unwrap_or(0),
-            "output_tokens": response.get("usage").and_then(|usage| usage.get("output_tokens")).and_then(Value::as_i64).unwrap_or(0)
-        }
-    }))
-}
-
 fn extract_response_output_text(response: &Value) -> String {
     if let Some(text) = response.get("output_text").and_then(Value::as_str) {
         return text.to_string();
@@ -4871,343 +4482,6 @@ fn transform_responses_frame_to_chat_sse(
     }
 }
 
-fn transform_responses_frame_to_anthropic_sse(
-    frame: &str,
-    requested_model: &str,
-    request_id: &str,
-    stream_state: &mut AnthropicStreamState,
-) -> Result<Vec<String>, String> {
-    let Some(data) = extract_sse_data(frame) else {
-        return Ok(Vec::new());
-    };
-
-    if data == "[DONE]" {
-        return Ok(finalize_anthropic_stream(stream_state, None));
-    }
-
-    let event: Value = serde_json::from_str(&data)
-        .map_err(|error| format!("invalid upstream sse json: {error}"))?;
-    let event_type = event
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-
-    match event_type {
-        "response.created" => Ok(ensure_anthropic_message_start(
-            requested_model,
-            request_id,
-            stream_state,
-        )),
-        "response.output_text.delta" => {
-            let delta = event
-                .get("delta")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let mut lines =
-                ensure_anthropic_message_start(requested_model, request_id, stream_state);
-            if delta.is_empty() {
-                return Ok(lines);
-            }
-            let block_index = ensure_anthropic_text_block(stream_state, &mut lines);
-            lines.push(anthropic_content_block_delta_line(
-                block_index,
-                json!({ "type": "text_delta", "text": delta }),
-            ));
-            Ok(lines)
-        }
-        "response.output_item.added" => {
-            let item = event.get("item").ok_or("missing response output item")?;
-            if item.get("type").and_then(Value::as_str) != Some("function_call") {
-                return Ok(Vec::new());
-            }
-
-            let output_index = event
-                .get("output_index")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            let call_id = item
-                .get("call_id")
-                .and_then(Value::as_str)
-                .or_else(|| item.get("id").and_then(Value::as_str))
-                .unwrap_or_default()
-                .to_string();
-            let name = item
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let arguments = item
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-
-            let mut lines =
-                ensure_anthropic_message_start(requested_model, request_id, stream_state);
-            close_anthropic_text_block(stream_state, &mut lines);
-            let mut saw_tool_use = false;
-            let mut block_index = 0usize;
-            {
-                let block = anthropic_tool_block_state(output_index, call_id, name, stream_state);
-                block_index = block.block_index;
-                if !block.started {
-                    lines.push(anthropic_content_block_start_line(
-                        block.block_index,
-                        json!({
-                            "type": "tool_use",
-                            "id": block.call_id,
-                            "name": block.name,
-                            "input": {}
-                        }),
-                    ));
-                    block.started = true;
-                    saw_tool_use = true;
-                }
-            }
-            if saw_tool_use {
-                stream_state.saw_tool_use = true;
-            }
-            if !arguments.is_empty() {
-                lines.push(anthropic_content_block_delta_line(
-                    block_index,
-                    json!({ "type": "input_json_delta", "partial_json": arguments }),
-                ));
-            }
-            Ok(lines)
-        }
-        "response.function_call_arguments.delta" => {
-            let output_index = event
-                .get("output_index")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            let delta = event
-                .get("delta")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if delta.is_empty() {
-                return Ok(Vec::new());
-            }
-            let mut lines =
-                ensure_anthropic_message_start(requested_model, request_id, stream_state);
-            close_anthropic_text_block(stream_state, &mut lines);
-            let mut saw_tool_use = false;
-            let mut block_index = 0usize;
-            {
-                let block = anthropic_tool_block_state(
-                    output_index,
-                    format!("call_{output_index}"),
-                    String::new(),
-                    stream_state,
-                );
-                block_index = block.block_index;
-                if !block.started {
-                    lines.push(anthropic_content_block_start_line(
-                        block.block_index,
-                        json!({
-                            "type": "tool_use",
-                            "id": block.call_id,
-                            "name": block.name,
-                            "input": {}
-                        }),
-                    ));
-                    block.started = true;
-                    saw_tool_use = true;
-                }
-            }
-            if saw_tool_use {
-                stream_state.saw_tool_use = true;
-            }
-            lines.push(anthropic_content_block_delta_line(
-                block_index,
-                json!({ "type": "input_json_delta", "partial_json": delta }),
-            ));
-            Ok(lines)
-        }
-        "response.function_call_arguments.done" => {
-            let output_index = event
-                .get("output_index")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            let mut lines = Vec::new();
-            if let Some(block) = stream_state.tool_blocks.get_mut(&output_index) {
-                if !block.closed {
-                    lines.push(anthropic_content_block_stop_line(block.block_index));
-                    block.closed = true;
-                }
-            }
-            Ok(lines)
-        }
-        "response.completed" => Ok(finalize_anthropic_stream(
-            stream_state,
-            Some(if stream_state.saw_tool_use {
-                "tool_use"
-            } else {
-                "end_turn"
-            }),
-        )),
-        "response.failed" | "error" => {
-            let message = event
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
-                .or_else(|| event.get("message").and_then(Value::as_str))
-                .unwrap_or("upstream reported stream failure");
-            Err(message.to_string())
-        }
-        _ => Ok(Vec::new()),
-    }
-}
-
-fn ensure_anthropic_message_start(
-    requested_model: &str,
-    request_id: &str,
-    stream_state: &mut AnthropicStreamState,
-) -> Vec<String> {
-    if stream_state.sent_message_start {
-        return Vec::new();
-    }
-    stream_state.sent_message_start = true;
-    vec![anthropic_event_line(
-        "message_start",
-        json!({
-            "type": "message_start",
-            "message": {
-                "id": format!("msg_{request_id}"),
-                "type": "message",
-                "role": "assistant",
-                "model": requested_model,
-                "content": [],
-                "stop_reason": Value::Null,
-                "stop_sequence": Value::Null,
-                "usage": { "input_tokens": 0, "output_tokens": 0 }
-            }
-        }),
-    )]
-}
-
-fn ensure_anthropic_text_block(
-    stream_state: &mut AnthropicStreamState,
-    lines: &mut Vec<String>,
-) -> usize {
-    if let Some(index) = stream_state.text_block_index {
-        return index;
-    }
-    let index = stream_state.next_block_index;
-    stream_state.next_block_index += 1;
-    stream_state.text_block_index = Some(index);
-    stream_state.text_block_closed = false;
-    lines.push(anthropic_content_block_start_line(
-        index,
-        json!({ "type": "text", "text": "" }),
-    ));
-    index
-}
-
-fn close_anthropic_text_block(stream_state: &mut AnthropicStreamState, lines: &mut Vec<String>) {
-    if let Some(index) = stream_state.text_block_index {
-        if !stream_state.text_block_closed {
-            lines.push(anthropic_content_block_stop_line(index));
-            stream_state.text_block_closed = true;
-        }
-    }
-}
-
-fn anthropic_tool_block_state<'a>(
-    output_index: i64,
-    call_id: String,
-    name: String,
-    stream_state: &'a mut AnthropicStreamState,
-) -> &'a mut AnthropicToolBlockState {
-    stream_state
-        .tool_blocks
-        .entry(output_index)
-        .or_insert_with(|| {
-            let block_index = stream_state.next_block_index;
-            stream_state.next_block_index += 1;
-            AnthropicToolBlockState {
-                block_index,
-                call_id,
-                name,
-                started: false,
-                closed: false,
-            }
-        })
-}
-
-fn finalize_anthropic_stream(
-    stream_state: &mut AnthropicStreamState,
-    stop_reason: Option<&str>,
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    close_anthropic_text_block(stream_state, &mut lines);
-    let mut indices = stream_state.tool_blocks.keys().copied().collect::<Vec<_>>();
-    indices.sort_unstable();
-    for index in indices {
-        if let Some(block) = stream_state.tool_blocks.get_mut(&index) {
-            if block.started && !block.closed {
-                lines.push(anthropic_content_block_stop_line(block.block_index));
-                block.closed = true;
-            }
-        }
-    }
-    if let Some(stop_reason) = stop_reason {
-        lines.push(anthropic_event_line(
-            "message_delta",
-            json!({
-                "type": "message_delta",
-                "delta": {
-                    "stop_reason": stop_reason,
-                    "stop_sequence": Value::Null
-                },
-                "usage": { "output_tokens": 0 }
-            }),
-        ));
-    }
-    lines.push(anthropic_event_line(
-        "message_stop",
-        json!({ "type": "message_stop" }),
-    ));
-    lines
-}
-
-fn anthropic_content_block_start_line(index: usize, content_block: Value) -> String {
-    anthropic_event_line(
-        "content_block_start",
-        json!({
-            "type": "content_block_start",
-            "index": index,
-            "content_block": content_block
-        }),
-    )
-}
-
-fn anthropic_content_block_delta_line(index: usize, delta: Value) -> String {
-    anthropic_event_line(
-        "content_block_delta",
-        json!({
-            "type": "content_block_delta",
-            "index": index,
-            "delta": delta
-        }),
-    )
-}
-
-fn anthropic_content_block_stop_line(index: usize) -> String {
-    anthropic_event_line(
-        "content_block_stop",
-        json!({
-            "type": "content_block_stop",
-            "index": index
-        }),
-    )
-}
-
-fn anthropic_event_line(event_name: &str, payload: Value) -> String {
-    format!(
-        "event: {event_name}\ndata: {}\n\n",
-        serde_json::to_string(&payload).unwrap()
-    )
-}
-
 fn lookup_or_assign_tool_call_index(
     tool_call_indices: &mut HashMap<i64, usize>,
     next_tool_call_index: &mut usize,
@@ -5405,6 +4679,8 @@ fn truncate(message: &str, max_len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{DispatchPayloadKind, build_claude_message_payloads};
+
     use std::{
         net::SocketAddr,
         path::PathBuf,
@@ -5645,11 +4921,8 @@ mod tests {
         addr
     }
 
-    async fn spawn_assistant_history_sensitive_upstream() -> (
-        SocketAddr,
-        Arc<AtomicUsize>,
-        Arc<Mutex<Vec<Value>>>,
-    ) {
+    async fn spawn_assistant_history_sensitive_upstream()
+    -> (SocketAddr, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
         let attempts = Arc::new(AtomicUsize::new(0));
         let captured_requests = Arc::new(Mutex::new(Vec::new()));
         let attempts_for_handler = attempts.clone();
@@ -9225,13 +8498,17 @@ mod tests {
         let captured = captured_requests.lock().unwrap();
         assert_eq!(captured.len(), 2);
         let first_input = captured[0]["input"].as_array().unwrap();
-        assert!(first_input.iter().any(|item| {
-            item["type"] == "message" && item["role"] == "assistant"
-        }));
+        assert!(
+            first_input
+                .iter()
+                .any(|item| { item["type"] == "message" && item["role"] == "assistant" })
+        );
         let second_input = captured[1]["input"].as_array().unwrap();
-        assert!(!second_input.iter().any(|item| {
-            item["type"] == "message" && item["role"] == "assistant"
-        }));
+        assert!(
+            !second_input
+                .iter()
+                .any(|item| { item["type"] == "message" && item["role"] == "assistant" })
+        );
         assert!(second_input.iter().any(|item| {
             item["type"] == "message"
                 && item["role"] == "user"
@@ -9252,7 +8529,8 @@ mod tests {
             ]
         });
 
-        let prepared = build_claude_message_payloads(payload.clone()).expect("payload should prepare");
+        let prepared =
+            build_claude_message_payloads(payload.clone()).expect("payload should prepare");
         let adapted = serde_json::from_slice::<Value>(
             &prepared
                 .bytes_for(DispatchPayloadKind::AnthropicMessagesToResponses)

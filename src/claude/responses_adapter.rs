@@ -528,7 +528,8 @@ fn transcript_safe_message_text(
     assistant_text_mode: AssistantTextHistoryMode,
 ) -> String {
     let joined = text_fragments.join("\n");
-    if role == ClaudeRole::Assistant && assistant_text_mode == AssistantTextHistoryMode::TranscriptUser
+    if role == ClaudeRole::Assistant
+        && assistant_text_mode == AssistantTextHistoryMode::TranscriptUser
     {
         format!("Assistant: {joined}")
     } else {
@@ -541,7 +542,10 @@ fn map_tool_definition(tool: &ClaudeToolDefinition) -> Result<Value, AppError> {
     mapped.insert("type".to_string(), Value::String("function".to_string()));
     mapped.insert("name".to_string(), Value::String(tool.name.to_string()));
     if let Some(description) = &tool.description {
-        mapped.insert("description".to_string(), Value::String(description.to_string()));
+        mapped.insert(
+            "description".to_string(),
+            Value::String(description.to_string()),
+        );
     }
     if let Some(schema) = &tool.input_schema {
         mapped.insert("parameters".to_string(), schema.clone());
@@ -909,7 +913,9 @@ mod tests {
         assert!(created.join("").contains("event: message_start"));
 
         let delta = stream
-            .translate_frame("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n")
+            .translate_frame(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n",
+            )
             .expect("text delta should map");
         let text = delta.join("");
         assert!(text.contains("event: content_block_start"));

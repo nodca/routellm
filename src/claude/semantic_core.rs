@@ -166,11 +166,15 @@ impl ClaudeMessageRequest {
     }
 
     pub fn system_text(&self) -> Option<String> {
-        self.system.as_ref().map(ClaudeSystemPrompt::normalized_text)
+        self.system
+            .as_ref()
+            .map(ClaudeSystemPrompt::normalized_text)
     }
 
     pub fn has_plaintext_assistant_history(&self) -> bool {
-        self.messages.iter().any(ClaudeMessage::is_plaintext_assistant)
+        self.messages
+            .iter()
+            .any(ClaudeMessage::is_plaintext_assistant)
     }
 }
 
@@ -369,7 +373,10 @@ fn parse_tool_definition(value: &Value) -> Result<ClaudeToolDefinition, AppError
             "anthropic tool name is required",
             "anthropic tool name must be a string",
         )?,
-        description: optional_string(object.get("description"), "anthropic tool description must be a string")?,
+        description: optional_string(
+            object.get("description"),
+            "anthropic tool description must be a string",
+        )?,
         input_schema: object.get("input_schema").cloned(),
     })
 }
@@ -512,7 +519,10 @@ mod tests {
         assert_eq!(request.model, "claude-sonnet-4-6");
         assert!(request.stream);
         assert_eq!(request.max_tokens, Some(256));
-        assert_eq!(request.system_text().as_deref(), Some("you are helpful\nstay terse"));
+        assert_eq!(
+            request.system_text().as_deref(),
+            Some("you are helpful\nstay terse")
+        );
         assert_eq!(request.tools.len(), 1);
         assert_eq!(
             request.tool_choice,
@@ -542,7 +552,9 @@ mod tests {
         }))
         .expect_err("invalid roles should fail");
 
-        assert!(matches!(error, AppError::BadRequest(message) if message.contains("unsupported anthropic message role")));
+        assert!(
+            matches!(error, AppError::BadRequest(message) if message.contains("unsupported anthropic message role"))
+        );
     }
 
     #[test]
@@ -556,7 +568,9 @@ mod tests {
         }))
         .expect_err("malformed blocks should fail");
 
-        assert!(matches!(error, AppError::BadRequest(message) if message.contains("anthropic tool_use id is required")));
+        assert!(
+            matches!(error, AppError::BadRequest(message) if message.contains("anthropic tool_use id is required"))
+        );
     }
 
     #[test]
@@ -564,6 +578,8 @@ mod tests {
         let error = ClaudeMessageRequest::parse_json(&json!({ "stream": false }))
             .expect_err("missing required fields should fail");
 
-        assert!(matches!(error, AppError::BadRequest(message) if message.contains("field `model` is required")));
+        assert!(
+            matches!(error, AppError::BadRequest(message) if message.contains("field `model` is required"))
+        );
     }
 }
