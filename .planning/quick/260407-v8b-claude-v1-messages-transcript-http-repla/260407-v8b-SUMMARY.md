@@ -47,4 +47,5 @@
 - `386ce4f` `feat(quick-260407-v8b-claude-v1-messages-transcript-http-repla-01): add claude transcript replay fixtures`
 - `d7f0315` `test(quick-260407-v8b-claude-v1-messages-transcript-http-repla-01): extend claude http replay coverage`
 - `9d93aef` `fix(quick-260407-v8b-claude-v1-messages-transcript-http-repla-01): preserve claude message error fidelity`
+- `fb3328e` `fix(quick-260407-v8b-claude-v1-messages-transcript-http-repla-01): align followup replay goldens`
 - `f9abb6c` `fix(quick-260407-v8b-claude-v1-messages-transcript-http-repla-01): thread upstream metadata through anthropic errors`
