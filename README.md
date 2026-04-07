@@ -7,7 +7,7 @@
 - 单二进制部署
 - 请求自动路由
 - 支持 TUI 管理、主动一键测活、运行状态查看
-- 支持在claude code中使用Openai兼容模型
+- 支持在claude code中使用openai兼容模型
 - 支持导入cc-switch已配置模型
 
 ## 核心概念
