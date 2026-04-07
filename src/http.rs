@@ -773,6 +773,34 @@ fn build_claude_request_log_context(
             })
     });
     let anthropic_beta = header_csv_values(headers, "anthropic-beta");
+    let message_summaries = summarize_anthropic_messages(payload);
+    let total_text_chars = message_summaries
+        .iter()
+        .map(|summary| {
+            summary
+                .get("text_chars")
+                .and_then(Value::as_i64)
+                .unwrap_or_default()
+        })
+        .sum::<i64>();
+    let total_tool_result_count = message_summaries
+        .iter()
+        .map(|summary| {
+            summary
+                .get("tool_result_count")
+                .and_then(Value::as_i64)
+                .unwrap_or_default()
+        })
+        .sum::<i64>();
+    let total_tool_result_chars = message_summaries
+        .iter()
+        .map(|summary| {
+            summary
+                .get("tool_result_serialized_chars")
+                .and_then(Value::as_i64)
+                .unwrap_or_default()
+        })
+        .sum::<i64>();
     let fingerprint = json!({
         "headers": {
             "anthropic_beta": anthropic_beta,
@@ -785,10 +813,18 @@ fn build_claude_request_log_context(
         },
         "body": {
             "top_level_keys": top_level_keys,
+            "payload_bytes": payload
+                .and_then(|body| serde_json::to_vec(body).ok())
+                .map(|bytes| bytes.len() as i64),
             "stream": payload.and_then(|body| body.get("stream")).and_then(Value::as_bool),
             "message_count": message_count,
+            "messages": message_summaries,
+            "messages_total_text_chars": total_text_chars,
+            "messages_total_tool_result_count": total_tool_result_count,
+            "messages_total_tool_result_serialized_chars": total_tool_result_chars,
             "system_present": payload.and_then(|body| body.get("system")).is_some_and(|value| !value.is_null()),
             "tool_count": tool_count,
+            "tools_summary": summarize_anthropic_tools(payload),
             "tool_choice_type": tool_choice_type,
             "thinking_present": payload.and_then(|body| body.get("thinking")).is_some_and(|value| !value.is_null()),
             "context_management_present": payload.and_then(|body| body.get("context_management")).is_some_and(|value| !value.is_null()),
@@ -808,6 +844,258 @@ fn build_claude_request_log_context(
             ))
         })?),
     })
+}
+
+fn summarize_anthropic_messages(payload: Option<&Value>) -> Vec<Value> {
+    payload
+        .and_then(|body| body.get("messages"))
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .map(summarize_anthropic_message)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn summarize_anthropic_message(message: &Value) -> Value {
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let Some(content) = message.get("content") else {
+        return json!({
+            "role": role,
+            "content_kind": "missing"
+        });
+    };
+
+    match content {
+        Value::String(text) => json!({
+            "role": role,
+            "content_kind": "string",
+            "content_block_count": 1,
+            "block_types_head": ["text"],
+            "block_type_counts": { "text": 1 },
+            "text_chars": text.len() as i64,
+            "tool_use_count": 0,
+            "tool_result_count": 0,
+            "tool_result_is_error_count": 0,
+            "tool_result_serialized_chars": 0,
+            "tool_result_content_kind_counts": {},
+            "tool_result_array_item_type_counts": {},
+            "tool_result_non_text_array_item_types": Vec::<String>::new(),
+            "has_tool_result_and_other_blocks": false
+        }),
+        Value::Array(blocks) => {
+            let mut block_type_counts = Map::new();
+            let mut block_types_head = Vec::new();
+            let mut text_chars = 0i64;
+            let mut tool_use_count = 0i64;
+            let mut tool_result_count = 0i64;
+            let mut tool_result_is_error_count = 0i64;
+            let mut tool_result_serialized_chars = 0i64;
+            let mut tool_result_content_kind_counts = Map::new();
+            let mut tool_result_array_item_type_counts = Map::new();
+            let mut tool_result_non_text_array_item_types = HashSet::new();
+
+            for block in blocks {
+                let block_type = block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                if block_types_head.len() < 16 {
+                    block_types_head.push(block_type.to_string());
+                }
+                increment_json_counter(&mut block_type_counts, block_type);
+
+                match block_type {
+                    "text" => {
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            text_chars += text.len() as i64;
+                        }
+                    }
+                    "tool_use" => {
+                        tool_use_count += 1;
+                    }
+                    "tool_result" => {
+                        tool_result_count += 1;
+                        if block
+                            .get("is_error")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            tool_result_is_error_count += 1;
+                        }
+                        summarize_tool_result_content(
+                            block.get("content"),
+                            &mut tool_result_serialized_chars,
+                            &mut tool_result_content_kind_counts,
+                            &mut tool_result_array_item_type_counts,
+                            &mut tool_result_non_text_array_item_types,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+
+            let mut non_text_array_item_types = tool_result_non_text_array_item_types
+                .into_iter()
+                .collect::<Vec<_>>();
+            non_text_array_item_types.sort();
+
+            json!({
+                "role": role,
+                "content_kind": "array",
+                "content_block_count": blocks.len() as i64,
+                "block_types_head": block_types_head,
+                "block_type_counts": block_type_counts,
+                "text_chars": text_chars,
+                "tool_use_count": tool_use_count,
+                "tool_result_count": tool_result_count,
+                "tool_result_is_error_count": tool_result_is_error_count,
+                "tool_result_serialized_chars": tool_result_serialized_chars,
+                "tool_result_content_kind_counts": tool_result_content_kind_counts,
+                "tool_result_array_item_type_counts": tool_result_array_item_type_counts,
+                "tool_result_non_text_array_item_types": non_text_array_item_types,
+                "has_tool_result_and_other_blocks": tool_result_count > 0 && blocks.len() as i64 > tool_result_count
+            })
+        }
+        other => json!({
+            "role": role,
+            "content_kind": json_value_kind(Some(other))
+        }),
+    }
+}
+
+fn summarize_tool_result_content(
+    content: Option<&Value>,
+    serialized_chars_total: &mut i64,
+    content_kind_counts: &mut Map<String, Value>,
+    array_item_type_counts: &mut Map<String, Value>,
+    non_text_array_item_types: &mut HashSet<String>,
+) {
+    increment_json_counter(content_kind_counts, json_value_kind(content));
+
+    let Some(content) = content else {
+        return;
+    };
+
+    if let Ok(serialized) = serde_json::to_string(content) {
+        *serialized_chars_total += serialized.len() as i64;
+    }
+
+    if let Value::Array(items) = content {
+        for item in items {
+            let item_type = item
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            increment_json_counter(array_item_type_counts, item_type);
+            if item_type != "text" {
+                non_text_array_item_types.insert(item_type.to_string());
+            }
+        }
+    }
+}
+
+fn summarize_anthropic_tools(payload: Option<&Value>) -> Value {
+    let Some(tools) = payload
+        .and_then(|body| body.get("tools"))
+        .and_then(Value::as_array)
+    else {
+        return json!({
+            "input_schema_count": 0,
+            "schema_bytes_total": 0,
+            "schema_bytes_max": 0,
+            "description_chars_max": 0,
+            "name_chars_max": 0,
+            "schema_keyword_tool_counts": {}
+        });
+    };
+
+    let mut schema_bytes_total = 0i64;
+    let mut schema_bytes_max = 0i64;
+    let mut description_chars_max = 0i64;
+    let mut name_chars_max = 0i64;
+    let mut input_schema_count = 0i64;
+    let mut schema_keyword_tool_counts = Map::new();
+
+    for tool in tools {
+        if let Some(name) = tool.get("name").and_then(Value::as_str) {
+            name_chars_max = name_chars_max.max(name.len() as i64);
+        }
+        if let Some(description) = tool.get("description").and_then(Value::as_str) {
+            description_chars_max = description_chars_max.max(description.len() as i64);
+        }
+
+        let Some(schema) = tool.get("input_schema") else {
+            continue;
+        };
+        input_schema_count += 1;
+
+        if let Ok(serialized) = serde_json::to_vec(schema) {
+            let size = serialized.len() as i64;
+            schema_bytes_total += size;
+            schema_bytes_max = schema_bytes_max.max(size);
+        }
+
+        for keyword in [
+            "anyOf",
+            "oneOf",
+            "allOf",
+            "$ref",
+            "enum",
+            "const",
+            "patternProperties",
+            "additionalProperties",
+        ] {
+            if json_value_contains_key(schema, keyword) {
+                increment_json_counter(&mut schema_keyword_tool_counts, keyword);
+            }
+        }
+    }
+
+    json!({
+        "input_schema_count": input_schema_count,
+        "schema_bytes_total": schema_bytes_total,
+        "schema_bytes_max": schema_bytes_max,
+        "description_chars_max": description_chars_max,
+        "name_chars_max": name_chars_max,
+        "schema_keyword_tool_counts": schema_keyword_tool_counts
+    })
+}
+
+fn increment_json_counter(map: &mut Map<String, Value>, key: &str) {
+    let next = map
+        .get(key)
+        .and_then(Value::as_i64)
+        .unwrap_or_default()
+        + 1;
+    map.insert(key.to_string(), Value::from(next));
+}
+
+fn json_value_kind(value: Option<&Value>) -> &'static str {
+    match value {
+        None => "missing",
+        Some(Value::Null) => "null",
+        Some(Value::Bool(_)) => "bool",
+        Some(Value::Number(_)) => "number",
+        Some(Value::String(_)) => "string",
+        Some(Value::Array(_)) => "array",
+        Some(Value::Object(_)) => "object",
+    }
+}
+
+fn json_value_contains_key(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::Object(object) => object
+            .iter()
+            .any(|(key, nested)| key == needle || json_value_contains_key(nested, needle)),
+        Value::Array(items) => items.iter().any(|item| json_value_contains_key(item, needle)),
+        _ => false,
+    }
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -8062,9 +8350,35 @@ mod tests {
             true
         );
         assert_eq!(log["claude_request_fingerprint"]["body"]["tool_count"], 1);
+        assert!(
+            log["claude_request_fingerprint"]["body"]["payload_bytes"]
+                .as_i64()
+                .unwrap()
+                > 0
+        );
         assert_eq!(
             log["claude_request_fingerprint"]["body"]["tool_choice_type"],
             "auto"
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["body"]["messages"][0]["role"],
+            "user"
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["body"]["messages"][0]["block_types_head"][0],
+            "text"
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["body"]["messages"][0]["text_chars"],
+            29
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["body"]["messages_total_tool_result_count"],
+            0
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["body"]["tools_summary"]["input_schema_count"],
+            1
         );
         assert_eq!(
             log["claude_request_fingerprint"]["body"]["system_present"],
