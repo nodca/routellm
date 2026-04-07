@@ -27,6 +27,10 @@ fn route_rank_key(channel: &ChannelRow, protocol_cost: u8) -> (i64, u8, i64, i64
     )
 }
 
+fn channel_has_unresolved_failure(channel: &ChannelRow) -> bool {
+    channel.needs_reprobe != 0
+}
+
 pub fn decide_route(
     requested_model: &str,
     _route: &ModelRouteRow,
@@ -58,6 +62,7 @@ pub fn ordered_eligible_channel_refs(
                 || channel.site_status != "active"
                 || channel.manual_blocked != 0
                 || channel.cooldown_until.is_some_and(|until| until > now_ts)
+                || channel_has_unresolved_failure(channel)
             {
                 return None;
             }
@@ -121,6 +126,12 @@ pub fn inspect_candidates(
                         "cooling down until {}",
                         channel.cooldown_until.unwrap_or_default()
                     ),
+                    None,
+                )
+            } else if channel_has_unresolved_failure(&channel) {
+                (
+                    false,
+                    "channel unavailable; waiting for successful recovery probe".to_string(),
                     None,
                 )
             } else if let Ok(channel_protocol) = parsed_protocol {
@@ -240,6 +251,7 @@ mod tests {
             cooldown_until,
             manual_blocked: 0,
             consecutive_fail_count: 0,
+            needs_reprobe: 0,
             last_status: None,
             last_error: None,
         }

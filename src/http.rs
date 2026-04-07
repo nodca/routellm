@@ -81,12 +81,14 @@ pub struct UpdateChannelRequest {
 enum ResponseAdapter {
     Passthrough,
     ResponsesToChatCompletions,
+    ResponsesToAnthropicMessages,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum DispatchPayloadKind {
     Original,
     ChatCompletionsToResponses,
+    AnthropicMessagesToResponses,
 }
 
 #[derive(Debug)]
@@ -136,6 +138,16 @@ impl PreparedPayloads {
                 }
 
                 let adapted = chat_completions_to_responses_payload(&self.original_value)?;
+                let bytes = serialize_json_bytes(&adapted)?;
+                let _ = self.chat_to_responses_json.set(bytes.clone());
+                Ok(bytes)
+            }
+            DispatchPayloadKind::AnthropicMessagesToResponses => {
+                if let Some(bytes) = self.chat_to_responses_json.get() {
+                    return Ok(bytes.clone());
+                }
+
+                let adapted = anthropic_messages_to_responses_payload(&self.original_value)?;
                 let bytes = serialize_json_bytes(&adapted)?;
                 let _ = self.chat_to_responses_json.set(bytes.clone());
                 Ok(bytes)
@@ -202,6 +214,25 @@ struct TokenUsage {
     input_tokens: i64,
     output_tokens: i64,
     total_tokens: i64,
+}
+
+#[derive(Debug, Default, Clone)]
+struct AnthropicStreamState {
+    sent_message_start: bool,
+    text_block_index: Option<usize>,
+    text_block_closed: bool,
+    saw_tool_use: bool,
+    next_block_index: usize,
+    tool_blocks: HashMap<i64, AnthropicToolBlockState>,
+}
+
+#[derive(Debug, Clone)]
+struct AnthropicToolBlockState {
+    block_index: usize,
+    call_id: String,
+    name: String,
+    started: bool,
+    closed: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -543,6 +574,22 @@ pub async fn delete_channel(
     )
 }
 
+pub async fn list_models(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let routes = state.store.list_export_routes().await?;
+    Ok(Json(json!({
+        "data": routes
+            .into_iter()
+            .map(|route| json!({
+                "id": route.model_pattern,
+                "type": "model",
+                "display_name": route.model_pattern,
+                "created_at": now_ts(),
+                "object": "model"
+            }))
+            .collect::<Vec<_>>()
+    })))
+}
+
 pub async fn create_response(
     State(state): State<AppState>,
     Json(payload): Json<Value>,
@@ -578,7 +625,29 @@ pub async fn create_message(
         .ok_or_else(|| AppError::BadRequest("field `model` is required".to_string()))?
         .to_string();
 
+    let use_responses_adapter = payload
+        .get("anthropic-beta")
+        .and_then(Value::as_array)
+        .is_some();
+
+    if use_responses_adapter {
+        let payload = anthropic_payload_with_stream_hint(payload)?;
+        return proxy_request(state, requested_model, payload, Protocol::Messages).await;
+    }
+
     proxy_request(state, requested_model, payload, Protocol::Messages).await
+}
+
+fn anthropic_payload_with_stream_hint(mut payload: Value) -> Result<Value, AppError> {
+    let stream = payload
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let object = payload.as_object_mut().ok_or_else(|| {
+        AppError::BadRequest("anthropic payload must be a json object".to_string())
+    })?;
+    object.insert("stream".to_string(), Value::Bool(stream));
+    Ok(payload)
 }
 
 pub async fn create_gemini_content(
@@ -763,6 +832,54 @@ async fn attempt_proxy_request(
         return Err(AppError::UpstreamStatus(message, status));
     }
 
+    if is_stream {
+        return match dispatch.response_adapter {
+            ResponseAdapter::Passthrough => {
+                proxy_passthrough_stream(
+                    state,
+                    route,
+                    selected,
+                    request_id.to_string(),
+                    requested_model.to_string(),
+                    status,
+                    headers,
+                    upstream_response,
+                    started_at,
+                    downstream_protocol,
+                    dispatch.upstream_protocol,
+                    !is_stream,
+                )
+                .await
+            }
+            ResponseAdapter::ResponsesToChatCompletions => {
+                proxy_chat_completions_stream(
+                    state,
+                    route,
+                    selected,
+                    request_id.to_string(),
+                    requested_model.to_string(),
+                    upstream_response,
+                    started_at,
+                    dispatch.upstream_protocol,
+                )
+                .await
+            }
+            ResponseAdapter::ResponsesToAnthropicMessages => {
+                proxy_anthropic_message_stream(
+                    state,
+                    route,
+                    selected,
+                    request_id.to_string(),
+                    requested_model.to_string(),
+                    upstream_response,
+                    started_at,
+                    dispatch.upstream_protocol,
+                )
+                .await
+            }
+        };
+    }
+
     if dispatch.response_adapter == ResponseAdapter::Passthrough && !is_stream {
         return proxy_nonstream_passthrough_json(
             state,
@@ -853,8 +970,17 @@ async fn attempt_proxy_request(
         }
     };
     let token_usage = extract_usage_from_value(dispatch.upstream_protocol, &response_value);
-    let chat_response =
-        responses_json_to_chat_completion(&response_value, requested_model, request_id);
+
+    let downstream_value = match dispatch.response_adapter {
+        ResponseAdapter::ResponsesToChatCompletions => {
+            responses_json_to_chat_completion(&response_value, requested_model, request_id)
+        }
+        ResponseAdapter::ResponsesToAnthropicMessages => {
+            responses_json_to_anthropic_message(&response_value, requested_model, request_id)?
+        }
+        ResponseAdapter::Passthrough => response_value.clone(),
+    };
+
     record_success(
         &state,
         &route,
@@ -868,7 +994,15 @@ async fn attempt_proxy_request(
         token_usage,
     )
     .await?;
-    build_json_response(StatusCode::OK, &chat_response)
+
+    if dispatch.response_adapter == ResponseAdapter::Passthrough {
+        let body = serialize_json_bytes(&response_value)?;
+        let mut passthrough_headers = headers.clone();
+        passthrough_headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        return build_response(StatusCode::OK, &passthrough_headers, Body::from(body));
+    }
+
+    build_json_response(StatusCode::OK, &downstream_value)
 }
 
 async fn read_response_body(upstream_response: reqwest::Response) -> Result<Vec<u8>, String> {
@@ -1350,6 +1484,220 @@ async fn proxy_chat_completions_stream(
     )
 }
 
+async fn proxy_anthropic_message_stream(
+    state: &AppState,
+    route: &ModelRouteRow,
+    selected: &ChannelRow,
+    request_id: String,
+    requested_model: String,
+    upstream_response: reqwest::Response,
+    started_at: Instant,
+    upstream_protocol: Protocol,
+) -> Result<Response<Body>, AppError> {
+    if upstream_protocol != Protocol::Responses {
+        let upstream_url = upstream_response.url().to_string();
+        let mut upstream_stream = upstream_response.bytes_stream();
+        let mut collected = Vec::new();
+        while let Some(next_chunk) = upstream_stream.next().await {
+            let chunk = next_chunk.map_err(|error| {
+                AppError::UpstreamTransport(describe_reqwest_error(
+                    "read_anthropic_passthrough_stream_chunk",
+                    Some(&upstream_url),
+                    &error,
+                ))
+            })?;
+            collected.extend_from_slice(&chunk);
+        }
+
+        let latency_ms = started_at.elapsed().as_millis() as i64;
+        record_success_with_note(
+            state,
+            route,
+            selected,
+            &request_id,
+            &requested_model,
+            Protocol::Messages,
+            upstream_protocol,
+            StatusCode::OK.as_u16(),
+            latency_ms,
+            None,
+            None,
+        )
+        .await?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "text/event-stream".parse().unwrap());
+        let body = String::from_utf8(collected).map_err(|error| {
+            AppError::Internal(format!("failed to decode anthropic stream body: {error}"))
+        })?;
+        return build_response(StatusCode::OK, &headers, Body::from(body));
+    }
+
+    let upstream_url = upstream_response.url().to_string();
+    let mut upstream_stream = upstream_response.bytes_stream();
+    let first_chunk = match await_first_upstream_chunk(
+        "read_anthropic_adapter_first_chunk",
+        &upstream_url,
+        &mut upstream_stream,
+    )
+    .await
+    {
+        Ok(chunk) => chunk,
+        Err(message) => {
+            record_failure(
+                state,
+                route,
+                selected,
+                &request_id,
+                &requested_model,
+                Protocol::Messages,
+                upstream_protocol,
+                Some(StatusCode::OK.as_u16()),
+                started_at.elapsed().as_millis() as i64,
+                message.clone(),
+            )
+            .await?;
+            return Err(AppError::UpstreamTransport(message));
+        }
+    };
+
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+    let state_for_task = state.clone();
+    let route_for_task = route.clone();
+    let selected_for_task = selected.clone();
+    let request_id_for_task = request_id.clone();
+    let requested_model_for_task = requested_model.clone();
+
+    tokio::spawn(async move {
+        let mut buffer = String::new();
+        let mut stream_state = AnthropicStreamState::default();
+        let mut stream_error: Option<String> = None;
+        let mut downstream_disconnected = false;
+
+        if let Some(chunk) = first_chunk {
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            let frames = drain_sse_frames(&mut buffer);
+            'first_chunk: for frame in frames {
+                match transform_responses_frame_to_anthropic_sse(
+                    &frame,
+                    &requested_model_for_task,
+                    &request_id_for_task,
+                    &mut stream_state,
+                ) {
+                    Ok(lines) => {
+                        for line in lines {
+                            if tx.send(Ok(Bytes::from(line))).await.is_err() {
+                                downstream_disconnected = true;
+                                break 'first_chunk;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(std::io::Error::other(error.clone()))).await;
+                        stream_error = Some(error);
+                        break 'first_chunk;
+                    }
+                }
+            }
+        }
+
+        if !downstream_disconnected && stream_error.is_none() {
+            'outer: while let Some(next_chunk) = upstream_stream.next().await {
+                match next_chunk {
+                    Ok(chunk) => {
+                        buffer.push_str(&String::from_utf8_lossy(&chunk));
+                        let frames = drain_sse_frames(&mut buffer);
+                        for frame in frames {
+                            match transform_responses_frame_to_anthropic_sse(
+                                &frame,
+                                &requested_model_for_task,
+                                &request_id_for_task,
+                                &mut stream_state,
+                            ) {
+                                Ok(lines) => {
+                                    for line in lines {
+                                        if tx.send(Ok(Bytes::from(line))).await.is_err() {
+                                            downstream_disconnected = true;
+                                            break 'outer;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ =
+                                        tx.send(Err(std::io::Error::other(error.clone()))).await;
+                                    stream_error = Some(error);
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let message = describe_reqwest_error(
+                            "read_anthropic_adapter_stream_chunk",
+                            Some(&upstream_url),
+                            &error,
+                        );
+                        let _ = tx.send(Err(std::io::Error::other(message.clone()))).await;
+                        stream_error = Some(message);
+                        break;
+                    }
+                }
+            }
+        }
+
+        drop(tx);
+
+        let latency_ms = started_at.elapsed().as_millis() as i64;
+        if let Some(message) = stream_error {
+            if let Err(error) = record_failure(
+                &state_for_task,
+                &route_for_task,
+                &selected_for_task,
+                &request_id_for_task,
+                &requested_model_for_task,
+                Protocol::Messages,
+                upstream_protocol,
+                Some(StatusCode::OK.as_u16()),
+                latency_ms,
+                message,
+            )
+            .await
+            {
+                tracing::error!("failed to persist anthropic stream failure: {error}");
+            }
+            return;
+        }
+
+        let success_note = downstream_disconnected
+            .then(|| "downstream disconnected before stream completion".to_string());
+        if let Err(error) = record_success_with_note(
+            &state_for_task,
+            &route_for_task,
+            &selected_for_task,
+            &request_id_for_task,
+            &requested_model_for_task,
+            Protocol::Messages,
+            upstream_protocol,
+            StatusCode::OK.as_u16(),
+            latency_ms,
+            success_note,
+            None,
+        )
+        .await
+        {
+            tracing::error!("failed to persist anthropic stream success: {error}");
+        }
+    });
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    build_response(
+        StatusCode::OK,
+        &headers,
+        Body::from_stream(ReceiverStream::new(rx)),
+    )
+}
+
 fn build_response(
     status: StatusCode,
     headers: &HeaderMap,
@@ -1446,6 +1794,7 @@ fn channel_admin_view(
         "manual_blocked": channel.manual_blocked != 0,
         "cooldown_remaining_seconds": cooldown_remaining_seconds,
         "consecutive_fail_count": channel.consecutive_fail_count,
+        "needs_reprobe": channel.needs_reprobe != 0,
         "last_status": channel.last_status,
         "last_error": channel.last_error,
         "last_error_kind": last_error_kind,
@@ -1525,6 +1874,8 @@ fn channel_state(channel: &ChannelRow, now_ts: i64) -> &'static str {
         "manual_intervention_required"
     } else if channel.cooldown_until.is_some_and(|until| until > now_ts) {
         "cooling_down"
+    } else if channel.needs_reprobe != 0 {
+        "unavailable"
     } else {
         "ready"
     }
@@ -1546,6 +1897,11 @@ fn build_upstream_dispatch(
             upstream_protocol: Protocol::Responses,
             payload_kind: DispatchPayloadKind::ChatCompletionsToResponses,
             response_adapter: ResponseAdapter::ResponsesToChatCompletions,
+        }),
+        (Protocol::Messages, Protocol::Responses) => Ok(UpstreamDispatch {
+            upstream_protocol: Protocol::Responses,
+            payload_kind: DispatchPayloadKind::AnthropicMessagesToResponses,
+            response_adapter: ResponseAdapter::ResponsesToAnthropicMessages,
         }),
         _ => Err(AppError::NoRoute(format!(
             "protocol mismatch: request={} channel={}",
@@ -2116,6 +2472,254 @@ fn select_last_chance_channel(
             )
         })
         .map(|(channel, _, _)| channel)
+}
+
+fn anthropic_messages_to_responses_payload(payload: &Value) -> Result<Value, AppError> {
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest("field `model` is required".to_string()))?;
+    let messages = payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::BadRequest("field `messages` is required".to_string()))?;
+
+    let mut body = Map::new();
+    body.insert("model".to_string(), Value::String(model.to_string()));
+    body.insert(
+        "input".to_string(),
+        Value::Array(anthropic_messages_to_responses_input(messages)?),
+    );
+
+    copy_optional_field(payload, &mut body, "stream");
+    copy_optional_field(payload, &mut body, "temperature");
+    copy_optional_field(payload, &mut body, "top_p");
+
+    if let Some(system) = payload.get("system") {
+        let system_text = anthropic_system_to_text(system)?;
+        if !system_text.is_empty() {
+            body.insert("instructions".to_string(), Value::String(system_text));
+        }
+    }
+
+    if let Some(max_tokens) = payload.get("max_tokens").cloned() {
+        body.insert("max_output_tokens".to_string(), max_tokens);
+    }
+
+    if let Some(tools) = payload.get("tools") {
+        let tools = tools
+            .as_array()
+            .ok_or_else(|| AppError::BadRequest("field `tools` must be an array".to_string()))?
+            .iter()
+            .map(anthropic_tool_to_responses_tool)
+            .collect::<Result<Vec<_>, _>>()?;
+        body.insert("tools".to_string(), Value::Array(tools));
+    }
+
+    if let Some(tool_choice) = payload.get("tool_choice") {
+        body.insert(
+            "tool_choice".to_string(),
+            anthropic_tool_choice_to_responses_tool_choice(tool_choice)?,
+        );
+    }
+
+    Ok(Value::Object(body))
+}
+
+fn anthropic_messages_to_responses_input(messages: &[Value]) -> Result<Vec<Value>, AppError> {
+    let mut items = Vec::new();
+    for message in messages {
+        items.extend(anthropic_message_to_responses_items(message)?);
+    }
+    Ok(items)
+}
+
+fn anthropic_message_to_responses_items(message: &Value) -> Result<Vec<Value>, AppError> {
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest("anthropic message role is required".to_string()))?;
+    let content = message
+        .get("content")
+        .ok_or_else(|| AppError::BadRequest("anthropic message content is required".to_string()))?;
+
+    match role {
+        "user" | "assistant" => anthropic_content_to_responses_items(role, content),
+        other => Err(AppError::BadRequest(format!(
+            "unsupported anthropic message role: {other}"
+        ))),
+    }
+}
+
+fn anthropic_content_to_responses_items(
+    role: &str,
+    content: &Value,
+) -> Result<Vec<Value>, AppError> {
+    match content {
+        Value::String(text) => Ok(vec![json!({
+            "type": "message",
+            "role": role,
+            "content": [{ "type": "input_text", "text": text }]
+        })]),
+        Value::Array(blocks) => {
+            let mut items = Vec::new();
+            let mut text_parts = Vec::new();
+            for block in blocks {
+                let block_type = block.get("type").and_then(Value::as_str).ok_or_else(|| {
+                    AppError::BadRequest("anthropic content block type is required".to_string())
+                })?;
+                match block_type {
+                    "text" => {
+                        let text = block.get("text").and_then(Value::as_str).ok_or_else(|| {
+                            AppError::BadRequest(
+                                "anthropic text block text is required".to_string(),
+                            )
+                        })?;
+                        text_parts.push(json!({ "type": "input_text", "text": text }));
+                    }
+                    "tool_use" => {
+                        let id = block.get("id").and_then(Value::as_str).ok_or_else(|| {
+                            AppError::BadRequest("anthropic tool_use id is required".to_string())
+                        })?;
+                        let name = block.get("name").and_then(Value::as_str).ok_or_else(|| {
+                            AppError::BadRequest("anthropic tool_use name is required".to_string())
+                        })?;
+                        let arguments = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                        items.push(json!({
+                            "type": "function_call",
+                            "call_id": id,
+                            "name": name,
+                            "arguments": serde_json::to_string(&arguments).unwrap()
+                        }));
+                    }
+                    "tool_result" => {
+                        let id = block
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                AppError::BadRequest(
+                                    "anthropic tool_result tool_use_id is required".to_string(),
+                                )
+                            })?;
+                        let output = anthropic_tool_result_to_string(block.get("content"))?;
+                        items.push(json!({
+                            "type": "function_call_output",
+                            "call_id": id,
+                            "output": output
+                        }));
+                    }
+                    other => {
+                        return Err(AppError::BadRequest(format!(
+                            "unsupported anthropic content block type: {other}"
+                        )));
+                    }
+                }
+            }
+
+            if !text_parts.is_empty() {
+                items.insert(
+                    0,
+                    json!({
+                        "type": "message",
+                        "role": role,
+                        "content": text_parts
+                    }),
+                );
+            }
+
+            Ok(items)
+        }
+        _ => Err(AppError::BadRequest(
+            "anthropic message content must be a string or array".to_string(),
+        )),
+    }
+}
+
+fn anthropic_system_to_text(system: &Value) -> Result<String, AppError> {
+    match system {
+        Value::String(text) => Ok(text.to_string()),
+        Value::Array(blocks) => blocks
+            .iter()
+            .map(|block| {
+                block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .ok_or_else(|| {
+                        AppError::BadRequest(
+                            "anthropic system blocks must contain text".to_string(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|parts| parts.join("\n")),
+        _ => Err(AppError::BadRequest(
+            "field `system` must be a string or array".to_string(),
+        )),
+    }
+}
+
+fn anthropic_tool_to_responses_tool(tool: &Value) -> Result<Value, AppError> {
+    let name = tool
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest("anthropic tool name is required".to_string()))?;
+    let mut mapped = Map::new();
+    mapped.insert("type".to_string(), Value::String("function".to_string()));
+    mapped.insert("name".to_string(), Value::String(name.to_string()));
+    if let Some(description) = tool.get("description").cloned() {
+        mapped.insert("description".to_string(), description);
+    }
+    if let Some(schema) = tool.get("input_schema").cloned() {
+        mapped.insert("parameters".to_string(), schema);
+    }
+    Ok(Value::Object(mapped))
+}
+
+fn anthropic_tool_choice_to_responses_tool_choice(tool_choice: &Value) -> Result<Value, AppError> {
+    let Some(tool_type) = tool_choice.get("type").and_then(Value::as_str) else {
+        return Err(AppError::BadRequest(
+            "anthropic tool_choice.type is required".to_string(),
+        ));
+    };
+
+    match tool_type {
+        "auto" => Ok(Value::String("auto".to_string())),
+        "any" => Ok(Value::String("required".to_string())),
+        "tool" => {
+            let name = tool_choice
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AppError::BadRequest("anthropic tool_choice.name is required".to_string())
+                })?;
+            Ok(json!({ "type": "function", "name": name }))
+        }
+        other => Err(AppError::BadRequest(format!(
+            "unsupported anthropic tool_choice.type: {other}"
+        ))),
+    }
+}
+
+fn anthropic_tool_result_to_string(content: Option<&Value>) -> Result<String, AppError> {
+    match content {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(text)) => Ok(text.to_string()),
+        Some(Value::Array(blocks)) => {
+            let mut parts = Vec::new();
+            for block in blocks {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    parts.push(text.to_string());
+                }
+            }
+            Ok(parts.join("\n"))
+        }
+        Some(other) => serde_json::to_string(other).map_err(|error| {
+            AppError::Internal(format!(
+                "failed to serialize anthropic tool_result content: {error}"
+            ))
+        }),
+    }
 }
 
 fn chat_completions_to_responses_payload(payload: &Value) -> Result<Value, AppError> {
@@ -2828,6 +3432,66 @@ fn responses_json_to_chat_completion(
     })
 }
 
+fn responses_json_to_anthropic_message(
+    response: &Value,
+    requested_model: &str,
+    request_id: &str,
+) -> Result<Value, AppError> {
+    let id = response
+        .get("id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("msg_{request_id}"));
+    let content = extract_response_output_text(response);
+    let tool_calls = extract_response_tool_calls(response);
+    let stop_reason = if tool_calls.is_empty() {
+        "end_turn"
+    } else {
+        "tool_use"
+    };
+
+    let mut content_blocks = Vec::new();
+    if !content.is_empty() {
+        content_blocks.push(json!({
+            "type": "text",
+            "text": content
+        }));
+    }
+    for tool_call in tool_calls {
+        let name = tool_call
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let arguments = tool_call
+            .get("function")
+            .and_then(|function| function.get("arguments"))
+            .and_then(Value::as_str)
+            .unwrap_or("{}");
+        let input = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+        content_blocks.push(json!({
+            "type": "tool_use",
+            "id": tool_call.get("id").and_then(Value::as_str).unwrap_or_default(),
+            "name": name,
+            "input": input
+        }));
+    }
+
+    Ok(json!({
+        "id": id,
+        "type": "message",
+        "role": "assistant",
+        "model": requested_model,
+        "content": content_blocks,
+        "stop_reason": stop_reason,
+        "stop_sequence": Value::Null,
+        "usage": {
+            "input_tokens": response.get("usage").and_then(|usage| usage.get("input_tokens")).and_then(Value::as_i64).unwrap_or(0),
+            "output_tokens": response.get("usage").and_then(|usage| usage.get("output_tokens")).and_then(Value::as_i64).unwrap_or(0)
+        }
+    }))
+}
+
 fn extract_response_output_text(response: &Value) -> String {
     if let Some(text) = response.get("output_text").and_then(Value::as_str) {
         return text.to_string();
@@ -3310,6 +3974,343 @@ fn transform_responses_frame_to_chat_sse(
         }
         _ => Ok(Vec::new()),
     }
+}
+
+fn transform_responses_frame_to_anthropic_sse(
+    frame: &str,
+    requested_model: &str,
+    request_id: &str,
+    stream_state: &mut AnthropicStreamState,
+) -> Result<Vec<String>, String> {
+    let Some(data) = extract_sse_data(frame) else {
+        return Ok(Vec::new());
+    };
+
+    if data == "[DONE]" {
+        return Ok(finalize_anthropic_stream(stream_state, None));
+    }
+
+    let event: Value = serde_json::from_str(&data)
+        .map_err(|error| format!("invalid upstream sse json: {error}"))?;
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    match event_type {
+        "response.created" => Ok(ensure_anthropic_message_start(
+            requested_model,
+            request_id,
+            stream_state,
+        )),
+        "response.output_text.delta" => {
+            let delta = event
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let mut lines =
+                ensure_anthropic_message_start(requested_model, request_id, stream_state);
+            if delta.is_empty() {
+                return Ok(lines);
+            }
+            let block_index = ensure_anthropic_text_block(stream_state, &mut lines);
+            lines.push(anthropic_content_block_delta_line(
+                block_index,
+                json!({ "type": "text_delta", "text": delta }),
+            ));
+            Ok(lines)
+        }
+        "response.output_item.added" => {
+            let item = event.get("item").ok_or("missing response output item")?;
+            if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                return Ok(Vec::new());
+            }
+
+            let output_index = event
+                .get("output_index")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let call_id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("id").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let arguments = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+
+            let mut lines =
+                ensure_anthropic_message_start(requested_model, request_id, stream_state);
+            close_anthropic_text_block(stream_state, &mut lines);
+            let mut saw_tool_use = false;
+            let mut block_index = 0usize;
+            {
+                let block = anthropic_tool_block_state(output_index, call_id, name, stream_state);
+                block_index = block.block_index;
+                if !block.started {
+                    lines.push(anthropic_content_block_start_line(
+                        block.block_index,
+                        json!({
+                            "type": "tool_use",
+                            "id": block.call_id,
+                            "name": block.name,
+                            "input": {}
+                        }),
+                    ));
+                    block.started = true;
+                    saw_tool_use = true;
+                }
+            }
+            if saw_tool_use {
+                stream_state.saw_tool_use = true;
+            }
+            if !arguments.is_empty() {
+                lines.push(anthropic_content_block_delta_line(
+                    block_index,
+                    json!({ "type": "input_json_delta", "partial_json": arguments }),
+                ));
+            }
+            Ok(lines)
+        }
+        "response.function_call_arguments.delta" => {
+            let output_index = event
+                .get("output_index")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let delta = event
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if delta.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut lines =
+                ensure_anthropic_message_start(requested_model, request_id, stream_state);
+            close_anthropic_text_block(stream_state, &mut lines);
+            let mut saw_tool_use = false;
+            let mut block_index = 0usize;
+            {
+                let block = anthropic_tool_block_state(
+                    output_index,
+                    format!("call_{output_index}"),
+                    String::new(),
+                    stream_state,
+                );
+                block_index = block.block_index;
+                if !block.started {
+                    lines.push(anthropic_content_block_start_line(
+                        block.block_index,
+                        json!({
+                            "type": "tool_use",
+                            "id": block.call_id,
+                            "name": block.name,
+                            "input": {}
+                        }),
+                    ));
+                    block.started = true;
+                    saw_tool_use = true;
+                }
+            }
+            if saw_tool_use {
+                stream_state.saw_tool_use = true;
+            }
+            lines.push(anthropic_content_block_delta_line(
+                block_index,
+                json!({ "type": "input_json_delta", "partial_json": delta }),
+            ));
+            Ok(lines)
+        }
+        "response.function_call_arguments.done" => {
+            let output_index = event
+                .get("output_index")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let mut lines = Vec::new();
+            if let Some(block) = stream_state.tool_blocks.get_mut(&output_index) {
+                if !block.closed {
+                    lines.push(anthropic_content_block_stop_line(block.block_index));
+                    block.closed = true;
+                }
+            }
+            Ok(lines)
+        }
+        "response.completed" => Ok(finalize_anthropic_stream(
+            stream_state,
+            Some(if stream_state.saw_tool_use {
+                "tool_use"
+            } else {
+                "end_turn"
+            }),
+        )),
+        "response.failed" | "error" => {
+            let message = event
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .or_else(|| event.get("message").and_then(Value::as_str))
+                .unwrap_or("upstream reported stream failure");
+            Err(message.to_string())
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn ensure_anthropic_message_start(
+    requested_model: &str,
+    request_id: &str,
+    stream_state: &mut AnthropicStreamState,
+) -> Vec<String> {
+    if stream_state.sent_message_start {
+        return Vec::new();
+    }
+    stream_state.sent_message_start = true;
+    vec![anthropic_event_line(
+        "message_start",
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": format!("msg_{request_id}"),
+                "type": "message",
+                "role": "assistant",
+                "model": requested_model,
+                "content": [],
+                "stop_reason": Value::Null,
+                "stop_sequence": Value::Null,
+                "usage": { "input_tokens": 0, "output_tokens": 0 }
+            }
+        }),
+    )]
+}
+
+fn ensure_anthropic_text_block(
+    stream_state: &mut AnthropicStreamState,
+    lines: &mut Vec<String>,
+) -> usize {
+    if let Some(index) = stream_state.text_block_index {
+        return index;
+    }
+    let index = stream_state.next_block_index;
+    stream_state.next_block_index += 1;
+    stream_state.text_block_index = Some(index);
+    stream_state.text_block_closed = false;
+    lines.push(anthropic_content_block_start_line(
+        index,
+        json!({ "type": "text", "text": "" }),
+    ));
+    index
+}
+
+fn close_anthropic_text_block(stream_state: &mut AnthropicStreamState, lines: &mut Vec<String>) {
+    if let Some(index) = stream_state.text_block_index {
+        if !stream_state.text_block_closed {
+            lines.push(anthropic_content_block_stop_line(index));
+            stream_state.text_block_closed = true;
+        }
+    }
+}
+
+fn anthropic_tool_block_state<'a>(
+    output_index: i64,
+    call_id: String,
+    name: String,
+    stream_state: &'a mut AnthropicStreamState,
+) -> &'a mut AnthropicToolBlockState {
+    stream_state
+        .tool_blocks
+        .entry(output_index)
+        .or_insert_with(|| {
+            let block_index = stream_state.next_block_index;
+            stream_state.next_block_index += 1;
+            AnthropicToolBlockState {
+                block_index,
+                call_id,
+                name,
+                started: false,
+                closed: false,
+            }
+        })
+}
+
+fn finalize_anthropic_stream(
+    stream_state: &mut AnthropicStreamState,
+    stop_reason: Option<&str>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    close_anthropic_text_block(stream_state, &mut lines);
+    let mut indices = stream_state.tool_blocks.keys().copied().collect::<Vec<_>>();
+    indices.sort_unstable();
+    for index in indices {
+        if let Some(block) = stream_state.tool_blocks.get_mut(&index) {
+            if block.started && !block.closed {
+                lines.push(anthropic_content_block_stop_line(block.block_index));
+                block.closed = true;
+            }
+        }
+    }
+    if let Some(stop_reason) = stop_reason {
+        lines.push(anthropic_event_line(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": stop_reason,
+                    "stop_sequence": Value::Null
+                },
+                "usage": { "output_tokens": 0 }
+            }),
+        ));
+    }
+    lines.push(anthropic_event_line(
+        "message_stop",
+        json!({ "type": "message_stop" }),
+    ));
+    lines
+}
+
+fn anthropic_content_block_start_line(index: usize, content_block: Value) -> String {
+    anthropic_event_line(
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": content_block
+        }),
+    )
+}
+
+fn anthropic_content_block_delta_line(index: usize, delta: Value) -> String {
+    anthropic_event_line(
+        "content_block_delta",
+        json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": delta
+        }),
+    )
+}
+
+fn anthropic_content_block_stop_line(index: usize) -> String {
+    anthropic_event_line(
+        "content_block_stop",
+        json!({
+            "type": "content_block_stop",
+            "index": index
+        }),
+    )
+}
+
+fn anthropic_event_line(event_name: &str, payload: Value) -> String {
+    format!(
+        "event: {event_name}\ndata: {}\n\n",
+        serde_json::to_string(&payload).unwrap()
+    )
 }
 
 fn lookup_or_assign_tool_call_index(
@@ -5245,7 +6246,8 @@ mod tests {
         assert_eq!(reset_value["data"]["state"], "ready");
         assert_eq!(reset_value["data"]["eligible"], true);
         assert!(reset_value["data"]["cooldown_until"].is_null());
-        assert_eq!(reset_value["data"]["consecutive_fail_count"], 0);
+        assert_eq!(reset_value["data"]["consecutive_fail_count"], 1);
+        assert_eq!(reset_value["data"]["needs_reprobe"], false);
     }
 
     #[tokio::test]
@@ -6481,7 +7483,8 @@ mod tests {
         assert_eq!(reset_value["data"]["state"], "ready");
         assert_eq!(reset_value["data"]["eligible"], true);
         assert!(reset_value["data"]["cooldown_until"].is_null());
-        assert_eq!(reset_value["data"]["consecutive_fail_count"], 0);
+        assert_eq!(reset_value["data"]["consecutive_fail_count"], 2);
+        assert_eq!(reset_value["data"]["needs_reprobe"], false);
 
         let enable_request = Request::builder()
             .method("POST")
@@ -6626,9 +7629,267 @@ mod tests {
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["data"]["manual_blocked"], false);
         assert_eq!(value["data"]["consecutive_fail_count"], 1);
+        assert_eq!(value["data"]["needs_reprobe"], false);
         assert_eq!(value["data"]["last_status"], 503);
         assert_eq!(value["data"]["last_error_kind"], "upstream_server_error");
         assert!(value["data"]["cooldown_until"].is_null());
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_maps_tool_use_events_from_responses_stream() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_tool_call_streaming_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let create_route_request = Request::builder()
+            .method("POST")
+            .uri("/api/routes")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "route_model": "claude-sonnet-4-6"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let create_route_response = app.clone().oneshot(create_route_request).await.unwrap();
+        assert_eq!(create_route_response.status(), StatusCode::CREATED);
+        let create_route_body = to_bytes(create_route_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_route_value: Value = serde_json::from_slice(&create_route_body).unwrap();
+        let route_id = create_route_value["data"]["route"]["id"].as_i64().unwrap();
+
+        let create_channel_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/routes/{route_id}/channels"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "base_url": format!("http://{upstream_addr}"),
+                    "api_key": "test-key",
+                    "upstream_model": "gpt-5.4",
+                    "protocol": "responses"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let create_channel_response = app.clone().oneshot(create_channel_request).await.unwrap();
+        assert_eq!(create_channel_response.status(), StatusCode::CREATED);
+
+        let proxy_request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "claude-sonnet-4-6",
+                    "stream": true,
+                    "max_tokens": 16,
+                    "messages": [{ "role": "user", "content": "weather?" }]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
+        assert_eq!(proxy_response.status(), StatusCode::OK);
+        assert_eq!(
+            proxy_response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        let body = to_bytes(proxy_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("event: message_start"));
+        assert!(text.contains("event: content_block_start"));
+        assert!(text.contains("\"type\":\"tool_use\""));
+        assert!(text.contains("\"partial_json\":\"{\\\"city\\\":\\\"Par\""));
+        assert!(text.contains("\"partial_json\":\"is\\\"}\""));
+        assert!(text.contains("event: content_block_stop"));
+        assert!(text.contains("event: message_delta"));
+        assert!(text.contains("\"stop_reason\":\"tool_use\""));
+        assert!(text.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn claude_route_can_target_responses_upstream_model() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_json_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let create_route_request = Request::builder()
+            .method("POST")
+            .uri("/api/routes")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "route_model": "claude-opus-4-6"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let create_route_response = app.clone().oneshot(create_route_request).await.unwrap();
+        assert_eq!(create_route_response.status(), StatusCode::CREATED);
+        let create_route_body = to_bytes(create_route_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_route_value: Value = serde_json::from_slice(&create_route_body).unwrap();
+        let route_id = create_route_value["data"]["route"]["id"].as_i64().unwrap();
+
+        let create_channel_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/routes/{route_id}/channels"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "base_url": format!("http://{upstream_addr}"),
+                    "api_key": "test-key",
+                    "upstream_model": "gpt-5.4",
+                    "protocol": "responses"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let create_channel_response = app.clone().oneshot(create_channel_request).await.unwrap();
+        assert_eq!(create_channel_response.status(), StatusCode::CREATED);
+
+        let proxy_request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "claude-opus-4-6",
+                    "max_tokens": 16,
+                    "messages": [{ "role": "user", "content": "ping" }]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
+        assert_eq!(proxy_response.status(), StatusCode::OK);
+        let proxy_body = to_bytes(proxy_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let proxy_value: Value = serde_json::from_slice(&proxy_body).unwrap();
+        assert_eq!(proxy_value["type"], "message");
+        assert_eq!(proxy_value["model"], "claude-opus-4-6");
+        assert_eq!(proxy_value["content"][0]["type"], "text");
+        assert_eq!(proxy_value["content"][0]["text"], "hello from upstream");
+    }
+
+    #[tokio::test]
+    async fn expired_cooldown_channel_stays_unavailable_until_success_clears_needs_reprobe() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_json_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        seed_database(&config.database_url, upstream_addr).await;
+
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+        sqlx::query(
+            r#"
+            update channels
+            set cooldown_until = ?,
+                consecutive_fail_count = 2,
+                needs_reprobe = 1,
+                last_status = 503,
+                last_error = 'temporary upstream failure'
+            where id = 1
+            "#,
+        )
+        .bind(super::now_ts() - 10)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let channels_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/routes/1/channels")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(channels_response.status(), StatusCode::OK);
+        let channels_body = to_bytes(channels_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let channels_value: Value = serde_json::from_slice(&channels_body).unwrap();
+        assert_eq!(
+            channels_value["data"]["channels"][0]["state"],
+            "unavailable"
+        );
+        assert_eq!(channels_value["data"]["channels"][0]["eligible"], false);
+        assert_eq!(channels_value["data"]["channels"][0]["needs_reprobe"], true);
+
+        let routes_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/routes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let routes_body = to_bytes(routes_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let routes_value: Value = serde_json::from_slice(&routes_body).unwrap();
+        assert_eq!(routes_value["data"][0]["ready_channel_count"], 0);
+
+        let probe_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/channels/1/probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(probe_response.status(), StatusCode::OK);
+        let probe_body = to_bytes(probe_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let probe_value: Value = serde_json::from_slice(&probe_body).unwrap();
+        assert_eq!(probe_value["data"]["state"], "ready");
+        assert_eq!(probe_value["data"]["needs_reprobe"], false);
     }
 
     #[test]

@@ -105,7 +105,8 @@ pub fn build_router(state: AppState) -> Router {
             "/chat/completions",
             axum::routing::post(http::create_chat_completion),
         )
-        .route("/messages", axum::routing::post(http::create_message));
+        .route("/messages", axum::routing::post(http::create_message))
+        .route("/models", axum::routing::get(http::list_models));
     let compat_router = Router::new()
         .route("/responses", axum::routing::post(http::create_response))
         .route(
@@ -113,6 +114,7 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::post(http::create_chat_completion),
         )
         .route("/messages", axum::routing::post(http::create_message))
+        .route("/models", axum::routing::get(http::list_models))
         .route(
             "/v1beta/openai/chat/completions",
             axum::routing::post(http::create_chat_completion),

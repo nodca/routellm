@@ -157,13 +157,30 @@ LLMROUTER_AUTH_KEY=$LLMROUTER_MASTER_KEY \
 | `chat_completions` | `chat_completions` |
 | `messages` | `messages` |
 | `chat_completions` | `responses`，通过薄兼容层转换 |
+| `messages` | `responses`，通过 Anthropic / Claude Code 兼容层转换 |
+
+对 Claude Code 这条主路径，当前已覆盖：
+
+- `POST /v1/messages` 非流式文本
+- `POST /v1/messages` 文本 SSE 流式
+- 非流式 `tool_use` / `tool_result` 基础映射
+- Anthropic 风格 tool streaming 基础事件：`message_start`、`content_block_start`、`content_block_delta`、`content_block_stop`、`message_delta`、`message_stop`
+- Responses 函数调用流事件到 Anthropic tool streaming 的基础映射：
+  - `response.output_item.added(function_call)` -> `tool_use` block start
+  - `response.function_call_arguments.delta` -> `input_json_delta.partial_json`
+  - `response.function_call_arguments.done` -> tool block stop
+  - `response.completed` -> `message_delta(stop_reason=tool_use/end_turn)` + `message_stop`
+- `GET /v1/models`
+- Claude route（例如 `claude-opus-4-6`）映射到非 Claude upstream model（例如 `gpt-5.4` / `glm-*`）
 
 当前不支持：
 
 - `responses -> chat_completions`
 - `responses -> messages`
-- `messages -> responses`
 - `messages -> chat_completions`
+- 多模态 content block 全覆盖
+- 所有 beta 头与扩展字段兼容
+- 与 Anthropic 官方错误对象逐字段完全一致
 
 选路顺序：
 
@@ -183,7 +200,7 @@ LLMROUTER_AUTH_KEY=$LLMROUTER_MASTER_KEY \
 | --- | --- |
 | `RUN` | 可用 |
 | `COOL 23s` | 自动冷却中 |
-| `UNAVAIL` | 不可用，通常是手动阻断或主动测活失败 |
+| `UNAVAIL` | 不可用。包括手动阻断、主动测活失败，或冷却结束后仍待成功复检的 channel |
 | `OFF` | 手动禁用 |
 | `PROBING` | 正在主动测活 |
 

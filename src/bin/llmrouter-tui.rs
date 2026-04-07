@@ -142,7 +142,6 @@ struct ProbeChannelOutcome {
 enum ProbeEvent {
     Single {
         outcome: ProbeChannelOutcome,
-        select_channel: bool,
     },
     BatchComplete {
         route_model: String,
@@ -265,11 +264,17 @@ impl ChannelProvider {
         }
     }
 
-    fn protocol_options(self) -> &'static [&'static str] {
+    fn protocol_options(self, route_model: &str) -> Vec<&'static str> {
         match self {
-            Self::OpenAiCompatible => &["responses", "chat_completions"],
-            Self::Gemini => &["chat_completions"],
-            Self::Anthropic => &["messages"],
+            Self::OpenAiCompatible => vec!["responses", "chat_completions"],
+            Self::Gemini => vec!["chat_completions"],
+            Self::Anthropic => {
+                if route_model.trim().starts_with("claude-") {
+                    vec!["responses", "messages"]
+                } else {
+                    vec!["messages"]
+                }
+            }
         }
     }
 
@@ -363,8 +368,8 @@ impl ProtocolSelectDialog {
         }
     }
 
-    fn options(&self) -> &'static [&'static str] {
-        self.provider.protocol_options()
+    fn options(&self) -> Vec<&'static str> {
+        self.provider.protocol_options(&self.route_model)
     }
 
     fn selected_protocol(&self) -> &'static str {
@@ -514,10 +519,14 @@ impl OnboardRouteField {
 
     fn hint(self) -> &'static str {
         match self {
-            Self::RouteModel => "下游稳定模型名。精确匹配，例如 gpt-5.4。",
+            Self::RouteModel => {
+                "下游稳定模型名。Claude route 可填 claude-opus/sonnet；真实上游模型名在 Upstream Model 单独填写。"
+            }
             Self::BaseUrl => "上游站点根地址。可直接填带 /v1 的兼容地址。",
             Self::ApiKey => "上游 Bearer Key。界面里会掩码显示，提交时原值会发送。",
-            Self::UpstreamModel => "可留空时默认跟 route model 一样，用于适配上游不同模型名。",
+            Self::UpstreamModel => {
+                "真实发给上游的模型名。Claude route 下这里可以填 gpt / glm 等非 Claude 模型。"
+            }
             Self::Protocol => "上游协议：responses / chat_completions / messages。",
             Self::Priority => "越小越优先。只会在最低 priority 可用组内选路。",
         }
@@ -532,10 +541,10 @@ impl OnboardRouteField {
 
     fn placeholder(self) -> &'static str {
         match self {
-            Self::RouteModel => "例如: gpt-5.4",
+            Self::RouteModel => "例如: claude-opus-4-6",
             Self::BaseUrl => "例如: https://api.example.com/v1",
             Self::ApiKey => "例如: sk-...",
-            Self::UpstreamModel => "留空则使用 route model",
+            Self::UpstreamModel => "例如: gpt-5.4 / glm-4.5，留空则使用 route model",
             Self::Protocol => "填写: responses / chat_completions / messages",
             Self::Priority => "默认 0",
         }
@@ -628,7 +637,7 @@ impl OnboardRouteForm {
             route_model: route.model_pattern.clone(),
             base_url: String::new(),
             api_key: String::new(),
-            upstream_model: route.model_pattern.clone(),
+            upstream_model: String::new(),
             protocol: protocol.to_string(),
             priority: "0".to_string(),
             active_field: OnboardRouteField::BaseUrl,
@@ -837,7 +846,9 @@ impl EditChannelField {
         match self {
             Self::BaseUrl => "上游站点根地址。可直接填带 /v1 的兼容地址。",
             Self::ApiKey => "上游 Bearer Key。界面里会掩码显示，提交时原值会发送。",
-            Self::UpstreamModel => "真实发给上游的模型名。",
+            Self::UpstreamModel => {
+                "真实发给上游的模型名。Claude route 下可显式映射到 gpt / glm 等模型。"
+            }
             Self::Protocol => "上游协议：responses / chat_completions / messages。",
             Self::Priority => "越小越优先，必须 >= 0。",
         }
@@ -1288,6 +1299,31 @@ impl App {
 
     fn selected_channel_ref(&self) -> Option<&ChannelSummary> {
         self.channels.get(self.selected_channel)
+    }
+
+    fn restore_selected_channel_by_id(&mut self, channel_id: Option<i64>) {
+        match channel_id {
+            Some(channel_id) => {
+                if let Some(index) = self
+                    .channels
+                    .iter()
+                    .position(|channel| channel.channel_id == channel_id)
+                {
+                    self.selected_channel = index;
+                } else if self.channels.is_empty() {
+                    self.selected_channel = 0;
+                } else {
+                    self.selected_channel = self.selected_channel.min(self.channels.len() - 1);
+                }
+            }
+            None => {
+                self.selected_channel = if self.channels.is_empty() {
+                    0
+                } else {
+                    self.selected_channel.min(self.channels.len() - 1)
+                };
+            }
+        }
     }
 
     fn filtered_route_indices(&self) -> Vec<usize> {
@@ -1776,7 +1812,6 @@ impl App {
                 probe_channel_request(client, base_url, auth_key, outcome.channel_id).await;
             let _ = tx.send(ProbeEvent::Single {
                 outcome: ProbeChannelOutcome { result, ..outcome },
-                select_channel: true,
             });
         });
     }
@@ -1856,10 +1891,7 @@ impl App {
                     }
                 }
 
-                let _ = tx.send(ProbeEvent::Single {
-                    outcome,
-                    select_channel: false,
-                });
+                let _ = tx.send(ProbeEvent::Single { outcome });
             }
 
             let _ = tx.send(ProbeEvent::BatchComplete {
@@ -1873,17 +1905,9 @@ impl App {
 
     async fn handle_probe_event(&mut self, event: ProbeEvent) {
         match event {
-            ProbeEvent::Single {
-                outcome,
-                select_channel,
-            } => {
+            ProbeEvent::Single { outcome } => {
                 self.probing_channels.remove(&outcome.channel_id);
-                let selected_channel_id = if select_channel {
-                    Some(outcome.channel_id)
-                } else {
-                    None
-                };
-                self.apply_probe_outcomes(outcome.route_id, selected_channel_id, [&outcome])
+                self.apply_probe_outcomes(outcome.route_id, [&outcome])
                     .await;
                 self.status = match &outcome.result {
                     Ok(updated) if updated.state == "ready" => {
@@ -1921,29 +1945,19 @@ impl App {
         }
     }
 
-    async fn apply_probe_outcomes<'a, I>(
-        &mut self,
-        route_id: i64,
-        selected_channel_id: Option<i64>,
-        outcomes: I,
-    ) where
+    async fn apply_probe_outcomes<'a, I>(&mut self, route_id: i64, outcomes: I)
+    where
         I: IntoIterator<Item = &'a ProbeChannelOutcome>,
     {
         let current_route_id = self.selected_route_ref().map(|route| route.id);
+        let selected_channel_id = self
+            .selected_channel_ref()
+            .map(|channel| channel.channel_id);
         if let Err(error) = self.reload_all().await {
             self.status = error;
             return;
         }
-
-        if let Some(selected_channel_id) = selected_channel_id {
-            if let Some(index) = self
-                .channels
-                .iter()
-                .position(|channel| channel.channel_id == selected_channel_id)
-            {
-                self.selected_channel = index;
-            }
-        }
+        self.restore_selected_channel_by_id(selected_channel_id);
 
         if current_route_id == Some(route_id) {
             for outcome in outcomes {
@@ -4210,9 +4224,11 @@ fn centered_rect(horizontal_percent: u16, vertical_percent: u16, area: Rect) -> 
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc;
+
     use super::{
-        ChannelAction, ChannelProvider, ChannelSummary, masked_secret, normalize_protocol_input,
-        toggle_action_for_channel,
+        App, ChannelAction, ChannelProvider, ChannelSummary, OnboardRouteForm, RouteSummary,
+        masked_secret, normalize_protocol_input, toggle_action_for_channel,
     };
 
     #[test]
@@ -4262,6 +4278,109 @@ mod tests {
         assert_eq!(
             toggle_action_for_channel(&channel),
             ChannelAction::ResetCooldown
+        );
+    }
+
+    #[test]
+    fn anthropic_route_form_allows_distinct_upstream_model_mapping() {
+        let route = RouteSummary {
+            id: 1,
+            model_pattern: "claude-opus-4-6".to_string(),
+            enabled: true,
+            routing_strategy: "priority".to_string(),
+            channel_count: 0,
+            ready_channel_count: 0,
+            cooling_channel_count: 0,
+            manual_blocked_channel_count: 0,
+        };
+        let mut form =
+            OnboardRouteForm::add_channel(&route, ChannelProvider::Anthropic, "messages");
+        form.base_url = "https://api.example.com/v1".to_string();
+        form.api_key = "sk-test".to_string();
+        form.upstream_model = "gpt-5.4".to_string();
+        form.protocol = "responses".to_string();
+
+        let request = form.to_add_channel_request().unwrap();
+        assert_eq!(request.route_model, "claude-opus-4-6");
+        assert_eq!(request.upstream_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(request.protocol, "responses");
+    }
+
+    #[test]
+    fn apply_probe_refresh_restores_current_selection_by_channel_id() {
+        let (probe_tx, _probe_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("http://127.0.0.1:3000".to_string(), None, probe_tx);
+        app.channels = vec![
+            ChannelSummary {
+                channel_id: 1,
+                route_id: 1,
+                account_id: 1,
+                site_name: "site-a".to_string(),
+                site_base_url: "https://a.example.com".to_string(),
+                account_label: "acc-a".to_string(),
+                account_status: "active".to_string(),
+                channel_label: "a".to_string(),
+                site_status: "active".to_string(),
+                upstream_model: "gpt-5.4".to_string(),
+                protocol: "responses".to_string(),
+                priority: 0,
+                avg_latency_ms: None,
+                manual_blocked: false,
+                cooldown_remaining_seconds: None,
+                consecutive_fail_count: 0,
+                last_status: None,
+                last_error: None,
+                last_error_kind: None,
+                last_error_hint: None,
+                eligible: true,
+                state: "ready".to_string(),
+                reason: "ok".to_string(),
+                requests_24h: 0,
+                success_requests_24h: 0,
+                input_tokens_24h: 0,
+                output_tokens_24h: 0,
+                total_tokens_24h: 0,
+            },
+            ChannelSummary {
+                channel_id: 2,
+                route_id: 1,
+                account_id: 2,
+                site_name: "site-b".to_string(),
+                site_base_url: "https://b.example.com".to_string(),
+                account_label: "acc-b".to_string(),
+                account_status: "active".to_string(),
+                channel_label: "b".to_string(),
+                site_status: "active".to_string(),
+                upstream_model: "gpt-5.4".to_string(),
+                protocol: "responses".to_string(),
+                priority: 1,
+                avg_latency_ms: None,
+                manual_blocked: false,
+                cooldown_remaining_seconds: None,
+                consecutive_fail_count: 0,
+                last_status: None,
+                last_error: None,
+                last_error_kind: None,
+                last_error_hint: None,
+                eligible: true,
+                state: "ready".to_string(),
+                reason: "ok".to_string(),
+                requests_24h: 0,
+                success_requests_24h: 0,
+                input_tokens_24h: 0,
+                output_tokens_24h: 0,
+                total_tokens_24h: 0,
+            },
+        ];
+        app.selected_channel = 1;
+
+        app.channels.swap(0, 1);
+        app.restore_selected_channel_by_id(Some(2));
+
+        assert_eq!(app.selected_channel, 0);
+        assert_eq!(
+            app.selected_channel_ref().map(|channel| channel.channel_id),
+            Some(2)
         );
     }
 

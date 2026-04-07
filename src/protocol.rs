@@ -45,6 +45,7 @@ pub fn compatibility_cost(channel_protocol: Protocol, request_protocol: Protocol
         (Protocol::Messages, Protocol::Messages) => Some(0),
         (Protocol::ChatCompletions, Protocol::ChatCompletions) => Some(0),
         (Protocol::ChatCompletions, Protocol::Responses) => Some(1),
+        (Protocol::Messages, Protocol::Responses) => Some(1),
         _ => None,
     }
 }

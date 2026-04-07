@@ -44,6 +44,7 @@ pub struct ChannelRow {
     pub cooldown_until: Option<i64>,
     pub manual_blocked: i64,
     pub consecutive_fail_count: i64,
+    pub needs_reprobe: i64,
     pub last_status: Option<i64>,
     pub last_error: Option<String>,
 }

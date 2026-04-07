@@ -1,0 +1,2 @@
+ALTER TABLE channels
+ADD COLUMN needs_reprobe INTEGER NOT NULL DEFAULT 0;

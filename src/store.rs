@@ -176,6 +176,7 @@ impl SqliteStore {
                   and a.status = 'active'
                   and s.status = 'active'
                   and c.manual_blocked = 0
+                  and c.needs_reprobe = 0
                   and (c.cooldown_until is null or c.cooldown_until <= ?)
                 then 1 else 0 end), 0) as ready_channel_count,
               coalesce(sum(case
@@ -476,10 +477,12 @@ impl SqliteStore {
             r#"
             update channels
             set enabled = ?,
+                needs_reprobe = case when ? = 1 then needs_reprobe else 0 end,
                 updated_at = current_timestamp
             where id = ?
             "#,
         )
+        .bind(if enabled { 1_i64 } else { 0_i64 })
         .bind(if enabled { 1_i64 } else { 0_i64 })
         .bind(channel_id)
         .execute(&self.pool)
@@ -501,7 +504,7 @@ impl SqliteStore {
             update channels
             set cooldown_until = null,
                 manual_blocked = 0,
-                consecutive_fail_count = 0,
+                needs_reprobe = 0,
                 updated_at = current_timestamp
             where id = ?
             "#,
@@ -685,6 +688,7 @@ impl SqliteStore {
             set cooldown_until = null,
                 manual_blocked = 0,
                 consecutive_fail_count = 0,
+                needs_reprobe = 0,
                 last_status = ?,
                 last_error = null,
                 avg_latency_ms = case
@@ -738,6 +742,7 @@ impl SqliteStore {
                 set cooldown_until = ?,
                     manual_blocked = ?,
                     consecutive_fail_count = ?,
+                    needs_reprobe = ?,
                     last_status = ?,
                     last_error = ?,
                     updated_at = current_timestamp
@@ -748,6 +753,11 @@ impl SqliteStore {
             .bind(cooldown_until)
             .bind(if manual_blocked { 1_i64 } else { 0_i64 })
             .bind(next_fail_count)
+            .bind(if manual_blocked || cooldown_until.is_some() {
+                1_i64
+            } else {
+                0_i64
+            })
             .bind(http_status.map(i64::from))
             .bind(error_message)
             .bind(channel_id)
@@ -783,6 +793,7 @@ const CHANNEL_SELECT_BY_ROUTE_SQL: &str = r#"
               c.cooldown_until,
               c.manual_blocked,
               c.consecutive_fail_count,
+              c.needs_reprobe,
       c.last_status,
       c.last_error
     from channels c
@@ -812,6 +823,7 @@ const CHANNEL_SELECT_BY_ID_SQL: &str = r#"
       c.cooldown_until,
       c.manual_blocked,
       c.consecutive_fail_count,
+      c.needs_reprobe,
       c.last_status,
       c.last_error
     from channels c
