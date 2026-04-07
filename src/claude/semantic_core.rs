@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::error::AppError;
 
@@ -83,11 +83,34 @@ pub enum ClaudeToolChoice {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ClaudeRequestExtensions {
-    pub thinking: Option<Value>,
-    pub context_management: Option<Value>,
-    pub metadata: Option<Value>,
-    pub beta_hints: Option<Value>,
-    pub request_hints: Option<Value>,
+    pub thinking: Option<ClaudeThinkingConfig>,
+    pub context_management: Option<ClaudeContextManagement>,
+    pub metadata: Option<Map<String, Value>>,
+    pub beta_hints: ClaudeBetaHints,
+    pub request_hints: ClaudeRequestHints,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClaudeThinkingConfig {
+    Enabled { budget_tokens: Option<u64> },
+    Adaptive,
+    Disabled,
+    Unrecognized(Value),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClaudeContextManagement {
+    pub raw: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClaudeBetaHints {
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClaudeRequestHints {
+    pub service_tier: Option<String>,
 }
 
 impl ClaudeMessageRequest {
@@ -150,17 +173,16 @@ impl ClaudeMessageRequest {
             tools,
             tool_choice,
             extensions: ClaudeRequestExtensions {
-                thinking: object.get("thinking").cloned(),
-                context_management: object.get("context_management").cloned(),
-                metadata: object.get("metadata").cloned(),
-                beta_hints: object
-                    .get("beta")
-                    .cloned()
-                    .or_else(|| object.get("betas").cloned()),
-                request_hints: object
-                    .get("request_hints")
-                    .cloned()
-                    .or_else(|| object.get("service_tier").cloned()),
+                thinking: parse_optional_thinking(object.get("thinking"))?,
+                context_management: parse_optional_context_management(
+                    object.get("context_management"),
+                )?,
+                metadata: parse_optional_metadata(object.get("metadata"))?,
+                beta_hints: parse_beta_hints(object.get("beta").or_else(|| object.get("betas")))?,
+                request_hints: parse_request_hints(
+                    object.get("request_hints"),
+                    object.get("service_tier"),
+                )?,
             },
         })
     }
@@ -225,6 +247,18 @@ impl ClaudeToolResultContent {
             ),
             Self::Json(_) => None,
         }
+    }
+}
+
+impl ClaudeThinkingConfig {
+    pub fn is_requested(&self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
+impl ClaudeBetaHints {
+    pub fn contains(&self, needle: &str) -> bool {
+        self.values.iter().any(|value| value == needle)
     }
 }
 
@@ -414,6 +448,117 @@ fn parse_tool_choice_kind(kind: &str, name: Option<&Value>) -> Result<ClaudeTool
     }
 }
 
+fn parse_optional_thinking(
+    value: Option<&Value>,
+) -> Result<Option<ClaudeThinkingConfig>, AppError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => parse_thinking(value).map(Some),
+    }
+}
+
+fn parse_thinking(value: &Value) -> Result<ClaudeThinkingConfig, AppError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest("field `thinking` must be an object".to_string()))?;
+    let Some(kind) = object.get("type").and_then(Value::as_str) else {
+        return Ok(ClaudeThinkingConfig::Unrecognized(value.clone()));
+    };
+
+    match kind {
+        "enabled" => Ok(ClaudeThinkingConfig::Enabled {
+            budget_tokens: object
+                .get("budget_tokens")
+                .map(|value| {
+                    value_as_u64(value, "field `thinking.budget_tokens` must be an integer")
+                })
+                .transpose()?,
+        }),
+        "adaptive" => Ok(ClaudeThinkingConfig::Adaptive),
+        "disabled" => Ok(ClaudeThinkingConfig::Disabled),
+        _ => Ok(ClaudeThinkingConfig::Unrecognized(value.clone())),
+    }
+}
+
+fn parse_optional_context_management(
+    value: Option<&Value>,
+) -> Result<Option<ClaudeContextManagement>, AppError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => Ok(Some(ClaudeContextManagement { raw: value.clone() })),
+    }
+}
+
+fn parse_optional_metadata(value: Option<&Value>) -> Result<Option<Map<String, Value>>, AppError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(object)) => Ok(Some(object.clone())),
+        Some(_) => Err(AppError::BadRequest(
+            "field `metadata` must be an object".to_string(),
+        )),
+    }
+}
+
+fn parse_beta_hints(value: Option<&Value>) -> Result<ClaudeBetaHints, AppError> {
+    let Some(value) = value else {
+        return Ok(ClaudeBetaHints::default());
+    };
+    match value {
+        Value::Null => Ok(ClaudeBetaHints::default()),
+        Value::String(text) => Ok(ClaudeBetaHints {
+            values: text
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect(),
+        }),
+        Value::Array(values) => Ok(ClaudeBetaHints {
+            values: values
+                .iter()
+                .map(|value| {
+                    value.as_str().map(ToString::to_string).ok_or_else(|| {
+                        AppError::BadRequest("field `betas` must contain only strings".to_string())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
+        _ => Err(AppError::BadRequest(
+            "field `betas` must be a string or array".to_string(),
+        )),
+    }
+}
+
+fn parse_request_hints(
+    request_hints: Option<&Value>,
+    service_tier_alias: Option<&Value>,
+) -> Result<ClaudeRequestHints, AppError> {
+    let alias_service_tier = match service_tier_alias {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(required_string(
+            Some(value),
+            "field `service_tier` is required",
+            "field `service_tier` must be a string",
+        )?),
+    };
+
+    match request_hints {
+        None | Some(Value::Null) => Ok(ClaudeRequestHints {
+            service_tier: alias_service_tier,
+        }),
+        Some(Value::Object(object)) => Ok(ClaudeRequestHints {
+            service_tier: optional_string(
+                object.get("service_tier"),
+                "field `request_hints.service_tier` must be a string",
+            )?
+            .or(alias_service_tier),
+        }),
+        Some(_) => Err(AppError::BadRequest(
+            "field `request_hints` must be an object".to_string(),
+        )),
+    }
+}
+
 fn required_string(
     value: Option<&Value>,
     missing_message: &str,
@@ -485,9 +630,11 @@ mod tests {
                 }
             }],
             "tool_choice": { "type": "tool", "name": "lookup_weather" },
-            "thinking": { "type": "enabled" },
+            "betas": ["claude-code-20250219", "context-management-2025-06-27"],
+            "thinking": { "type": "enabled", "budget_tokens": 128 },
             "context_management": { "strategy": "retain" },
             "metadata": { "tenant": "ops" },
+            "service_tier": "priority",
             "messages": [
                 {
                     "role": "user",
@@ -530,7 +677,31 @@ mod tests {
                 name: "lookup_weather".to_string()
             })
         );
-        assert!(request.extensions.thinking.is_some());
+        assert_eq!(
+            request.extensions.thinking,
+            Some(ClaudeThinkingConfig::Enabled {
+                budget_tokens: Some(128)
+            })
+        );
+        assert_eq!(
+            request.extensions.request_hints.service_tier.as_deref(),
+            Some("priority")
+        );
+        assert_eq!(
+            request.extensions.beta_hints.values,
+            vec![
+                "claude-code-20250219".to_string(),
+                "context-management-2025-06-27".to_string()
+            ]
+        );
+        assert_eq!(
+            request
+                .extensions
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("tenant")),
+            Some(&json!("ops"))
+        );
         assert_eq!(request.messages.len(), 2);
         assert_eq!(request.messages[0].role, ClaudeRole::User);
         assert_eq!(request.messages[1].role, ClaudeRole::Assistant);
@@ -580,6 +751,20 @@ mod tests {
 
         assert!(
             matches!(error, AppError::BadRequest(message) if message.contains("field `model` is required"))
+        );
+    }
+
+    #[test]
+    fn claude_semantic_core_rejects_invalid_extension_shapes() {
+        let error = ClaudeMessageRequest::parse_json(&json!({
+            "model": "claude-sonnet-4-6",
+            "metadata": "opaque",
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .expect_err("invalid metadata should fail");
+
+        assert!(
+            matches!(error, AppError::BadRequest(message) if message.contains("field `metadata` must be an object"))
         );
     }
 }

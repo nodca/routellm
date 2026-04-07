@@ -8523,6 +8523,10 @@ mod tests {
         let payload = json!({
             "model": "claude-opus-4-6",
             "max_tokens": 64,
+            "metadata": { "tenant": "ops" },
+            "service_tier": "priority",
+            "thinking": { "type": "enabled", "budget_tokens": 32 },
+            "betas": ["claude-code-20250219"],
             "messages": [
                 { "role": "user", "content": [{ "type": "text", "text": "hello" }] },
                 { "role": "assistant", "content": [{ "type": "text", "text": "pong" }] }
@@ -8540,6 +8544,8 @@ mod tests {
 
         assert_eq!(adapted["model"], "claude-opus-4-6");
         assert_eq!(adapted["max_output_tokens"], 64);
+        assert_eq!(adapted["metadata"]["tenant"], "ops");
+        assert_eq!(adapted["service_tier"], "priority");
         assert_eq!(adapted["input"][0]["role"], "user");
         assert!(prepared.should_retry_with_assistant_history_compat());
     }

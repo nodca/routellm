@@ -4,8 +4,9 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     claude::semantic_core::{
-        ClaudeContentBlock, ClaudeMessage, ClaudeMessageRequest, ClaudeRole, ClaudeToolChoice,
-        ClaudeToolDefinition, ClaudeToolResult, ClaudeToolResultContent, ClaudeToolUse,
+        ClaudeContentBlock, ClaudeContextManagement, ClaudeMessage, ClaudeMessageRequest,
+        ClaudeRole, ClaudeThinkingConfig, ClaudeToolChoice, ClaudeToolDefinition, ClaudeToolResult,
+        ClaudeToolResultContent, ClaudeToolUse,
     },
     error::AppError,
 };
@@ -20,6 +21,30 @@ pub enum ResponsesRequestMode {
 #[derive(Debug, Clone, Default)]
 pub struct ResponsesProviderAdapter {
     request_mode: ResponsesRequestMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ResponsesExtensionPolicy {
+    pub metadata: Option<Map<String, Value>>,
+    pub service_tier: Option<String>,
+    pub requested_betas: Vec<String>,
+    pub unsupported_beta_hints: Vec<String>,
+    pub thinking: ResponsesThinkingPolicy,
+    pub context_management: ResponsesContextManagementPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResponsesThinkingPolicy {
+    #[default]
+    Omit,
+    IgnoreRequested,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResponsesContextManagementPolicy {
+    #[default]
+    Omit,
+    IgnoreRequested,
 }
 
 pub struct AnthropicStreamEventAdapter {
@@ -68,44 +93,67 @@ impl ResponsesProviderAdapter {
         request.has_plaintext_assistant_history()
     }
 
-    pub fn request_to_payload(&self, _request: &ClaudeMessageRequest) -> Result<Value, AppError> {
+    pub fn extension_policy(&self, request: &ClaudeMessageRequest) -> ResponsesExtensionPolicy {
+        let context_requested = request.extensions.context_management.is_some()
+            || request
+                .extensions
+                .beta_hints
+                .values
+                .iter()
+                .any(|beta| beta.contains("context-management"));
+
+        ResponsesExtensionPolicy {
+            metadata: request.extensions.metadata.clone(),
+            service_tier: request.extensions.request_hints.service_tier.clone(),
+            requested_betas: request.extensions.beta_hints.values.clone(),
+            unsupported_beta_hints: request.extensions.beta_hints.values.clone(),
+            thinking: map_thinking_policy(request.extensions.thinking.as_ref()),
+            context_management: map_context_management_policy(
+                request.extensions.context_management.as_ref(),
+                context_requested,
+            ),
+        }
+    }
+
+    pub fn request_to_payload(&self, request: &ClaudeMessageRequest) -> Result<Value, AppError> {
         let assistant_text_mode = match self.request_mode {
             ResponsesRequestMode::Standard => AssistantTextHistoryMode::NativeRole,
             ResponsesRequestMode::AssistantHistoryCompat => {
                 AssistantTextHistoryMode::TranscriptUser
             }
         };
+        let extension_policy = self.extension_policy(request);
         let mut body = Map::new();
         body.insert(
             "model".to_string(),
-            Value::String(_request.model.to_string()),
+            Value::String(request.model.to_string()),
         );
         body.insert(
             "input".to_string(),
             Value::Array(messages_to_responses_input(
-                &_request.messages,
+                &request.messages,
                 assistant_text_mode,
             )?),
         );
-        body.insert("stream".to_string(), Value::Bool(_request.stream));
+        body.insert("stream".to_string(), Value::Bool(request.stream));
 
-        if let Some(temperature) = _request.temperature {
+        if let Some(temperature) = request.temperature {
             body.insert("temperature".to_string(), json!(temperature));
         }
-        if let Some(top_p) = _request.top_p {
+        if let Some(top_p) = request.top_p {
             body.insert("top_p".to_string(), json!(top_p));
         }
-        if let Some(max_tokens) = _request.max_tokens {
+        if let Some(max_tokens) = request.max_tokens {
             body.insert("max_output_tokens".to_string(), json!(max_tokens));
         }
-        if let Some(system_text) = _request.system_text().filter(|text| !text.is_empty()) {
+        if let Some(system_text) = request.system_text().filter(|text| !text.is_empty()) {
             body.insert("instructions".to_string(), Value::String(system_text));
         }
-        if !_request.tools.is_empty() {
+        if !request.tools.is_empty() {
             body.insert(
                 "tools".to_string(),
                 Value::Array(
-                    _request
+                    request
                         .tools
                         .iter()
                         .map(map_tool_definition)
@@ -113,11 +161,17 @@ impl ResponsesProviderAdapter {
                 ),
             );
         }
-        if let Some(tool_choice) = &_request.tool_choice {
+        if let Some(tool_choice) = &request.tool_choice {
             body.insert(
                 "tool_choice".to_string(),
                 map_tool_choice(tool_choice.clone())?,
             );
+        }
+        if let Some(metadata) = extension_policy.metadata {
+            body.insert("metadata".to_string(), Value::Object(metadata));
+        }
+        if let Some(service_tier) = extension_policy.service_tier {
+            body.insert("service_tier".to_string(), Value::String(service_tier));
         }
 
         Ok(Value::Object(body))
@@ -194,6 +248,26 @@ impl ResponsesProviderAdapter {
             request_id: request_id.into(),
             state: AnthropicStreamState::default(),
         }
+    }
+}
+
+fn map_thinking_policy(thinking: Option<&ClaudeThinkingConfig>) -> ResponsesThinkingPolicy {
+    match thinking {
+        None | Some(ClaudeThinkingConfig::Disabled) => ResponsesThinkingPolicy::Omit,
+        Some(ClaudeThinkingConfig::Enabled { .. })
+        | Some(ClaudeThinkingConfig::Adaptive)
+        | Some(ClaudeThinkingConfig::Unrecognized(_)) => ResponsesThinkingPolicy::IgnoreRequested,
+    }
+}
+
+fn map_context_management_policy(
+    context_management: Option<&ClaudeContextManagement>,
+    context_requested: bool,
+) -> ResponsesContextManagementPolicy {
+    if context_management.is_some() || context_requested {
+        ResponsesContextManagementPolicy::IgnoreRequested
+    } else {
+        ResponsesContextManagementPolicy::Omit
     }
 }
 
@@ -801,6 +875,11 @@ mod tests {
             "max_tokens": 64,
             "temperature": 0.1,
             "top_p": 0.8,
+            "betas": ["claude-code-20250219", "context-management-2025-06-27"],
+            "thinking": { "type": "enabled", "budget_tokens": 64 },
+            "context_management": { "type": "ephemeral" },
+            "metadata": { "tenant": "ops" },
+            "request_hints": { "service_tier": "priority" },
             "tool_choice": { "type": "tool", "name": "lookup_weather" },
             "tools": [{
                 "name": "lookup_weather",
@@ -834,11 +913,14 @@ mod tests {
         let payload = ResponsesProviderAdapter::new()
             .request_to_payload(&request)
             .expect("request should map");
+        let policy = ResponsesProviderAdapter::new().extension_policy(&request);
 
         assert_eq!(payload["model"], "claude-sonnet-4-6");
         assert_eq!(payload["instructions"], "be concise");
         assert_eq!(payload["stream"], true);
         assert_eq!(payload["max_output_tokens"], 64);
+        assert_eq!(payload["metadata"]["tenant"], "ops");
+        assert_eq!(payload["service_tier"], "priority");
         assert_eq!(payload["tool_choice"]["name"], "lookup_weather");
         assert_eq!(payload["tools"][0]["type"], "function");
         assert_eq!(payload["input"][0]["type"], "message");
@@ -846,6 +928,14 @@ mod tests {
         assert_eq!(payload["input"][1]["role"], "assistant");
         assert_eq!(payload["input"][2]["type"], "function_call");
         assert_eq!(payload["input"][3]["type"], "function_call_output");
+        assert_eq!(policy.service_tier.as_deref(), Some("priority"));
+        assert_eq!(policy.requested_betas.len(), 2);
+        assert_eq!(policy.unsupported_beta_hints.len(), 2);
+        assert_eq!(policy.thinking, ResponsesThinkingPolicy::IgnoreRequested);
+        assert_eq!(
+            policy.context_management,
+            ResponsesContextManagementPolicy::IgnoreRequested
+        );
     }
 
     #[test]
