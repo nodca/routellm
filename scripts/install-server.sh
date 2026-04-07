@@ -181,7 +181,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 URL="$(download_url "$ASSET_NAME")"
 ARCHIVE_PATH="${TMP_DIR}/${ASSET_NAME}"
 echo "正在下载：${URL}"
-curl -fsSL "$URL" -o "$ARCHIVE_PATH"
+curl -fL --progress-bar "$URL" -o "$ARCHIVE_PATH"
 tar -xzf "$ARCHIVE_PATH" -C "$TMP_DIR"
 PACKAGE_ROOT="$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 -type d | head -n1)"
 if [[ -z "$PACKAGE_ROOT" ]]; then
