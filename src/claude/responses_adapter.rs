@@ -1,7 +1,12 @@
-use serde_json::Value;
+use std::collections::HashMap;
+
+use serde_json::{Map, Value, json};
 
 use crate::{
-    claude::semantic_core::ClaudeMessageRequest,
+    claude::semantic_core::{
+        ClaudeContentBlock, ClaudeMessage, ClaudeMessageRequest, ClaudeRole, ClaudeToolChoice,
+        ClaudeToolDefinition, ClaudeToolResult, ClaudeToolResultContent, ClaudeToolUse,
+    },
     error::AppError,
 };
 
@@ -17,7 +22,30 @@ pub struct ResponsesProviderAdapter {
     request_mode: ResponsesRequestMode,
 }
 
-pub struct AnthropicStreamEventAdapter;
+pub struct AnthropicStreamEventAdapter {
+    requested_model: String,
+    request_id: String,
+    state: AnthropicStreamState,
+}
+
+#[derive(Debug, Default, Clone)]
+struct AnthropicStreamState {
+    sent_message_start: bool,
+    text_block_index: Option<usize>,
+    text_block_closed: bool,
+    saw_tool_use: bool,
+    next_block_index: usize,
+    tool_blocks: HashMap<i64, AnthropicToolBlockState>,
+}
+
+#[derive(Debug, Clone)]
+struct AnthropicToolBlockState {
+    block_index: usize,
+    call_id: String,
+    name: String,
+    started: bool,
+    closed: bool,
+}
 
 impl ResponsesProviderAdapter {
     pub fn new() -> Self {
@@ -41,35 +69,715 @@ impl ResponsesProviderAdapter {
     }
 
     pub fn request_to_payload(&self, _request: &ClaudeMessageRequest) -> Result<Value, AppError> {
-        Err(AppError::BadRequest(
-            "claude responses adapter request mapping not implemented".to_string(),
-        ))
+        let assistant_text_mode = match self.request_mode {
+            ResponsesRequestMode::Standard => AssistantTextHistoryMode::NativeRole,
+            ResponsesRequestMode::AssistantHistoryCompat => {
+                AssistantTextHistoryMode::TranscriptUser
+            }
+        };
+        let mut body = Map::new();
+        body.insert(
+            "model".to_string(),
+            Value::String(_request.model.to_string()),
+        );
+        body.insert(
+            "input".to_string(),
+            Value::Array(messages_to_responses_input(
+                &_request.messages,
+                assistant_text_mode,
+            )?),
+        );
+        body.insert("stream".to_string(), Value::Bool(_request.stream));
+
+        if let Some(temperature) = _request.temperature {
+            body.insert("temperature".to_string(), json!(temperature));
+        }
+        if let Some(top_p) = _request.top_p {
+            body.insert("top_p".to_string(), json!(top_p));
+        }
+        if let Some(max_tokens) = _request.max_tokens {
+            body.insert("max_output_tokens".to_string(), json!(max_tokens));
+        }
+        if let Some(system_text) = _request.system_text().filter(|text| !text.is_empty()) {
+            body.insert("instructions".to_string(), Value::String(system_text));
+        }
+        if !_request.tools.is_empty() {
+            body.insert(
+                "tools".to_string(),
+                Value::Array(
+                    _request
+                        .tools
+                        .iter()
+                        .map(map_tool_definition)
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            );
+        }
+        if let Some(tool_choice) = &_request.tool_choice {
+            body.insert(
+                "tool_choice".to_string(),
+                map_tool_choice(tool_choice.clone())?,
+            );
+        }
+
+        Ok(Value::Object(body))
     }
 
     pub fn response_to_message(
         &self,
-        _response: &Value,
-        _requested_model: &str,
-        _request_id: &str,
+        response: &Value,
+        requested_model: &str,
+        request_id: &str,
     ) -> Result<Value, AppError> {
-        Err(AppError::BadRequest(
-            "claude responses adapter response mapping not implemented".to_string(),
-        ))
+        let id = response
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("msg_{request_id}"));
+        let content = extract_response_output_text(response);
+        let tool_calls = extract_response_tool_calls(response);
+        let stop_reason = if tool_calls.is_empty() {
+            "end_turn"
+        } else {
+            "tool_use"
+        };
+
+        let mut content_blocks = Vec::new();
+        if !content.is_empty() {
+            content_blocks.push(json!({
+                "type": "text",
+                "text": content
+            }));
+        }
+        for tool_call in tool_calls {
+            let name = tool_call
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let arguments = tool_call
+                .get("function")
+                .and_then(|function| function.get("arguments"))
+                .and_then(Value::as_str)
+                .unwrap_or("{}");
+            let input = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+            content_blocks.push(json!({
+                "type": "tool_use",
+                "id": tool_call.get("id").and_then(Value::as_str).unwrap_or_default(),
+                "name": name,
+                "input": input
+            }));
+        }
+
+        Ok(json!({
+            "id": id,
+            "type": "message",
+            "role": "assistant",
+            "model": requested_model,
+            "content": content_blocks,
+            "stop_reason": stop_reason,
+            "stop_sequence": Value::Null,
+            "usage": {
+                "input_tokens": response.get("usage").and_then(|usage| usage.get("input_tokens")).and_then(Value::as_i64).unwrap_or(0),
+                "output_tokens": response.get("usage").and_then(|usage| usage.get("output_tokens")).and_then(Value::as_i64).unwrap_or(0)
+            }
+        }))
     }
 
     pub fn stream_event_adapter(
         &self,
-        _requested_model: impl Into<String>,
-        _request_id: impl Into<String>,
+        requested_model: impl Into<String>,
+        request_id: impl Into<String>,
     ) -> AnthropicStreamEventAdapter {
-        AnthropicStreamEventAdapter
+        AnthropicStreamEventAdapter {
+            requested_model: requested_model.into(),
+            request_id: request_id.into(),
+            state: AnthropicStreamState::default(),
+        }
     }
 }
 
 impl AnthropicStreamEventAdapter {
-    pub fn translate_frame(&mut self, _frame: &str) -> Result<Vec<String>, String> {
-        Ok(Vec::new())
+    pub fn translate_frame(&mut self, frame: &str) -> Result<Vec<String>, String> {
+        let Some(data) = extract_sse_data(frame) else {
+            return Ok(Vec::new());
+        };
+
+        if data == "[DONE]" {
+            return Ok(finalize_anthropic_stream(&mut self.state, None));
+        }
+
+        let event: Value = serde_json::from_str(&data)
+            .map_err(|error| format!("invalid upstream sse json: {error}"))?;
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        match event_type {
+            "response.created" => Ok(ensure_anthropic_message_start(
+                &self.requested_model,
+                &self.request_id,
+                &mut self.state,
+            )),
+            "response.output_text.delta" => {
+                let delta = event
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let mut lines = ensure_anthropic_message_start(
+                    &self.requested_model,
+                    &self.request_id,
+                    &mut self.state,
+                );
+                if delta.is_empty() {
+                    return Ok(lines);
+                }
+                let block_index = ensure_anthropic_text_block(&mut self.state, &mut lines);
+                lines.push(anthropic_content_block_delta_line(
+                    block_index,
+                    json!({ "type": "text_delta", "text": delta }),
+                ));
+                Ok(lines)
+            }
+            "response.output_item.added" => {
+                let item = event.get("item").ok_or("missing response output item")?;
+                if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                    return Ok(Vec::new());
+                }
+
+                let output_index = event
+                    .get("output_index")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("id").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_string();
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let arguments = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+
+                let mut lines = ensure_anthropic_message_start(
+                    &self.requested_model,
+                    &self.request_id,
+                    &mut self.state,
+                );
+                close_anthropic_text_block(&mut self.state, &mut lines);
+                let mut saw_tool_use = false;
+                let block_index;
+                {
+                    let block =
+                        anthropic_tool_block_state(output_index, call_id, name, &mut self.state);
+                    block_index = block.block_index;
+                    if !block.started {
+                        lines.push(anthropic_content_block_start_line(
+                            block.block_index,
+                            json!({
+                                "type": "tool_use",
+                                "id": block.call_id,
+                                "name": block.name,
+                                "input": {}
+                            }),
+                        ));
+                        block.started = true;
+                        saw_tool_use = true;
+                    }
+                }
+                if saw_tool_use {
+                    self.state.saw_tool_use = true;
+                }
+                if !arguments.is_empty() {
+                    lines.push(anthropic_content_block_delta_line(
+                        block_index,
+                        json!({ "type": "input_json_delta", "partial_json": arguments }),
+                    ));
+                }
+                Ok(lines)
+            }
+            "response.function_call_arguments.delta" => {
+                let output_index = event
+                    .get("output_index")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let delta = event
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if delta.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                let mut lines = ensure_anthropic_message_start(
+                    &self.requested_model,
+                    &self.request_id,
+                    &mut self.state,
+                );
+                close_anthropic_text_block(&mut self.state, &mut lines);
+                let mut saw_tool_use = false;
+                let block_index;
+                {
+                    let block = anthropic_tool_block_state(
+                        output_index,
+                        format!("call_{output_index}"),
+                        String::new(),
+                        &mut self.state,
+                    );
+                    block_index = block.block_index;
+                    if !block.started {
+                        lines.push(anthropic_content_block_start_line(
+                            block.block_index,
+                            json!({
+                                "type": "tool_use",
+                                "id": block.call_id,
+                                "name": block.name,
+                                "input": {}
+                            }),
+                        ));
+                        block.started = true;
+                        saw_tool_use = true;
+                    }
+                }
+                if saw_tool_use {
+                    self.state.saw_tool_use = true;
+                }
+                lines.push(anthropic_content_block_delta_line(
+                    block_index,
+                    json!({ "type": "input_json_delta", "partial_json": delta }),
+                ));
+                Ok(lines)
+            }
+            "response.function_call_arguments.done" => {
+                let output_index = event
+                    .get("output_index")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let mut lines = Vec::new();
+                if let Some(block) = self.state.tool_blocks.get_mut(&output_index) {
+                    if !block.closed {
+                        lines.push(anthropic_content_block_stop_line(block.block_index));
+                        block.closed = true;
+                    }
+                }
+                Ok(lines)
+            }
+            "response.completed" => {
+                let stop_reason = if self.state.saw_tool_use {
+                    "tool_use"
+                } else {
+                    "end_turn"
+                };
+                Ok(finalize_anthropic_stream(
+                    &mut self.state,
+                    Some(stop_reason),
+                ))
+            }
+            "response.failed" | "error" => {
+                let message = event
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .or_else(|| event.get("message").and_then(Value::as_str))
+                    .unwrap_or("upstream reported stream failure");
+                Err(message.to_string())
+            }
+            _ => Ok(Vec::new()),
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssistantTextHistoryMode {
+    NativeRole,
+    TranscriptUser,
+}
+
+fn messages_to_responses_input(
+    messages: &[ClaudeMessage],
+    assistant_text_mode: AssistantTextHistoryMode,
+) -> Result<Vec<Value>, AppError> {
+    let mut items = Vec::new();
+    for message in messages {
+        items.extend(message_to_responses_items(message, assistant_text_mode)?);
+    }
+    Ok(items)
+}
+
+fn message_to_responses_items(
+    message: &ClaudeMessage,
+    assistant_text_mode: AssistantTextHistoryMode,
+) -> Result<Vec<Value>, AppError> {
+    let mut items = Vec::new();
+    let mut text_parts = Vec::new();
+    let mut text_fragments = Vec::new();
+
+    for block in &message.content {
+        match block {
+            ClaudeContentBlock::Text(block) => {
+                text_fragments.push(block.text.to_string());
+                text_parts.push(json!({
+                    "type": "input_text",
+                    "text": block.text
+                }));
+            }
+            ClaudeContentBlock::ToolUse(tool_use) => {
+                items.push(tool_use_to_responses_item(tool_use)?);
+            }
+            ClaudeContentBlock::ToolResult(tool_result) => {
+                items.push(tool_result_to_responses_item(tool_result)?);
+            }
+        }
+    }
+
+    if !text_parts.is_empty() {
+        items.insert(
+            0,
+            responses_message_item(
+                message.role,
+                if message.role == ClaudeRole::Assistant
+                    && assistant_text_mode == AssistantTextHistoryMode::TranscriptUser
+                {
+                    vec![json!({
+                        "type": "input_text",
+                        "text": transcript_safe_message_text(
+                            message.role,
+                            text_fragments,
+                            assistant_text_mode,
+                        )
+                    })]
+                } else {
+                    text_parts
+                },
+                assistant_text_mode,
+            ),
+        );
+    }
+
+    Ok(items)
+}
+
+fn tool_use_to_responses_item(tool_use: &ClaudeToolUse) -> Result<Value, AppError> {
+    Ok(json!({
+        "type": "function_call",
+        "call_id": tool_use.id,
+        "name": tool_use.name,
+        "arguments": serde_json::to_string(&tool_use.input).map_err(|error| {
+            AppError::Internal(format!("failed to serialize anthropic tool_use input: {error}"))
+        })?
+    }))
+}
+
+fn tool_result_to_responses_item(tool_result: &ClaudeToolResult) -> Result<Value, AppError> {
+    Ok(json!({
+        "type": "function_call_output",
+        "call_id": tool_result.tool_use_id,
+        "output": tool_result_content_to_string(&tool_result.content)?
+    }))
+}
+
+fn tool_result_content_to_string(content: &ClaudeToolResultContent) -> Result<String, AppError> {
+    match content {
+        ClaudeToolResultContent::Empty => Ok(String::new()),
+        ClaudeToolResultContent::Text(text) => Ok(text.to_string()),
+        ClaudeToolResultContent::TextBlocks(blocks) => Ok(blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")),
+        ClaudeToolResultContent::Json(value) => serde_json::to_string(value).map_err(|error| {
+            AppError::Internal(format!(
+                "failed to serialize anthropic tool_result content: {error}"
+            ))
+        }),
+    }
+}
+
+fn responses_message_item(
+    role: ClaudeRole,
+    content: Vec<Value>,
+    assistant_text_mode: AssistantTextHistoryMode,
+) -> Value {
+    let mapped_role = if role == ClaudeRole::Assistant
+        && assistant_text_mode == AssistantTextHistoryMode::TranscriptUser
+    {
+        "user"
+    } else {
+        match role {
+            ClaudeRole::User => "user",
+            ClaudeRole::Assistant => "assistant",
+        }
+    };
+    json!({
+        "type": "message",
+        "role": mapped_role,
+        "content": content
+    })
+}
+
+fn transcript_safe_message_text(
+    role: ClaudeRole,
+    text_fragments: Vec<String>,
+    assistant_text_mode: AssistantTextHistoryMode,
+) -> String {
+    let joined = text_fragments.join("\n");
+    if role == ClaudeRole::Assistant && assistant_text_mode == AssistantTextHistoryMode::TranscriptUser
+    {
+        format!("Assistant: {joined}")
+    } else {
+        joined
+    }
+}
+
+fn map_tool_definition(tool: &ClaudeToolDefinition) -> Result<Value, AppError> {
+    let mut mapped = Map::new();
+    mapped.insert("type".to_string(), Value::String("function".to_string()));
+    mapped.insert("name".to_string(), Value::String(tool.name.to_string()));
+    if let Some(description) = &tool.description {
+        mapped.insert("description".to_string(), Value::String(description.to_string()));
+    }
+    if let Some(schema) = &tool.input_schema {
+        mapped.insert("parameters".to_string(), schema.clone());
+    }
+    Ok(Value::Object(mapped))
+}
+
+fn map_tool_choice(tool_choice: ClaudeToolChoice) -> Result<Value, AppError> {
+    match tool_choice {
+        ClaudeToolChoice::Auto => Ok(Value::String("auto".to_string())),
+        ClaudeToolChoice::Any => Ok(Value::String("required".to_string())),
+        ClaudeToolChoice::Tool { name } => Ok(json!({
+            "type": "function",
+            "name": name
+        })),
+    }
+}
+
+fn extract_response_output_text(response: &Value) -> String {
+    if let Some(text) = response.get("output_text").and_then(Value::as_str) {
+        return text.to_string();
+    }
+
+    let mut parts = Vec::new();
+    if let Some(outputs) = response.get("output").and_then(Value::as_array) {
+        for output in outputs {
+            if let Some(content_items) = output.get("content").and_then(Value::as_array) {
+                for item in content_items {
+                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                        parts.push(text.to_string());
+                        continue;
+                    }
+                    if let Some(text) = item.get("output_text").and_then(Value::as_str) {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+        }
+    }
+    parts.join("")
+}
+
+fn extract_response_tool_calls(response: &Value) -> Vec<Value> {
+    response
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(response_output_item_to_chat_tool_call)
+        .collect()
+}
+
+fn response_output_item_to_chat_tool_call(item: &Value) -> Option<Value> {
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return None;
+    }
+
+    let name = item.get("name").and_then(Value::as_str)?;
+    let arguments = item
+        .get("arguments")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let id = item
+        .get("call_id")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("id").and_then(Value::as_str))?;
+
+    Some(json!({
+        "id": id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": arguments
+        }
+    }))
+}
+
+fn extract_sse_data(frame: &str) -> Option<String> {
+    let data = frame
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!data.is_empty()).then_some(data)
+}
+
+fn ensure_anthropic_message_start(
+    requested_model: &str,
+    request_id: &str,
+    stream_state: &mut AnthropicStreamState,
+) -> Vec<String> {
+    if stream_state.sent_message_start {
+        return Vec::new();
+    }
+    stream_state.sent_message_start = true;
+    vec![anthropic_event_line(
+        "message_start",
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": format!("msg_{request_id}"),
+                "type": "message",
+                "role": "assistant",
+                "model": requested_model,
+                "content": [],
+                "stop_reason": Value::Null,
+                "stop_sequence": Value::Null,
+                "usage": { "input_tokens": 0, "output_tokens": 0 }
+            }
+        }),
+    )]
+}
+
+fn ensure_anthropic_text_block(
+    stream_state: &mut AnthropicStreamState,
+    lines: &mut Vec<String>,
+) -> usize {
+    if let Some(index) = stream_state.text_block_index {
+        return index;
+    }
+    let index = stream_state.next_block_index;
+    stream_state.next_block_index += 1;
+    stream_state.text_block_index = Some(index);
+    stream_state.text_block_closed = false;
+    lines.push(anthropic_content_block_start_line(
+        index,
+        json!({ "type": "text", "text": "" }),
+    ));
+    index
+}
+
+fn close_anthropic_text_block(stream_state: &mut AnthropicStreamState, lines: &mut Vec<String>) {
+    if let Some(index) = stream_state.text_block_index {
+        if !stream_state.text_block_closed {
+            lines.push(anthropic_content_block_stop_line(index));
+            stream_state.text_block_closed = true;
+        }
+    }
+}
+
+fn anthropic_tool_block_state<'a>(
+    output_index: i64,
+    call_id: String,
+    name: String,
+    stream_state: &'a mut AnthropicStreamState,
+) -> &'a mut AnthropicToolBlockState {
+    stream_state
+        .tool_blocks
+        .entry(output_index)
+        .or_insert_with(|| {
+            let block_index = stream_state.next_block_index;
+            stream_state.next_block_index += 1;
+            AnthropicToolBlockState {
+                block_index,
+                call_id,
+                name,
+                started: false,
+                closed: false,
+            }
+        })
+}
+
+fn finalize_anthropic_stream(
+    stream_state: &mut AnthropicStreamState,
+    stop_reason: Option<&str>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    close_anthropic_text_block(stream_state, &mut lines);
+    let mut indices = stream_state.tool_blocks.keys().copied().collect::<Vec<_>>();
+    indices.sort_unstable();
+    for index in indices {
+        if let Some(block) = stream_state.tool_blocks.get_mut(&index) {
+            if block.started && !block.closed {
+                lines.push(anthropic_content_block_stop_line(block.block_index));
+                block.closed = true;
+            }
+        }
+    }
+    if let Some(stop_reason) = stop_reason {
+        lines.push(anthropic_event_line(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": stop_reason,
+                    "stop_sequence": Value::Null
+                },
+                "usage": { "output_tokens": 0 }
+            }),
+        ));
+    }
+    lines.push(anthropic_event_line(
+        "message_stop",
+        json!({ "type": "message_stop" }),
+    ));
+    lines
+}
+
+fn anthropic_content_block_start_line(index: usize, content_block: Value) -> String {
+    anthropic_event_line(
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": content_block
+        }),
+    )
+}
+
+fn anthropic_content_block_delta_line(index: usize, delta: Value) -> String {
+    anthropic_event_line(
+        "content_block_delta",
+        json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": delta
+        }),
+    )
+}
+
+fn anthropic_content_block_stop_line(index: usize) -> String {
+    anthropic_event_line(
+        "content_block_stop",
+        json!({
+            "type": "content_block_stop",
+            "index": index
+        }),
+    )
+}
+
+fn anthropic_event_line(event_name: &str, payload: Value) -> String {
+    format!(
+        "event: {event_name}\ndata: {}\n\n",
+        serde_json::to_string(&payload).unwrap()
+    )
 }
 
 #[cfg(test)]
@@ -213,7 +921,8 @@ mod tests {
             .expect("tool call should map");
         let tool_text = tool.join("");
         assert!(tool_text.contains("\"type\":\"tool_use\""));
-        assert!(tool_text.contains("\"partial_json\":\"{\\\\\\\"city\\\\\\\":\\\\\\\"Par\""));
+        assert!(tool_text.contains("\"partial_json\""));
+        assert!(tool_text.contains("call_1"));
 
         let done = stream
             .translate_frame("data: {\"type\":\"response.completed\"}\n\n")
