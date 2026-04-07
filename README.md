@@ -10,7 +10,7 @@
 - 支持在claude code中使用openai兼容模型
 - 支持导入cc-switch已配置模型
 
-<img src="./tui.png" alt="" />
+![tui](tui.png)
 
 ## 核心概念
 
