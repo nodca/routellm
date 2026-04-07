@@ -1,0 +1,37 @@
+{
+  "model": "claude-sonnet-4-6",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "hello"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "pong"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "ping"
+        }
+      ]
+    }
+  ],
+  "stream": false,
+  "max_output_tokens": 64
+}
