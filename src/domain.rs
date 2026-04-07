@@ -53,6 +53,7 @@ pub struct ChannelRow {
 pub struct RequestLogRow {
     pub id: i64,
     pub request_id: String,
+    pub downstream_client_request_id: Option<String>,
     pub downstream_path: String,
     pub upstream_path: String,
     pub model_requested: String,
@@ -67,6 +68,7 @@ pub struct RequestLogRow {
     pub channel_label: String,
     pub site_name: String,
     pub upstream_model: String,
+    pub claude_request_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -106,18 +108,20 @@ pub struct RouteDecisionView {
 #[derive(Debug, Clone)]
 pub struct RequestLogWrite {
     pub request_id: String,
+    pub downstream_client_request_id: Option<String>,
     pub downstream_path: String,
     pub upstream_path: String,
     pub model_requested: String,
-    pub route_id: i64,
-    pub channel_id: i64,
-    pub channel_label: String,
-    pub site_name: String,
-    pub upstream_model: String,
+    pub route_id: Option<i64>,
+    pub channel_id: Option<i64>,
+    pub channel_label: Option<String>,
+    pub site_name: Option<String>,
+    pub upstream_model: Option<String>,
     pub http_status: Option<i64>,
     pub latency_ms: i64,
     pub error_message: Option<String>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
+    pub claude_request_fingerprint: Option<String>,
 }

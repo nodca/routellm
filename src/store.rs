@@ -528,6 +528,7 @@ impl SqliteStore {
             r#"
             insert into request_logs (
               request_id,
+              downstream_client_request_id,
               downstream_path,
               upstream_path,
               model_requested,
@@ -541,11 +542,13 @@ impl SqliteStore {
               error_message,
               input_tokens,
               output_tokens,
-              total_tokens
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              total_tokens,
+              claude_request_fingerprint
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&log.request_id)
+        .bind(&log.downstream_client_request_id)
         .bind(&log.downstream_path)
         .bind(&log.upstream_path)
         .bind(&log.model_requested)
@@ -560,6 +563,7 @@ impl SqliteStore {
         .bind(log.input_tokens)
         .bind(log.output_tokens)
         .bind(log.total_tokens)
+        .bind(&log.claude_request_fingerprint)
         .execute(&self.pool)
         .await?;
 
@@ -645,6 +649,7 @@ impl SqliteStore {
             select
               rl.id,
               rl.request_id,
+              rl.downstream_client_request_id,
               rl.downstream_path,
               rl.upstream_path,
               rl.model_requested,
@@ -658,7 +663,8 @@ impl SqliteStore {
               rl.created_at,
               coalesce(rl.channel_label, c.label, '') as channel_label,
               coalesce(rl.site_name, s.name, '') as site_name,
-              coalesce(rl.upstream_model, c.upstream_model, '') as upstream_model
+              coalesce(rl.upstream_model, c.upstream_model, '') as upstream_model,
+              rl.claude_request_fingerprint
             from request_logs rl
             left join channels c on c.id = rl.channel_id
             left join accounts a on a.id = c.account_id

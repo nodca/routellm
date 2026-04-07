@@ -10,7 +10,7 @@ use axum::{
     body::{Body, Bytes, to_bytes},
     extract::{Path, Query, State},
     http::{
-        HeaderMap, StatusCode,
+        HeaderMap, StatusCode, Uri,
         header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING, UPGRADE},
     },
     response::Response,
@@ -103,6 +103,13 @@ struct PreparedPayloads {
     original_value: Value,
     original_json: OnceLock<Bytes>,
     chat_to_responses_json: OnceLock<Bytes>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RequestLogContext {
+    downstream_path: Option<String>,
+    downstream_client_request_id: Option<String>,
+    claude_request_fingerprint: Option<String>,
 }
 
 impl PreparedPayloads {
@@ -600,7 +607,15 @@ pub async fn create_response(
         .ok_or_else(|| AppError::BadRequest("field `model` is required".to_string()))?
         .to_string();
 
-    proxy_request(state, requested_model, payload, Protocol::Responses).await
+    proxy_request(
+        state,
+        requested_model,
+        payload,
+        Protocol::Responses,
+        None,
+        RequestLogContext::default(),
+    )
+    .await
 }
 
 pub async fn create_chat_completion(
@@ -612,11 +627,21 @@ pub async fn create_chat_completion(
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::BadRequest("field `model` is required".to_string()))?
         .to_string();
-    proxy_request(state, requested_model, payload, Protocol::ChatCompletions).await
+    proxy_request(
+        state,
+        requested_model,
+        payload,
+        Protocol::ChatCompletions,
+        None,
+        RequestLogContext::default(),
+    )
+    .await
 }
 
 pub async fn create_message(
     State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Result<Response<Body>, AppError> {
     let requested_model = payload
@@ -629,13 +654,30 @@ pub async fn create_message(
         .get("anthropic-beta")
         .and_then(Value::as_array)
         .is_some();
+    let log_context = build_claude_request_log_context(uri.path(), &headers, Some(&payload))?;
 
     if use_responses_adapter {
         let payload = anthropic_payload_with_stream_hint(payload)?;
-        return proxy_request(state, requested_model, payload, Protocol::Messages).await;
+        return proxy_request(
+            state,
+            requested_model,
+            payload,
+            Protocol::Messages,
+            None,
+            log_context,
+        )
+        .await;
     }
 
-    proxy_request(state, requested_model, payload, Protocol::Messages).await
+    proxy_request(
+        state,
+        requested_model,
+        payload,
+        Protocol::Messages,
+        None,
+        log_context,
+    )
+    .await
 }
 
 fn anthropic_payload_with_stream_hint(mut payload: Value) -> Result<Value, AppError> {
@@ -648,6 +690,97 @@ fn anthropic_payload_with_stream_hint(mut payload: Value) -> Result<Value, AppEr
     })?;
     object.insert("stream".to_string(), Value::Bool(stream));
     Ok(payload)
+}
+
+fn build_claude_request_log_context(
+    path: &str,
+    headers: &HeaderMap,
+    payload: Option<&Value>,
+) -> Result<RequestLogContext, AppError> {
+    let client_request_id = header_value(headers, "x-client-request-id");
+    let top_level_keys = payload
+        .and_then(Value::as_object)
+        .map(|object| {
+            let mut keys = object.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            keys
+        })
+        .unwrap_or_default();
+    let message_count = payload
+        .and_then(|body| body.get("messages"))
+        .and_then(Value::as_array)
+        .map(|messages| messages.len() as i64);
+    let tool_count = payload
+        .and_then(|body| body.get("tools"))
+        .and_then(Value::as_array)
+        .map(|tools| tools.len() as i64);
+    let tool_choice_type = payload.and_then(|body| {
+        body.get("tool_choice")
+            .and_then(|choice| choice.get("type").and_then(Value::as_str))
+            .map(ToString::to_string)
+            .or_else(|| {
+                body.get("tool_choice")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+    });
+    let anthropic_beta = header_csv_values(headers, "anthropic-beta");
+    let fingerprint = json!({
+        "headers": {
+            "anthropic_beta": anthropic_beta,
+            "x_app": header_value(headers, "x-app").map(|value| truncate(&value, 120)),
+            "x_client_app": header_value(headers, "x-client-app").map(|value| truncate(&value, 120)),
+            "x_client_request_id_present": client_request_id.is_some(),
+            "claude_code_session_id_present": headers.contains_key("x-claude-code-session-id"),
+            "x_anthropic_additional_protection_present": headers.contains_key("x-anthropic-additional-protection"),
+            "user_agent": header_value(headers, "user-agent").map(|value| truncate(&value, 200))
+        },
+        "body": {
+            "top_level_keys": top_level_keys,
+            "stream": payload.and_then(|body| body.get("stream")).and_then(Value::as_bool),
+            "message_count": message_count,
+            "system_present": payload.and_then(|body| body.get("system")).is_some_and(|value| !value.is_null()),
+            "tool_count": tool_count,
+            "tool_choice_type": tool_choice_type,
+            "thinking_present": payload.and_then(|body| body.get("thinking")).is_some_and(|value| !value.is_null()),
+            "context_management_present": payload.and_then(|body| body.get("context_management")).is_some_and(|value| !value.is_null()),
+            "metadata_present": payload.and_then(|body| body.get("metadata")).is_some_and(|value| !value.is_null()),
+            "max_tokens": payload.and_then(|body| body.get("max_tokens")).and_then(Value::as_i64),
+            "max_output_tokens": payload.and_then(|body| body.get("max_output_tokens")).and_then(Value::as_i64),
+            "max_completion_tokens": payload.and_then(|body| body.get("max_completion_tokens")).and_then(Value::as_i64)
+        }
+    });
+
+    Ok(RequestLogContext {
+        downstream_path: Some(path.to_string()),
+        downstream_client_request_id: client_request_id,
+        claude_request_fingerprint: Some(serde_json::to_string(&fingerprint).map_err(|error| {
+            AppError::Internal(format!("failed to serialize claude request fingerprint: {error}"))
+        })?),
+    })
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn header_csv_values(headers: &HeaderMap, name: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| seen.insert((*value).to_string()))
+        .map(ToString::to_string)
+        .collect()
 }
 
 pub async fn create_gemini_content(
@@ -671,6 +804,8 @@ pub async fn create_gemini_content(
         requested_model.clone(),
         chat_payload,
         Protocol::ChatCompletions,
+        None,
+        RequestLogContext::default(),
     )
     .await?;
 
@@ -691,12 +826,14 @@ async fn proxy_request(
     requested_model: String,
     payload: Value,
     downstream_protocol: Protocol,
+    request_id_override: Option<String>,
+    log_context: RequestLogContext,
 ) -> Result<Response<Body>, AppError> {
     let payloads = PreparedPayloads::new(payload);
     let route = state.store.find_route(&requested_model).await?;
     let channels = state.store.load_channels(route.id).await?;
     let now = now_ts();
-    let request_id = Uuid::new_v4().to_string();
+    let request_id = request_id_override.unwrap_or_else(|| Uuid::new_v4().to_string());
     let ordered_channels =
         routing::ordered_eligible_channel_refs(&channels, downstream_protocol, now);
     if ordered_channels.is_empty() {
@@ -709,6 +846,7 @@ async fn proxy_request(
                 &requested_model,
                 &payloads,
                 downstream_protocol,
+                &log_context,
             )
             .await;
         }
@@ -727,6 +865,7 @@ async fn proxy_request(
             &requested_model,
             &payloads,
             downstream_protocol,
+            &log_context,
         )
         .await
         {
@@ -748,6 +887,7 @@ async fn attempt_proxy_request(
     requested_model: &str,
     payloads: &PreparedPayloads,
     downstream_protocol: Protocol,
+    log_context: &RequestLogContext,
 ) -> Result<Response<Body>, AppError> {
     let channel_protocol = Protocol::parse(&selected.protocol)?;
     let dispatch = build_upstream_dispatch(downstream_protocol, channel_protocol)?;
@@ -795,6 +935,7 @@ async fn attempt_proxy_request(
                 requested_model,
                 downstream_protocol,
                 dispatch.upstream_protocol,
+                log_context,
                 None,
                 started_at.elapsed().as_millis() as i64,
                 error.to_string(),
@@ -824,6 +965,7 @@ async fn attempt_proxy_request(
             requested_model,
             downstream_protocol,
             dispatch.upstream_protocol,
+            log_context,
             Some(status.as_u16()),
             started_at.elapsed().as_millis() as i64,
             message.clone(),
@@ -847,6 +989,7 @@ async fn attempt_proxy_request(
                     started_at,
                     downstream_protocol,
                     dispatch.upstream_protocol,
+                    log_context.clone(),
                     !is_stream,
                 )
                 .await
@@ -861,6 +1004,7 @@ async fn attempt_proxy_request(
                     upstream_response,
                     started_at,
                     dispatch.upstream_protocol,
+                    log_context.clone(),
                 )
                 .await
             }
@@ -874,6 +1018,7 @@ async fn attempt_proxy_request(
                     upstream_response,
                     started_at,
                     dispatch.upstream_protocol,
+                    log_context.clone(),
                 )
                 .await
             }
@@ -893,6 +1038,7 @@ async fn attempt_proxy_request(
             started_at,
             downstream_protocol,
             dispatch.upstream_protocol,
+            log_context.clone(),
         )
         .await;
     }
@@ -910,6 +1056,7 @@ async fn attempt_proxy_request(
             started_at,
             downstream_protocol,
             dispatch.upstream_protocol,
+            log_context.clone(),
             !is_stream,
         )
         .await;
@@ -925,6 +1072,7 @@ async fn attempt_proxy_request(
             upstream_response,
             started_at,
             dispatch.upstream_protocol,
+            log_context.clone(),
         )
         .await;
     }
@@ -941,6 +1089,7 @@ async fn attempt_proxy_request(
                 requested_model,
                 downstream_protocol,
                 dispatch.upstream_protocol,
+                log_context,
                 Some(status.as_u16()),
                 started_at.elapsed().as_millis() as i64,
                 message.clone(),
@@ -961,6 +1110,7 @@ async fn attempt_proxy_request(
                 requested_model,
                 downstream_protocol,
                 dispatch.upstream_protocol,
+                log_context,
                 Some(status.as_u16()),
                 started_at.elapsed().as_millis() as i64,
                 message.clone(),
@@ -989,6 +1139,7 @@ async fn attempt_proxy_request(
         requested_model,
         downstream_protocol,
         dispatch.upstream_protocol,
+        log_context,
         status.as_u16(),
         started_at.elapsed().as_millis() as i64,
         token_usage,
@@ -1074,6 +1225,7 @@ async fn proxy_passthrough_stream(
     started_at: Instant,
     downstream_protocol: Protocol,
     upstream_protocol: Protocol,
+    log_context: RequestLogContext,
     capture_usage: bool,
 ) -> Result<Response<Body>, AppError> {
     let upstream_url = upstream_response.url().to_string();
@@ -1095,6 +1247,7 @@ async fn proxy_passthrough_stream(
                 &requested_model,
                 downstream_protocol,
                 upstream_protocol,
+                &log_context,
                 Some(status.as_u16()),
                 started_at.elapsed().as_millis() as i64,
                 message.clone(),
@@ -1110,6 +1263,7 @@ async fn proxy_passthrough_stream(
     let selected_for_task = selected.clone();
     let request_id_for_task = request_id.clone();
     let requested_model_for_task = requested_model.clone();
+    let log_context_for_task = log_context.clone();
 
     tokio::spawn(async move {
         let mut stream_error: Option<String> = None;
@@ -1163,6 +1317,7 @@ async fn proxy_passthrough_stream(
                 &requested_model_for_task,
                 downstream_protocol,
                 upstream_protocol,
+                &log_context_for_task,
                 Some(status.as_u16()),
                 latency_ms,
                 message,
@@ -1188,6 +1343,7 @@ async fn proxy_passthrough_stream(
             &requested_model_for_task,
             downstream_protocol,
             upstream_protocol,
+            &log_context_for_task,
             status.as_u16(),
             latency_ms,
             success_note,
@@ -1214,6 +1370,7 @@ async fn proxy_nonstream_passthrough_json(
     started_at: Instant,
     downstream_protocol: Protocol,
     upstream_protocol: Protocol,
+    log_context: RequestLogContext,
 ) -> Result<Response<Body>, AppError> {
     let body = match read_response_body(upstream_response).await {
         Ok(body) => body,
@@ -1227,6 +1384,7 @@ async fn proxy_nonstream_passthrough_json(
                 &requested_model,
                 downstream_protocol,
                 upstream_protocol,
+                &log_context,
                 Some(status.as_u16()),
                 started_at.elapsed().as_millis() as i64,
                 message.clone(),
@@ -1248,6 +1406,7 @@ async fn proxy_nonstream_passthrough_json(
                 &requested_model,
                 downstream_protocol,
                 upstream_protocol,
+                &log_context,
                 Some(status.as_u16()),
                 started_at.elapsed().as_millis() as i64,
                 message.clone(),
@@ -1266,6 +1425,7 @@ async fn proxy_nonstream_passthrough_json(
         &requested_model,
         downstream_protocol,
         upstream_protocol,
+        &log_context,
         status.as_u16(),
         started_at.elapsed().as_millis() as i64,
         token_usage,
@@ -1284,6 +1444,7 @@ async fn proxy_chat_completions_stream(
     upstream_response: reqwest::Response,
     started_at: Instant,
     upstream_protocol: Protocol,
+    log_context: RequestLogContext,
 ) -> Result<Response<Body>, AppError> {
     let upstream_url = upstream_response.url().to_string();
     let mut upstream_stream = upstream_response.bytes_stream();
@@ -1304,6 +1465,7 @@ async fn proxy_chat_completions_stream(
                 &requested_model,
                 Protocol::ChatCompletions,
                 upstream_protocol,
+                &log_context,
                 Some(StatusCode::OK.as_u16()),
                 started_at.elapsed().as_millis() as i64,
                 message.clone(),
@@ -1320,6 +1482,7 @@ async fn proxy_chat_completions_stream(
     let request_id_for_task = request_id.clone();
     let requested_model_for_task = requested_model.clone();
     let chat_id = format!("chatcmpl-{request_id}");
+    let log_context_for_task = log_context.clone();
 
     tokio::spawn(async move {
         let mut buffer = String::new();
@@ -1442,6 +1605,7 @@ async fn proxy_chat_completions_stream(
                 &requested_model_for_task,
                 Protocol::ChatCompletions,
                 upstream_protocol,
+                &log_context_for_task,
                 Some(StatusCode::OK.as_u16()),
                 latency_ms,
                 message,
@@ -1464,6 +1628,7 @@ async fn proxy_chat_completions_stream(
             &requested_model_for_task,
             Protocol::ChatCompletions,
             upstream_protocol,
+            &log_context_for_task,
             StatusCode::OK.as_u16(),
             latency_ms,
             success_note,
@@ -1493,6 +1658,7 @@ async fn proxy_anthropic_message_stream(
     upstream_response: reqwest::Response,
     started_at: Instant,
     upstream_protocol: Protocol,
+    log_context: RequestLogContext,
 ) -> Result<Response<Body>, AppError> {
     if upstream_protocol != Protocol::Responses {
         let upstream_url = upstream_response.url().to_string();
@@ -1518,6 +1684,7 @@ async fn proxy_anthropic_message_stream(
             &requested_model,
             Protocol::Messages,
             upstream_protocol,
+            &log_context,
             StatusCode::OK.as_u16(),
             latency_ms,
             None,
@@ -1552,6 +1719,7 @@ async fn proxy_anthropic_message_stream(
                 &requested_model,
                 Protocol::Messages,
                 upstream_protocol,
+                &log_context,
                 Some(StatusCode::OK.as_u16()),
                 started_at.elapsed().as_millis() as i64,
                 message.clone(),
@@ -1567,6 +1735,7 @@ async fn proxy_anthropic_message_stream(
     let selected_for_task = selected.clone();
     let request_id_for_task = request_id.clone();
     let requested_model_for_task = requested_model.clone();
+    let log_context_for_task = log_context.clone();
 
     tokio::spawn(async move {
         let mut buffer = String::new();
@@ -1657,6 +1826,7 @@ async fn proxy_anthropic_message_stream(
                 &requested_model_for_task,
                 Protocol::Messages,
                 upstream_protocol,
+                &log_context_for_task,
                 Some(StatusCode::OK.as_u16()),
                 latency_ms,
                 message,
@@ -1678,6 +1848,7 @@ async fn proxy_anthropic_message_stream(
             &requested_model_for_task,
             Protocol::Messages,
             upstream_protocol,
+            &log_context_for_task,
             StatusCode::OK.as_u16(),
             latency_ms,
             success_note,
@@ -1813,10 +1984,16 @@ fn channel_admin_view(
 fn request_log_admin_view(log: RequestLogRow) -> Value {
     let (error_kind, error_hint) =
         classify_upstream_error(log.http_status, log.error_message.as_deref());
+    let claude_request_fingerprint = log
+        .claude_request_fingerprint
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .unwrap_or(Value::Null);
 
     json!({
         "id": log.id,
         "request_id": log.request_id,
+        "downstream_client_request_id": log.downstream_client_request_id,
         "downstream_path": log.downstream_path,
         "upstream_path": log.upstream_path,
         "model_requested": log.model_requested,
@@ -1827,6 +2004,7 @@ fn request_log_admin_view(log: RequestLogRow) -> Value {
         "http_status": log.http_status,
         "latency_ms": log.latency_ms,
         "error_message": log.error_message,
+        "claude_request_fingerprint": claude_request_fingerprint,
         "error_kind": error_kind,
         "error_hint": error_hint,
         "created_at": log.created_at
@@ -1945,6 +2123,7 @@ async fn record_success(
     requested_model: &str,
     downstream_protocol: Protocol,
     upstream_protocol: Protocol,
+    log_context: &RequestLogContext,
     http_status: u16,
     latency_ms: i64,
     token_usage: Option<TokenUsage>,
@@ -1957,6 +2136,7 @@ async fn record_success(
         requested_model,
         downstream_protocol,
         upstream_protocol,
+        log_context,
         http_status,
         latency_ms,
         None,
@@ -1973,6 +2153,7 @@ async fn record_success_with_note(
     requested_model: &str,
     downstream_protocol: Protocol,
     upstream_protocol: Protocol,
+    log_context: &RequestLogContext,
     http_status: u16,
     latency_ms: i64,
     error_message: Option<String>,
@@ -1985,6 +2166,7 @@ async fn record_success_with_note(
         requested_model,
         downstream_protocol,
         upstream_protocol,
+        log_context,
         Some(i64::from(http_status)),
         latency_ms,
         error_message,
@@ -2006,6 +2188,7 @@ async fn record_failure(
     requested_model: &str,
     downstream_protocol: Protocol,
     upstream_protocol: Protocol,
+    log_context: &RequestLogContext,
     http_status: Option<u16>,
     latency_ms: i64,
     error_message: String,
@@ -2017,6 +2200,7 @@ async fn record_failure(
         requested_model,
         downstream_protocol,
         upstream_protocol,
+        log_context,
         http_status.map(i64::from),
         latency_ms,
         Some(error_message.clone()),
@@ -2041,6 +2225,7 @@ fn build_request_log_write(
     requested_model: &str,
     downstream_protocol: Protocol,
     upstream_protocol: Protocol,
+    log_context: &RequestLogContext,
     http_status: Option<i64>,
     latency_ms: i64,
     error_message: Option<String>,
@@ -2058,20 +2243,25 @@ fn build_request_log_write(
 
     RequestLogWrite {
         request_id: request_id.to_string(),
-        downstream_path: downstream_protocol.path().to_string(),
+        downstream_client_request_id: log_context.downstream_client_request_id.clone(),
+        downstream_path: log_context
+            .downstream_path
+            .clone()
+            .unwrap_or_else(|| downstream_protocol.path().to_string()),
         upstream_path: upstream_protocol.path().to_string(),
         model_requested: requested_model.to_string(),
-        route_id: route.id,
-        channel_id: selected.channel_id,
-        channel_label: selected.channel_label.clone(),
-        site_name: selected.site_name.clone(),
-        upstream_model: selected.upstream_model.clone(),
+        route_id: Some(route.id),
+        channel_id: Some(selected.channel_id),
+        channel_label: Some(selected.channel_label.clone()),
+        site_name: Some(selected.site_name.clone()),
+        upstream_model: Some(selected.upstream_model.clone()),
         http_status,
         latency_ms,
         error_message,
         input_tokens,
         output_tokens,
         total_tokens,
+        claude_request_fingerprint: log_context.claude_request_fingerprint.clone(),
     }
 }
 
