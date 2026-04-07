@@ -84,11 +84,12 @@ enum ResponseAdapter {
     ResponsesToAnthropicMessages,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DispatchPayloadKind {
     Original,
     ChatCompletionsToResponses,
     AnthropicMessagesToResponses,
+    AnthropicMessagesToResponsesAssistantHistoryCompat,
 }
 
 #[derive(Debug)]
@@ -103,6 +104,7 @@ struct PreparedPayloads {
     original_value: Value,
     original_json: OnceLock<Bytes>,
     chat_to_responses_json: OnceLock<Bytes>,
+    anthropic_compat_to_responses_json: OnceLock<Bytes>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -118,6 +120,7 @@ impl PreparedPayloads {
             original_value: payload,
             original_json: OnceLock::new(),
             chat_to_responses_json: OnceLock::new(),
+            anthropic_compat_to_responses_json: OnceLock::new(),
         }
     }
 
@@ -157,6 +160,19 @@ impl PreparedPayloads {
                 let adapted = anthropic_messages_to_responses_payload(&self.original_value)?;
                 let bytes = serialize_json_bytes(&adapted)?;
                 let _ = self.chat_to_responses_json.set(bytes.clone());
+                Ok(bytes)
+            }
+            DispatchPayloadKind::AnthropicMessagesToResponsesAssistantHistoryCompat => {
+                if let Some(bytes) = self.anthropic_compat_to_responses_json.get() {
+                    return Ok(bytes.clone());
+                }
+
+                let adapted =
+                    anthropic_messages_to_responses_payload_assistant_history_compat(
+                        &self.original_value,
+                    )?;
+                let bytes = serialize_json_bytes(&adapted)?;
+                let _ = self.anthropic_compat_to_responses_json.set(bytes.clone());
                 Ok(bytes)
             }
         }
@@ -208,6 +224,37 @@ fn build_upstream_url(base_url: &str, protocol: Protocol) -> String {
             }
         }
     }
+}
+
+async fn dispatch_upstream_request(
+    upstream_client: &reqwest::Client,
+    upstream_url: &str,
+    upstream_protocol: Protocol,
+    api_key: &str,
+    payload_bytes: Bytes,
+) -> Result<reqwest::Response, AppError> {
+    timeout(
+        Duration::from_secs(FIRST_TOKEN_TIMEOUT_SECS),
+        apply_upstream_auth(
+            upstream_client.post(upstream_url),
+            upstream_protocol,
+            api_key,
+        )
+        .header(CONTENT_TYPE, "application/json")
+        .body(payload_bytes)
+        .send(),
+    )
+    .await
+    .map_err(|_| AppError::UpstreamTransport(first_token_timeout_message("response headers")))
+    .and_then(|response| {
+        response.map_err(|error| {
+            AppError::UpstreamTransport(describe_reqwest_error(
+                "send_upstream_request",
+                Some(upstream_url),
+                &error,
+            ))
+        })
+    })
 }
 
 #[derive(Debug)]
@@ -1390,28 +1437,14 @@ async fn attempt_proxy_request(
     } else {
         &state.upstream_client
     };
-    let upstream_response = timeout(
-        Duration::from_secs(FIRST_TOKEN_TIMEOUT_SECS),
-        apply_upstream_auth(
-            upstream_client.post(&upstream_url),
-            dispatch.upstream_protocol,
-            &selected.account_api_key,
-        )
-        .header(CONTENT_TYPE, "application/json")
-        .body(payload_bytes.clone())
-        .send(),
+    let upstream_response = dispatch_upstream_request(
+        upstream_client,
+        &upstream_url,
+        dispatch.upstream_protocol,
+        &selected.account_api_key,
+        payload_bytes.clone(),
     )
-    .await
-    .map_err(|_| AppError::UpstreamTransport(first_token_timeout_message("response headers")))
-    .and_then(|response| {
-        response.map_err(|error| {
-            AppError::UpstreamTransport(describe_reqwest_error(
-                "send_upstream_request",
-                Some(&upstream_url),
-                &error,
-            ))
-        })
-    });
+    .await;
 
     let upstream_response = match upstream_response {
         Ok(response) => response,
@@ -1434,7 +1467,72 @@ async fn attempt_proxy_request(
         }
     };
 
-    let status = upstream_response.status();
+    let mut upstream_response = upstream_response;
+    let mut status = upstream_response.status();
+    if status.is_server_error()
+        && dispatch.payload_kind == DispatchPayloadKind::AnthropicMessagesToResponses
+        && should_retry_with_assistant_text_history_compat(&payloads.original_value)
+    {
+        tracing::warn!(
+            request_id,
+            requested_model,
+            status = status.as_u16(),
+            "retrying anthropic messages request with assistant-history compatibility payload"
+        );
+        let compat_payload_bytes = match payloads
+            .bytes_for(DispatchPayloadKind::AnthropicMessagesToResponsesAssistantHistoryCompat)
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                record_failure(
+                    &state,
+                    &route,
+                    &selected,
+                    request_id,
+                    requested_model,
+                    downstream_protocol,
+                    dispatch.upstream_protocol,
+                    log_context,
+                    Some(error.status_code().as_u16()),
+                    started_at.elapsed().as_millis() as i64,
+                    error.to_string(),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+
+        upstream_response = match dispatch_upstream_request(
+            upstream_client,
+            &upstream_url,
+            dispatch.upstream_protocol,
+            &selected.account_api_key,
+            compat_payload_bytes,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                record_failure(
+                    &state,
+                    &route,
+                    &selected,
+                    request_id,
+                    requested_model,
+                    downstream_protocol,
+                    dispatch.upstream_protocol,
+                    log_context,
+                    None,
+                    started_at.elapsed().as_millis() as i64,
+                    error.to_string(),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+        status = upstream_response.status();
+    }
+
     let headers = upstream_response.headers().clone();
 
     if !status.is_success() {
@@ -3154,6 +3252,28 @@ fn select_last_chance_channel(
 }
 
 fn anthropic_messages_to_responses_payload(payload: &Value) -> Result<Value, AppError> {
+    anthropic_messages_to_responses_payload_with_mode(payload, AssistantTextHistoryMode::NativeRole)
+}
+
+fn anthropic_messages_to_responses_payload_assistant_history_compat(
+    payload: &Value,
+) -> Result<Value, AppError> {
+    anthropic_messages_to_responses_payload_with_mode(
+        payload,
+        AssistantTextHistoryMode::TranscriptUser,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssistantTextHistoryMode {
+    NativeRole,
+    TranscriptUser,
+}
+
+fn anthropic_messages_to_responses_payload_with_mode(
+    payload: &Value,
+    assistant_text_mode: AssistantTextHistoryMode,
+) -> Result<Value, AppError> {
     let model = payload
         .get("model")
         .and_then(Value::as_str)
@@ -3167,7 +3287,10 @@ fn anthropic_messages_to_responses_payload(payload: &Value) -> Result<Value, App
     body.insert("model".to_string(), Value::String(model.to_string()));
     body.insert(
         "input".to_string(),
-        Value::Array(anthropic_messages_to_responses_input(messages)?),
+        Value::Array(anthropic_messages_to_responses_input(
+            messages,
+            assistant_text_mode,
+        )?),
     );
 
     copy_optional_field(payload, &mut body, "stream");
@@ -3205,15 +3328,24 @@ fn anthropic_messages_to_responses_payload(payload: &Value) -> Result<Value, App
     Ok(Value::Object(body))
 }
 
-fn anthropic_messages_to_responses_input(messages: &[Value]) -> Result<Vec<Value>, AppError> {
+fn anthropic_messages_to_responses_input(
+    messages: &[Value],
+    assistant_text_mode: AssistantTextHistoryMode,
+) -> Result<Vec<Value>, AppError> {
     let mut items = Vec::new();
     for message in messages {
-        items.extend(anthropic_message_to_responses_items(message)?);
+        items.extend(anthropic_message_to_responses_items(
+            message,
+            assistant_text_mode,
+        )?);
     }
     Ok(items)
 }
 
-fn anthropic_message_to_responses_items(message: &Value) -> Result<Vec<Value>, AppError> {
+fn anthropic_message_to_responses_items(
+    message: &Value,
+    assistant_text_mode: AssistantTextHistoryMode,
+) -> Result<Vec<Value>, AppError> {
     let role = message
         .get("role")
         .and_then(Value::as_str)
@@ -3223,7 +3355,9 @@ fn anthropic_message_to_responses_items(message: &Value) -> Result<Vec<Value>, A
         .ok_or_else(|| AppError::BadRequest("anthropic message content is required".to_string()))?;
 
     match role {
-        "user" | "assistant" => anthropic_content_to_responses_items(role, content),
+        "user" | "assistant" => {
+            anthropic_content_to_responses_items(role, content, assistant_text_mode)
+        }
         other => Err(AppError::BadRequest(format!(
             "unsupported anthropic message role: {other}"
         ))),
@@ -3233,16 +3367,21 @@ fn anthropic_message_to_responses_items(message: &Value) -> Result<Vec<Value>, A
 fn anthropic_content_to_responses_items(
     role: &str,
     content: &Value,
+    assistant_text_mode: AssistantTextHistoryMode,
 ) -> Result<Vec<Value>, AppError> {
     match content {
-        Value::String(text) => Ok(vec![json!({
-            "type": "message",
-            "role": role,
-            "content": [{ "type": "input_text", "text": text }]
-        })]),
+        Value::String(text) => Ok(vec![responses_message_item(
+            role,
+            vec![json!({
+                "type": "input_text",
+                "text": transcript_safe_message_text(role, vec![text.to_string()], assistant_text_mode)
+            })],
+            assistant_text_mode,
+        )]),
         Value::Array(blocks) => {
             let mut items = Vec::new();
             let mut text_parts = Vec::new();
+            let mut text_fragments = Vec::new();
             for block in blocks {
                 let block_type = block.get("type").and_then(Value::as_str).ok_or_else(|| {
                     AppError::BadRequest("anthropic content block type is required".to_string())
@@ -3254,6 +3393,7 @@ fn anthropic_content_to_responses_items(
                                 "anthropic text block text is required".to_string(),
                             )
                         })?;
+                        text_fragments.push(text.to_string());
                         text_parts.push(json!({ "type": "input_text", "text": text }));
                     }
                     "tool_use" => {
@@ -3298,11 +3438,24 @@ fn anthropic_content_to_responses_items(
             if !text_parts.is_empty() {
                 items.insert(
                     0,
-                    json!({
-                        "type": "message",
-                        "role": role,
-                        "content": text_parts
-                    }),
+                    responses_message_item(
+                        role,
+                        if role == "assistant"
+                            && assistant_text_mode == AssistantTextHistoryMode::TranscriptUser
+                        {
+                            vec![json!({
+                                "type": "input_text",
+                                "text": transcript_safe_message_text(
+                                    role,
+                                    text_fragments,
+                                    assistant_text_mode,
+                                )
+                            })]
+                        } else {
+                            text_parts
+                        },
+                        assistant_text_mode,
+                    ),
                 );
             }
 
@@ -3311,6 +3464,69 @@ fn anthropic_content_to_responses_items(
         _ => Err(AppError::BadRequest(
             "anthropic message content must be a string or array".to_string(),
         )),
+    }
+}
+
+fn responses_message_item(
+    role: &str,
+    content: Vec<Value>,
+    assistant_text_mode: AssistantTextHistoryMode,
+) -> Value {
+    let mapped_role =
+        if role == "assistant" && assistant_text_mode == AssistantTextHistoryMode::TranscriptUser {
+            "user"
+        } else {
+            role
+        };
+    json!({
+        "type": "message",
+        "role": mapped_role,
+        "content": content
+    })
+}
+
+fn transcript_safe_message_text(
+    role: &str,
+    text_fragments: Vec<String>,
+    assistant_text_mode: AssistantTextHistoryMode,
+) -> String {
+    let joined = text_fragments.join("\n");
+    if role == "assistant" && assistant_text_mode == AssistantTextHistoryMode::TranscriptUser {
+        format!("Assistant: {joined}")
+    } else {
+        joined
+    }
+}
+
+fn should_retry_with_assistant_text_history_compat(payload: &Value) -> bool {
+    payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages
+                .iter()
+                .any(anthropic_message_has_plaintext_assistant_history)
+        })
+}
+
+fn anthropic_message_has_plaintext_assistant_history(message: &Value) -> bool {
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return false;
+    }
+
+    match message.get("content") {
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Array(blocks)) => {
+            !blocks.is_empty()
+                && blocks.iter().all(|block| {
+                    block.get("type").and_then(Value::as_str) == Some("text")
+                        && block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.trim().is_empty())
+                })
+        }
+        _ => false,
     }
 }
 
@@ -5193,7 +5409,7 @@ mod tests {
         net::SocketAddr,
         path::PathBuf,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
@@ -5202,6 +5418,7 @@ mod tests {
     use axum::{
         Json, Router,
         body::{Body, Bytes, to_bytes},
+        extract::State,
         http::{HeaderMap, Request, StatusCode, header::CONTENT_TYPE},
         response::Response,
         routing::post,
@@ -5426,6 +5643,79 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         addr
+    }
+
+    async fn spawn_assistant_history_sensitive_upstream() -> (
+        SocketAddr,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<Value>>>,
+    ) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let captured_requests = Arc::new(Mutex::new(Vec::new()));
+        let attempts_for_handler = attempts.clone();
+        let captured_for_handler = captured_requests.clone();
+
+        async fn handler(
+            State((attempts, captured)): State<(Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>)>,
+            Json(payload): Json<Value>,
+        ) -> Response<Body> {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            captured.lock().unwrap().push(payload.clone());
+
+            let has_assistant_role_history = payload
+                .get("input")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.get("type").and_then(Value::as_str) == Some("message")
+                            && item.get("role").and_then(Value::as_str) == Some("assistant")
+                    })
+                });
+
+            if has_assistant_role_history {
+                return Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"error":{"message":"assistant role history unsupported","type":"server_error"}}"#,
+                    ))
+                    .unwrap();
+            }
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "id": "resp_compat_ok",
+                        "output": [{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "compat fallback ok"
+                            }]
+                        }],
+                        "usage": {
+                            "input_tokens": 12,
+                            "output_tokens": 3,
+                            "total_tokens": 15
+                        }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap()
+        }
+
+        let app = Router::new()
+            .route("/v1/responses", post(handler))
+            .with_state((attempts_for_handler, captured_for_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, attempts, captured_requests)
     }
 
     async fn spawn_delayed_server_error_upstream(delay: Duration) -> SocketAddr {
@@ -8851,6 +9141,104 @@ mod tests {
         assert_eq!(proxy_value["model"], "claude-opus-4-6");
         assert_eq!(proxy_value["content"][0]["type"], "text");
         assert_eq!(proxy_value["content"][0]["text"], "hello from upstream");
+    }
+
+    #[tokio::test]
+    async fn claude_messages_retry_with_assistant_history_compat_after_upstream_5xx() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let (upstream_addr, attempts, captured_requests) =
+            spawn_assistant_history_sensitive_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let create_route_request = Request::builder()
+            .method("POST")
+            .uri("/api/routes")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "route_model": "claude-opus-4-6"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let create_route_response = app.clone().oneshot(create_route_request).await.unwrap();
+        assert_eq!(create_route_response.status(), StatusCode::CREATED);
+        let create_route_body = to_bytes(create_route_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_route_value: Value = serde_json::from_slice(&create_route_body).unwrap();
+        let route_id = create_route_value["data"]["route"]["id"].as_i64().unwrap();
+
+        let create_channel_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/routes/{route_id}/channels"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "base_url": format!("http://{upstream_addr}"),
+                    "api_key": "test-key",
+                    "upstream_model": "gpt-5.4",
+                    "protocol": "responses"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let create_channel_response = app.clone().oneshot(create_channel_request).await.unwrap();
+        assert_eq!(create_channel_response.status(), StatusCode::CREATED);
+
+        let proxy_request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "claude-opus-4-6",
+                    "max_tokens": 64,
+                    "messages": [
+                        { "role": "user", "content": [{ "type": "text", "text": "hello" }] },
+                        { "role": "assistant", "content": [{ "type": "text", "text": "pong" }] },
+                        { "role": "user", "content": [{ "type": "text", "text": "ping" }] }
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
+        assert_eq!(proxy_response.status(), StatusCode::OK);
+        let proxy_body = to_bytes(proxy_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let proxy_value: Value = serde_json::from_slice(&proxy_body).unwrap();
+        assert_eq!(proxy_value["content"][0]["text"], "compat fallback ok");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        let captured = captured_requests.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        let first_input = captured[0]["input"].as_array().unwrap();
+        assert!(first_input.iter().any(|item| {
+            item["type"] == "message" && item["role"] == "assistant"
+        }));
+        let second_input = captured[1]["input"].as_array().unwrap();
+        assert!(!second_input.iter().any(|item| {
+            item["type"] == "message" && item["role"] == "assistant"
+        }));
+        assert!(second_input.iter().any(|item| {
+            item["type"] == "message"
+                && item["role"] == "user"
+                && item["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Assistant: pong"))
+        }));
     }
 
     #[tokio::test]
