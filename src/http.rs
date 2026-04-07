@@ -1395,6 +1395,78 @@ fn extract_upstream_error_metadata(
     })
 }
 
+fn anthropic_error_kind_from_status(status: StatusCode) -> &'static str {
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        "authentication_error"
+    } else if status.is_server_error() {
+        "api_error"
+    } else {
+        "invalid_request_error"
+    }
+}
+
+fn build_anthropic_upstream_error_response(
+    status: StatusCode,
+    request_id: &str,
+    upstream_headers: &HeaderMap,
+    body: &[u8],
+    metadata: Option<&UpstreamErrorMetadata>,
+) -> Result<Response<Body>, AppError> {
+    let parsed_body = serde_json::from_slice::<Value>(body).ok();
+    let upstream_error = parsed_body.as_ref().and_then(|value| value.get("error"));
+    let message = upstream_error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            parsed_body
+                .as_ref()
+                .and_then(|value| value.get("message").and_then(Value::as_str))
+        })
+        .unwrap_or("upstream request failed");
+    let kind = upstream_error
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            parsed_body
+                .as_ref()
+                .filter(|value| value.get("type").and_then(Value::as_str) != Some("error"))
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_else(|| anthropic_error_kind_from_status(status));
+
+    let payload = json!({
+        "type": "error",
+        "error": {
+            "type": kind,
+            "message": message
+        }
+    });
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+    let response_request_id = metadata
+        .and_then(|value| value.request_id.as_deref())
+        .unwrap_or(request_id);
+    headers.insert("request-id", response_request_id.parse().unwrap());
+
+    if let Some(retry_after) = metadata.and_then(|value| value.retry_after.as_deref()) {
+        headers.insert("retry-after", retry_after.parse().unwrap());
+    }
+    if let Some(should_retry) = metadata.and_then(|value| value.should_retry.as_deref()) {
+        headers.insert("x-should-retry", should_retry.parse().unwrap());
+    }
+    if let Some(version) = upstream_headers.get("anthropic-version") {
+        headers.insert("anthropic-version", version.clone());
+    }
+
+    build_response(
+        status,
+        &headers,
+        Body::from(serialize_json_bytes(&payload)?),
+    )
+}
+
 pub(crate) fn is_anthropic_message_path(path: &str) -> bool {
     path == "/v1/messages" || path == "/messages"
 }
@@ -1794,13 +1866,26 @@ async fn attempt_proxy_request(
     let headers = upstream_response.headers().clone();
 
     if !status.is_success() {
-        let message = match upstream_response.bytes().await {
-            Ok(body) => truncate(String::from_utf8_lossy(&body).as_ref(), 800),
-            Err(error) => format!(
-                "upstream returned status={} but failed to read error body: {}",
-                status.as_u16(),
-                describe_reqwest_error("read_error_response_body", Some(&upstream_url), &error)
+        let (message, metadata, error_body) = match upstream_response.bytes().await {
+            Ok(body) => (
+                truncate(String::from_utf8_lossy(&body).as_ref(), 800),
+                extract_upstream_error_metadata(&headers, &body),
+                body.to_vec(),
             ),
+            Err(error) => {
+                let message = format!(
+                    "upstream returned status={} but failed to read error body: {}",
+                    status.as_u16(),
+                    describe_reqwest_error("read_error_response_body", Some(&upstream_url), &error)
+                );
+                let fallback_body = serde_json::to_vec(&json!({
+                    "error": {
+                        "message": message
+                    }
+                }))
+                .unwrap_or_default();
+                (message, None, fallback_body)
+            }
         };
         record_failure(
             &state,
@@ -1816,7 +1901,16 @@ async fn attempt_proxy_request(
             message.clone(),
         )
         .await?;
-        return Err(AppError::UpstreamStatus(message, status, None));
+        if downstream_protocol == Protocol::Messages {
+            return build_anthropic_upstream_error_response(
+                status,
+                request_id,
+                &headers,
+                &error_body,
+                metadata.as_ref(),
+            );
+        }
+        return Err(AppError::UpstreamStatus(message, status, metadata));
     }
 
     if is_stream {
@@ -8121,6 +8215,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claude_messages_propagates_anthropic_error_headers() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let expected_upstream_payload = fixture_json(include_str!(
+            "claude/fixtures/claude_code_http_transcript_followup_responses_payload.json"
+        ));
+        let first_error = json!({
+            "type": "error",
+            "error": {
+                "type": "overloaded_error",
+                "message": "capacity spike"
+            },
+            "request_id": "req_body_ignored"
+        });
+        let second_error = json!({
+            "type": "error",
+            "error": {
+                "type": "rate_limit_error",
+                "message": "slow down"
+            },
+            "request_id": "req_body_456"
+        });
+        let overloaded_status = StatusCode::from_u16(529).unwrap();
+        let (upstream_addr, captured_requests) = spawn_responses_replay_upstream(vec![
+            json_replay_response_with_headers(
+                overloaded_status,
+                vec![
+                    ("request-id", "req_header_123"),
+                    ("retry-after", "11"),
+                    ("x-should-retry", "true"),
+                ],
+                first_error,
+            ),
+            json_replay_response_with_headers(
+                StatusCode::TOO_MANY_REQUESTS,
+                vec![("retry-after", "5"), ("x-should-retry", "false")],
+                second_error,
+            ),
+        ])
+        .await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        let route_id =
+            create_route_with_responses_channel(&app, "claude-sonnet-4-6", upstream_addr).await;
+
+        let first_request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(include_str!(
+                "claude/fixtures/claude_code_http_transcript_followup_request.json"
+            )))
+            .unwrap();
+        let first_response = app.clone().oneshot(first_request).await.unwrap();
+        assert_eq!(first_response.status(), overloaded_status);
+        assert_eq!(
+            first_response.headers().get("request-id").unwrap(),
+            "req_header_123"
+        );
+        assert_eq!(first_response.headers().get("retry-after").unwrap(), "11");
+        assert_eq!(
+            first_response.headers().get("x-should-retry").unwrap(),
+            "true"
+        );
+        let first_value = response_json(first_response).await;
+        assert_eq!(first_value["type"], "error");
+        assert_eq!(first_value["error"]["type"], "overloaded_error");
+        assert_eq!(first_value["error"]["message"], "capacity spike");
+
+        let second_request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(include_str!(
+                "claude/fixtures/claude_code_http_transcript_followup_request.json"
+            )))
+            .unwrap();
+        let second_response = app.clone().oneshot(second_request).await.unwrap();
+        assert_eq!(second_response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            second_response.headers().get("request-id").unwrap(),
+            "req_body_456"
+        );
+        assert_eq!(second_response.headers().get("retry-after").unwrap(), "5");
+        assert_eq!(
+            second_response.headers().get("x-should-retry").unwrap(),
+            "false"
+        );
+        let second_value = response_json(second_response).await;
+        assert_eq!(second_value["type"], "error");
+        assert_eq!(second_value["error"]["type"], "rate_limit_error");
+        assert_eq!(second_value["error"]["message"], "slow down");
+
+        let captured = captured_requests.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0], expected_upstream_payload);
+        assert_eq!(captured[1], expected_upstream_payload);
+
+        let log = latest_route_log(&app, route_id).await;
+        assert_eq!(log["upstream_path"], "/v1/responses");
+        assert_eq!(log["http_status"], 429);
+    }
+
+    #[tokio::test]
     async fn claude_code_style_message_failures_log_redacted_fingerprint_and_correlation() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
@@ -8235,7 +8441,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["type"], "error");
-        assert_eq!(value["error"]["type"], "api_error");
+        assert_eq!(value["error"]["type"], "server_error");
         assert!(
             value["error"]["message"]
                 .as_str()
@@ -9122,9 +9328,8 @@ mod tests {
     async fn claude_http_golden_replay_stream_failure_chunked() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
-        let expected_prefix = include_str!(
-            "claude/fixtures/claude_code_http_stream_failure_prefix.sse"
-        );
+        let expected_prefix =
+            include_str!("claude/fixtures/claude_code_http_stream_failure_prefix.sse");
         let expected_payload = fixture_json(include_str!(
             "claude/fixtures/claude_code_tool_cycle_responses_payload.json"
         ));
@@ -9134,10 +9339,9 @@ mod tests {
             "ather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}\n\ndata: {\"type\":\"response.failed\",\"error\":{\"messa",
             "ge\":\"model runtime failed\"}}\n\n",
         ];
-        let (upstream_addr, captured_requests) = spawn_responses_replay_upstream(vec![
-            sse_chunked_replay_response(awkward_chunks),
-        ])
-        .await;
+        let (upstream_addr, captured_requests) =
+            spawn_responses_replay_upstream(vec![sse_chunked_replay_response(awkward_chunks)])
+                .await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             database_url: database_url(db_path),
