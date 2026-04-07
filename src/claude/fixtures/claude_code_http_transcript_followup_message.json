@@ -6,13 +6,13 @@
   "content": [
     {
       "type": "text",
-      "text": "It is sunny in Paris."
+      "text": "Pack a light jacket."
     }
   ],
   "stop_reason": "end_turn",
   "stop_sequence": null,
   "usage": {
-    "input_tokens": 18,
-    "output_tokens": 7
+    "input_tokens": 8,
+    "output_tokens": 5
   }
 }
