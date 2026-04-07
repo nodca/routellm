@@ -3,10 +3,12 @@ use std::collections::HashMap;
 use serde_json::{Map, Value, json};
 
 use crate::{
+    claude::provider_capability_profile::{
+        ClaudeExtensionResolution, ClaudeProviderCapabilityProfile,
+    },
     claude::semantic_core::{
-        ClaudeContentBlock, ClaudeContextManagement, ClaudeMessage, ClaudeMessageRequest,
-        ClaudeRole, ClaudeThinkingConfig, ClaudeToolChoice, ClaudeToolDefinition, ClaudeToolResult,
-        ClaudeToolResultContent, ClaudeToolUse,
+        ClaudeContentBlock, ClaudeMessage, ClaudeMessageRequest, ClaudeRole, ClaudeToolChoice,
+        ClaudeToolDefinition, ClaudeToolResult, ClaudeToolResultContent, ClaudeToolUse,
     },
     error::AppError,
 };
@@ -18,33 +20,10 @@ pub enum ResponsesRequestMode {
     AssistantHistoryCompat,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ResponsesProviderAdapter {
     request_mode: ResponsesRequestMode,
-}
-
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct ResponsesExtensionPolicy {
-    pub metadata: Option<Map<String, Value>>,
-    pub service_tier: Option<String>,
-    pub requested_betas: Vec<String>,
-    pub unsupported_beta_hints: Vec<String>,
-    pub thinking: ResponsesThinkingPolicy,
-    pub context_management: ResponsesContextManagementPolicy,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ResponsesThinkingPolicy {
-    #[default]
-    Omit,
-    IgnoreRequested,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ResponsesContextManagementPolicy {
-    #[default]
-    Omit,
-    IgnoreRequested,
+    capability_profile: ClaudeProviderCapabilityProfile,
 }
 
 pub struct AnthropicStreamEventAdapter {
@@ -74,11 +53,22 @@ struct AnthropicToolBlockState {
 
 impl ResponsesProviderAdapter {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            request_mode: ResponsesRequestMode::default(),
+            capability_profile: ClaudeProviderCapabilityProfile::responses(),
+        }
     }
 
     pub fn with_request_mode(mut self, request_mode: ResponsesRequestMode) -> Self {
         self.request_mode = request_mode;
+        self
+    }
+
+    pub fn with_capability_profile(
+        mut self,
+        capability_profile: ClaudeProviderCapabilityProfile,
+    ) -> Self {
+        self.capability_profile = capability_profile;
         self
     }
 
@@ -93,26 +83,9 @@ impl ResponsesProviderAdapter {
         request.has_plaintext_assistant_history()
     }
 
-    pub fn extension_policy(&self, request: &ClaudeMessageRequest) -> ResponsesExtensionPolicy {
-        let context_requested = request.extensions.context_management.is_some()
-            || request
-                .extensions
-                .beta_hints
-                .values
-                .iter()
-                .any(|beta| beta.contains("context-management"));
-
-        ResponsesExtensionPolicy {
-            metadata: request.extensions.metadata.clone(),
-            service_tier: request.extensions.request_hints.service_tier.clone(),
-            requested_betas: request.extensions.beta_hints.values.clone(),
-            unsupported_beta_hints: request.extensions.beta_hints.values.clone(),
-            thinking: map_thinking_policy(request.extensions.thinking.as_ref()),
-            context_management: map_context_management_policy(
-                request.extensions.context_management.as_ref(),
-                context_requested,
-            ),
-        }
+    pub fn extension_policy(&self, request: &ClaudeMessageRequest) -> ClaudeExtensionResolution {
+        self.capability_profile
+            .resolve_extensions(&request.extensions)
     }
 
     pub fn request_to_payload(&self, request: &ClaudeMessageRequest) -> Result<Value, AppError> {
@@ -167,10 +140,10 @@ impl ResponsesProviderAdapter {
                 map_tool_choice(tool_choice.clone())?,
             );
         }
-        if let Some(metadata) = extension_policy.metadata {
+        if let Some(metadata) = extension_policy.metadata.forwarded {
             body.insert("metadata".to_string(), Value::Object(metadata));
         }
-        if let Some(service_tier) = extension_policy.service_tier {
+        if let Some(service_tier) = extension_policy.service_tier.forwarded {
             body.insert("service_tier".to_string(), Value::String(service_tier));
         }
 
@@ -248,26 +221,6 @@ impl ResponsesProviderAdapter {
             request_id: request_id.into(),
             state: AnthropicStreamState::default(),
         }
-    }
-}
-
-fn map_thinking_policy(thinking: Option<&ClaudeThinkingConfig>) -> ResponsesThinkingPolicy {
-    match thinking {
-        None | Some(ClaudeThinkingConfig::Disabled) => ResponsesThinkingPolicy::Omit,
-        Some(ClaudeThinkingConfig::Enabled { .. })
-        | Some(ClaudeThinkingConfig::Adaptive)
-        | Some(ClaudeThinkingConfig::Unrecognized(_)) => ResponsesThinkingPolicy::IgnoreRequested,
-    }
-}
-
-fn map_context_management_policy(
-    context_management: Option<&ClaudeContextManagement>,
-    context_requested: bool,
-) -> ResponsesContextManagementPolicy {
-    if context_management.is_some() || context_requested {
-        ResponsesContextManagementPolicy::IgnoreRequested
-    } else {
-        ResponsesContextManagementPolicy::Omit
     }
 }
 
@@ -862,6 +815,7 @@ fn anthropic_event_line(event_name: &str, payload: Value) -> String {
 mod tests {
     use serde_json::json;
 
+    use crate::claude::provider_capability_profile::CapabilityDisposition;
     use crate::claude::semantic_core::ClaudeMessageRequest;
 
     use super::*;
@@ -928,13 +882,16 @@ mod tests {
         assert_eq!(payload["input"][1]["role"], "assistant");
         assert_eq!(payload["input"][2]["type"], "function_call");
         assert_eq!(payload["input"][3]["type"], "function_call_output");
-        assert_eq!(policy.service_tier.as_deref(), Some("priority"));
+        assert_eq!(policy.service_tier.forwarded.as_deref(), Some("priority"));
         assert_eq!(policy.requested_betas.len(), 2);
         assert_eq!(policy.unsupported_beta_hints.len(), 2);
-        assert_eq!(policy.thinking, ResponsesThinkingPolicy::IgnoreRequested);
         assert_eq!(
-            policy.context_management,
-            ResponsesContextManagementPolicy::IgnoreRequested
+            policy.thinking.disposition,
+            CapabilityDisposition::IgnoreRequested
+        );
+        assert_eq!(
+            policy.context_management.disposition,
+            CapabilityDisposition::IgnoreRequested
         );
     }
 

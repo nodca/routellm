@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::{
     app::AppState,
     claude::{
+        provider_capability_profile::ClaudeProviderCapabilityProfile,
         responses_adapter::{ResponsesProviderAdapter, ResponsesRequestMode},
         semantic_core::ClaudeMessageRequest,
     },
@@ -138,14 +139,17 @@ impl PreparedPayloads {
     }
 
     fn for_claude_message(payload: Value, semantic_request: ClaudeMessageRequest) -> Self {
+        let capability_profile = ClaudeProviderCapabilityProfile::responses();
         Self {
             original_value: payload,
             original_json: OnceLock::new(),
             chat_to_responses_json: OnceLock::new(),
             claude_message: Some(ClaudeMessagePayloads {
                 semantic_request,
-                response_adapter: ResponsesProviderAdapter::new(),
+                response_adapter: ResponsesProviderAdapter::new()
+                    .with_capability_profile(capability_profile.clone()),
                 compat_response_adapter: ResponsesProviderAdapter::new()
+                    .with_capability_profile(capability_profile)
                     .with_request_mode(ResponsesRequestMode::AssistantHistoryCompat),
                 anthropic_to_responses_json: OnceLock::new(),
                 anthropic_compat_to_responses_json: OnceLock::new(),
@@ -8546,6 +8550,9 @@ mod tests {
         assert_eq!(adapted["max_output_tokens"], 64);
         assert_eq!(adapted["metadata"]["tenant"], "ops");
         assert_eq!(adapted["service_tier"], "priority");
+        assert!(adapted.get("thinking").is_none());
+        assert!(adapted.get("context_management").is_none());
+        assert!(adapted.get("betas").is_none());
         assert_eq!(adapted["input"][0]["role"], "user");
         assert!(prepared.should_retry_with_assistant_history_compat());
     }
