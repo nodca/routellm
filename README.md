@@ -98,11 +98,11 @@ curl -fsSL https://raw.githubusercontent.com/nodca/routellm/main/scripts/install
   bash -s -- --server http://你的服务器IP:1290 --auth-key 你的master_key
 ```
 
+
 Windows：
 
 ```powershell
-$script = [scriptblock]::Create((irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.ps1))
-& $script -Server "http://你的服务器IP:1290" -AuthKey "你的master_key"
+$script = [scriptblock]::Create((irm https://raw.githubusercontent.com/nodca/routellm/main/scripts/install-tui.ps1)); & $script -Server "http://你的服务器IP:1290" -AuthKey "你的master_key"
 ```
 
 下游客户端配置：
