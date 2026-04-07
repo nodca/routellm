@@ -1,6 +1,7 @@
 pub mod app;
 pub mod bootstrap;
 pub mod cc_switch;
+pub mod claude;
 pub mod config;
 pub mod domain;
 pub mod error;
