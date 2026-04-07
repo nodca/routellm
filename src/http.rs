@@ -9241,6 +9241,192 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn claude_native_gateway_skeleton_builds_message_payloads_from_semantic_core() {
+        let payload = json!({
+            "model": "claude-opus-4-6",
+            "max_tokens": 64,
+            "messages": [
+                { "role": "user", "content": [{ "type": "text", "text": "hello" }] },
+                { "role": "assistant", "content": [{ "type": "text", "text": "pong" }] }
+            ]
+        });
+
+        let prepared = build_claude_message_payloads(payload.clone()).expect("payload should prepare");
+        let adapted = serde_json::from_slice::<Value>(
+            &prepared
+                .bytes_for(DispatchPayloadKind::AnthropicMessagesToResponses)
+                .expect("request should adapt"),
+        )
+        .expect("adapted payload should deserialize");
+
+        assert_eq!(adapted["model"], "claude-opus-4-6");
+        assert_eq!(adapted["max_output_tokens"], 64);
+        assert_eq!(adapted["input"][0]["role"], "user");
+        assert!(prepared.should_retry_with_assistant_history_compat());
+    }
+
+    #[tokio::test]
+    async fn claude_native_gateway_skeleton_keeps_nonstream_messages_flow() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_json_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let create_route_request = Request::builder()
+            .method("POST")
+            .uri("/api/routes")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "route_model": "claude-opus-4-6"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let create_route_response = app.clone().oneshot(create_route_request).await.unwrap();
+        assert_eq!(create_route_response.status(), StatusCode::CREATED);
+        let create_route_body = to_bytes(create_route_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_route_value: Value = serde_json::from_slice(&create_route_body).unwrap();
+        let route_id = create_route_value["data"]["route"]["id"].as_i64().unwrap();
+
+        let create_channel_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/routes/{route_id}/channels"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "base_url": format!("http://{upstream_addr}"),
+                    "api_key": "test-key",
+                    "upstream_model": "gpt-5.4",
+                    "protocol": "responses"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let create_channel_response = app.clone().oneshot(create_channel_request).await.unwrap();
+        assert_eq!(create_channel_response.status(), StatusCode::CREATED);
+
+        let proxy_request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "claude-opus-4-6",
+                    "max_tokens": 16,
+                    "messages": [{ "role": "user", "content": "ping" }]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
+        assert_eq!(proxy_response.status(), StatusCode::OK);
+        let proxy_body = to_bytes(proxy_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let proxy_value: Value = serde_json::from_slice(&proxy_body).unwrap();
+        assert_eq!(proxy_value["type"], "message");
+        assert_eq!(proxy_value["model"], "claude-opus-4-6");
+        assert_eq!(proxy_value["content"][0]["type"], "text");
+        assert_eq!(proxy_value["content"][0]["text"], "hello from upstream");
+    }
+
+    #[tokio::test]
+    async fn claude_native_gateway_skeleton_keeps_stream_tool_flow() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let upstream_addr = spawn_tool_call_streaming_upstream().await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let create_route_request = Request::builder()
+            .method("POST")
+            .uri("/api/routes")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "route_model": "claude-sonnet-4-6"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let create_route_response = app.clone().oneshot(create_route_request).await.unwrap();
+        assert_eq!(create_route_response.status(), StatusCode::CREATED);
+        let create_route_body = to_bytes(create_route_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_route_value: Value = serde_json::from_slice(&create_route_body).unwrap();
+        let route_id = create_route_value["data"]["route"]["id"].as_i64().unwrap();
+
+        let create_channel_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/routes/{route_id}/channels"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "base_url": format!("http://{upstream_addr}"),
+                    "api_key": "test-key",
+                    "upstream_model": "gpt-5.4",
+                    "protocol": "responses"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let create_channel_response = app.clone().oneshot(create_channel_request).await.unwrap();
+        assert_eq!(create_channel_response.status(), StatusCode::CREATED);
+
+        let proxy_request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "claude-sonnet-4-6",
+                    "stream": true,
+                    "max_tokens": 16,
+                    "messages": [{ "role": "user", "content": "weather?" }]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
+        assert_eq!(proxy_response.status(), StatusCode::OK);
+        assert_eq!(
+            proxy_response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        let body = to_bytes(proxy_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("event: message_start"));
+        assert!(text.contains("event: content_block_start"));
+        assert!(text.contains("\"type\":\"tool_use\""));
+        assert!(text.contains("event: message_delta"));
+        assert!(text.contains("\"stop_reason\":\"tool_use\""));
+        assert!(text.contains("event: message_stop"));
+    }
+
     #[tokio::test]
     async fn expired_cooldown_channel_stays_unavailable_until_success_clears_needs_reprobe() {
         let temp_dir = tempdir().unwrap();
