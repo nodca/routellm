@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed quick task 260407-tc7 for Claude strict/compat responses profiles
-last_updated: "2026-04-07T13:28:00Z"
-last_activity: 2026-04-07 — Completed quick task 260407-tc7 for Claude strict/compat responses profiles
+stopped_at: Completed quick task 260407-ts1 for Claude Code messages contract tests
+last_updated: "2026-04-07T13:35:00Z"
+last_activity: 2026-04-07 — Completed quick task 260407-ts1 for Claude Code messages contract tests
 progress:
   total_phases: 4
   completed_phases: 0
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-04-03)
 Phase: 1 of 4 (Brownfield Baseline)
 Plan: 0 of 2 in current phase
 Status: Ready to plan
-Last activity: 2026-04-07 — Completed quick task 260407-tc7 for Claude strict/compat responses profiles
+Last activity: 2026-04-07 — Completed quick task 260407-ts1 for Claude Code messages contract tests
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -77,6 +77,7 @@ Recent decisions affecting current work:
 | 260407-ryn | 2026-04-07 | 设计并开始实现 Claude 专用原生网关架构，先完成 Claude semantic core 与 responses provider adapter 骨架 | Done |
 | 260407-t0k | 2026-04-07 | 为 Claude 原生网关实现 provider capability profile，让 Responses adapter 按上游能力分层处理扩展字段 | Done |
 | 260407-tc7 | 2026-04-07 | 为 Claude 原生网关增加 strict responses / compat responses capability profiles，并将 fallback 与降级日志绑定到 profile 决策 | Done |
+| 260407-ts1 | 2026-04-07 | 基于 Claude Code 源码补充 Claude messages 原生 contract tests，覆盖 stream 终止、事件顺序与 tool use 语义 | Done |
 
 ### Blockers/Concerns
 
@@ -85,6 +86,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-Last session: 2026-04-07T13:28:00Z
-Stopped at: Completed quick task 260407-tc7 for Claude strict/compat responses profiles
-Resume file: .planning/quick/260407-tc7-claude-strict-responses-compat-responses/260407-tc7-SUMMARY.md
+Last session: 2026-04-07T13:35:00Z
+Stopped at: Completed quick task 260407-ts1 for Claude Code messages contract tests
+Resume file: .planning/quick/260407-ts1-claude-code-claude-messages-contract-tes/260407-ts1-SUMMARY.md

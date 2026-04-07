@@ -38,6 +38,7 @@ struct AnthropicStreamState {
     text_block_index: Option<usize>,
     text_block_closed: bool,
     saw_tool_use: bool,
+    finalized: bool,
     next_block_index: usize,
     tool_blocks: HashMap<i64, AnthropicToolBlockState>,
 }
@@ -237,7 +238,15 @@ impl AnthropicStreamEventAdapter {
         };
 
         if data == "[DONE]" {
-            return Ok(finalize_anthropic_stream(&mut self.state, None));
+            let stop_reason = if self.state.saw_tool_use {
+                "tool_use"
+            } else {
+                "end_turn"
+            };
+            return Ok(finalize_anthropic_stream(
+                &mut self.state,
+                Some(stop_reason),
+            ));
         }
 
         let event: Value = serde_json::from_str(&data)
@@ -746,6 +755,10 @@ fn finalize_anthropic_stream(
     stream_state: &mut AnthropicStreamState,
     stop_reason: Option<&str>,
 ) -> Vec<String> {
+    if stream_state.finalized {
+        return Vec::new();
+    }
+
     let mut lines = Vec::new();
     close_anthropic_text_block(stream_state, &mut lines);
     let mut indices = stream_state.tool_blocks.keys().copied().collect::<Vec<_>>();
@@ -775,6 +788,7 @@ fn finalize_anthropic_stream(
         "message_stop",
         json!({ "type": "message_stop" }),
     ));
+    stream_state.finalized = true;
     lines
 }
 
@@ -1010,5 +1024,99 @@ mod tests {
         assert!(done_text.contains("event: message_delta"));
         assert!(done_text.contains("\"stop_reason\":\"tool_use\""));
         assert!(done_text.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn claude_responses_adapter_done_frame_synthesizes_terminal_message_delta_once() {
+        let adapter = ResponsesProviderAdapter::new();
+        let mut stream = adapter.stream_event_adapter("claude-sonnet-4-6", "req_123");
+
+        let _ = stream
+            .translate_frame("data: {\"type\":\"response.created\"}\n\n")
+            .expect("created frame should map");
+        let _ = stream
+            .translate_frame(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n",
+            )
+            .expect("text delta should map");
+
+        let done_only = stream
+            .translate_frame("data: [DONE]\n\n")
+            .expect("done frame should map");
+        let done_only_text = done_only.join("");
+        assert!(done_only_text.contains("event: content_block_stop"));
+        assert!(done_only_text.contains("event: message_delta"));
+        assert!(done_only_text.contains("\"stop_reason\":\"end_turn\""));
+        assert!(done_only_text.contains("event: message_stop"));
+
+        let duplicate_done = stream
+            .translate_frame("data: [DONE]\n\n")
+            .expect("duplicate done should not fail");
+        assert!(duplicate_done.is_empty());
+    }
+
+    #[test]
+    fn claude_responses_adapter_preserves_claude_stream_event_order_assumed_by_query_engine() {
+        let adapter = ResponsesProviderAdapter::new();
+        let mut stream = adapter.stream_event_adapter("claude-sonnet-4-6", "req_123");
+
+        let _ = stream
+            .translate_frame("data: {\"type\":\"response.created\"}\n\n")
+            .expect("created frame should map");
+        let _ = stream
+            .translate_frame(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n",
+            )
+            .expect("text delta should map");
+
+        let terminal = stream
+            .translate_frame("data: {\"type\":\"response.completed\"}\n\n")
+            .expect("completion frame should map")
+            .join("");
+
+        let stop_index = terminal
+            .find("event: content_block_stop")
+            .expect("text block stop should be present");
+        let delta_index = terminal
+            .find("event: message_delta")
+            .expect("message_delta should be present");
+        let message_stop_index = terminal
+            .find("event: message_stop")
+            .expect("message_stop should be present");
+
+        assert!(stop_index < delta_index);
+        assert!(delta_index < message_stop_index);
+        assert!(terminal.contains("\"stop_reason\":\"end_turn\""));
+    }
+
+    #[test]
+    fn claude_responses_adapter_closes_text_block_before_tool_use_block() {
+        let adapter = ResponsesProviderAdapter::new();
+        let mut stream = adapter.stream_event_adapter("claude-sonnet-4-6", "req_123");
+
+        let _ = stream
+            .translate_frame("data: {\"type\":\"response.created\"}\n\n")
+            .expect("created frame should map");
+        let _ = stream
+            .translate_frame(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n",
+            )
+            .expect("text delta should map");
+
+        let tool_transition = stream
+            .translate_frame("data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}\n\n")
+            .expect("tool call should map")
+            .join("");
+
+        let text_stop_index = tool_transition
+            .find("event: content_block_stop")
+            .expect("text block should close first");
+        let tool_start_index = tool_transition[text_stop_index + 1..]
+            .find("\"type\":\"tool_use\"")
+            .map(|index| index + text_stop_index + 1)
+            .expect("tool use start should follow");
+
+        assert!(text_stop_index < tool_start_index);
+        assert!(tool_transition.contains("\"partial_json\":\"{\\\"city\\\":\\\"Paris\\\"}\""));
     }
 }
