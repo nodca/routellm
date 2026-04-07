@@ -120,12 +120,11 @@ struct ClaudeMessagePayloads {
     responses_payload_cache: Mutex<HashMap<ClaudePayloadCacheKey, Bytes>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ClaudePayloadCacheKey {
-    StrictStandard,
-    StrictAssistantHistoryCompat,
-    CompatStandard,
-    CompatAssistantHistoryCompat,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ClaudePayloadCacheKey {
+    profile_kind: ResponsesCapabilityProfileKind,
+    request_mode: ResponsesRequestMode,
+    upstream_model: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -140,22 +139,12 @@ impl ClaudePayloadCacheKey {
     fn new(
         capability_profile: &ClaudeProviderCapabilityProfile,
         request_mode: ResponsesRequestMode,
+        upstream_model: &str,
     ) -> Self {
-        match (capability_profile.profile_kind, request_mode) {
-            (ResponsesCapabilityProfileKind::Strict, ResponsesRequestMode::Standard) => {
-                Self::StrictStandard
-            }
-            (
-                ResponsesCapabilityProfileKind::Strict,
-                ResponsesRequestMode::AssistantHistoryCompat,
-            ) => Self::StrictAssistantHistoryCompat,
-            (ResponsesCapabilityProfileKind::Compat, ResponsesRequestMode::Standard) => {
-                Self::CompatStandard
-            }
-            (
-                ResponsesCapabilityProfileKind::Compat,
-                ResponsesRequestMode::AssistantHistoryCompat,
-            ) => Self::CompatAssistantHistoryCompat,
+        Self {
+            profile_kind: capability_profile.profile_kind,
+            request_mode,
+            upstream_model: upstream_model.to_string(),
         }
     }
 }
@@ -219,13 +208,14 @@ impl PreparedPayloads {
     }
 
     fn bytes_for(&self, kind: DispatchPayloadKind) -> Result<Bytes, AppError> {
-        self.bytes_for_with_claude_profile(kind, None)
+        self.bytes_for_with_claude_profile(kind, None, None)
     }
 
     fn bytes_for_with_claude_profile(
         &self,
         kind: DispatchPayloadKind,
         capability_profile: Option<&ClaudeProviderCapabilityProfile>,
+        upstream_model_override: Option<&str>,
     ) -> Result<Bytes, AppError> {
         match kind {
             DispatchPayloadKind::Original => {
@@ -256,8 +246,13 @@ impl PreparedPayloads {
                 let profile = capability_profile
                     .cloned()
                     .unwrap_or_else(ClaudeProviderCapabilityProfile::responses_strict);
-                let cache_key =
-                    ClaudePayloadCacheKey::new(&profile, ResponsesRequestMode::Standard);
+                let upstream_model = upstream_model_override
+                    .unwrap_or_else(|| claude_message.semantic_request.model.as_str());
+                let cache_key = ClaudePayloadCacheKey::new(
+                    &profile,
+                    ResponsesRequestMode::Standard,
+                    upstream_model,
+                );
                 if let Some(bytes) = claude_message
                     .responses_payload_cache
                     .lock()
@@ -268,9 +263,13 @@ impl PreparedPayloads {
                     return Ok(bytes);
                 }
 
+                let adapted_request = claude_request_for_upstream_model(
+                    &claude_message.semantic_request,
+                    upstream_model,
+                );
                 let adapted = ResponsesProviderAdapter::new()
                     .with_capability_profile(profile)
-                    .request_to_payload(&claude_message.semantic_request)?;
+                    .request_to_payload(&adapted_request)?;
                 let bytes = serialize_json_bytes(&adapted)?;
                 claude_message
                     .responses_payload_cache
@@ -288,9 +287,12 @@ impl PreparedPayloads {
                 let profile = capability_profile
                     .cloned()
                     .unwrap_or_else(ClaudeProviderCapabilityProfile::responses_strict);
+                let upstream_model = upstream_model_override
+                    .unwrap_or_else(|| claude_message.semantic_request.model.as_str());
                 let cache_key = ClaudePayloadCacheKey::new(
                     &profile,
                     ResponsesRequestMode::AssistantHistoryCompat,
+                    upstream_model,
                 );
                 if let Some(bytes) = claude_message
                     .responses_payload_cache
@@ -302,10 +304,14 @@ impl PreparedPayloads {
                     return Ok(bytes);
                 }
 
+                let adapted_request = claude_request_for_upstream_model(
+                    &claude_message.semantic_request,
+                    upstream_model,
+                );
                 let adapted = ResponsesProviderAdapter::new()
                     .with_capability_profile(profile)
                     .with_request_mode(ResponsesRequestMode::AssistantHistoryCompat)
-                    .request_to_payload(&claude_message.semantic_request)?;
+                    .request_to_payload(&adapted_request)?;
                 let bytes = serialize_json_bytes(&adapted)?;
                 claude_message
                     .responses_payload_cache
@@ -348,6 +354,19 @@ impl PreparedPayloads {
             ResponsesProviderAdapter::new().with_capability_profile(capability_profile.clone())
         })
     }
+}
+
+fn claude_request_for_upstream_model(
+    request: &ClaudeMessageRequest,
+    upstream_model: &str,
+) -> ClaudeMessageRequest {
+    if request.model == upstream_model {
+        return request.clone();
+    }
+
+    let mut adapted = request.clone();
+    adapted.model = upstream_model.to_string();
+    adapted
 }
 
 fn build_upstream_url(base_url: &str, protocol: Protocol) -> String {
@@ -1720,9 +1739,11 @@ async fn attempt_proxy_request(
         _ => log_context.clone(),
     };
     let is_stream = payloads.is_stream();
-    let payload_bytes = match payloads
-        .bytes_for_with_claude_profile(dispatch.payload_kind, claude_capability_profile.as_ref())
-    {
+    let payload_bytes = match payloads.bytes_for_with_claude_profile(
+        dispatch.payload_kind,
+        claude_capability_profile.as_ref(),
+        Some(&selected.upstream_model),
+    ) {
         Ok(bytes) => bytes,
         Err(error) => {
             record_failure(
@@ -1811,6 +1832,7 @@ async fn attempt_proxy_request(
         let compat_payload_bytes = match payloads.bytes_for_with_claude_profile(
             DispatchPayloadKind::AnthropicMessagesToResponsesAssistantHistoryCompat,
             claude_capability_profile.as_ref(),
+            Some(&selected.upstream_model),
         ) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -5727,6 +5749,20 @@ mod tests {
         serde_json::from_str(raw).expect("fixture json should parse")
     }
 
+    fn fixture_json_with_upstream_model(raw: &str, upstream_model: &str) -> Value {
+        let mut value = fixture_json(raw);
+        value["model"] = json!(upstream_model);
+        value
+    }
+
+    fn fixture_json_with_compat_upstream_model(raw: &str, upstream_model: &str) -> Value {
+        let mut value = fixture_json_with_upstream_model(raw, upstream_model);
+        if let Some(object) = value.as_object_mut() {
+            object.remove("metadata");
+        }
+        value
+    }
+
     fn normalize_anthropic_stream_ids(stream: &str) -> String {
         let marker = "\"id\":\"msg_";
         let Some(start) = stream.find(marker) else {
@@ -8218,9 +8254,12 @@ mod tests {
     async fn claude_messages_propagates_anthropic_error_headers() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
-        let expected_upstream_payload = fixture_json(include_str!(
-            "claude/fixtures/claude_code_http_transcript_followup_responses_payload.json"
-        ));
+        let expected_upstream_payload = fixture_json_with_upstream_model(
+            include_str!(
+                "claude/fixtures/claude_code_http_transcript_followup_responses_payload.json"
+            ),
+            "gpt-5.4",
+        );
         let first_error = json!({
             "type": "error",
             "error": {
@@ -8927,7 +8966,15 @@ mod tests {
     async fn claude_route_can_target_responses_upstream_model() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
-        let upstream_addr = spawn_json_upstream().await;
+        let (upstream_addr, captured_requests) =
+            spawn_responses_replay_upstream(vec![json_replay_response(
+                StatusCode::OK,
+                json!({
+                    "id": "resp_123",
+                    "output_text": "hello from upstream"
+                }),
+            )])
+            .await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             database_url: database_url(db_path),
@@ -8998,6 +9045,46 @@ mod tests {
         assert_eq!(proxy_value["model"], "claude-opus-4-6");
         assert_eq!(proxy_value["content"][0]["type"], "text");
         assert_eq!(proxy_value["content"][0]["text"], "hello from upstream");
+
+        let captured = captured_requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0]["model"], "gpt-5.4");
+    }
+
+    #[test]
+    fn claude_prepared_payloads_use_selected_upstream_model_without_cache_leak() {
+        let prepared = build_claude_message_payloads(json!({
+            "model": "claude-opus-4-6",
+            "stream": true,
+            "max_tokens": 16,
+            "messages": [{ "role": "user", "content": "ping" }]
+        }))
+        .expect("claude payload should parse");
+        let profile = ClaudeProviderCapabilityProfile::responses_compat();
+
+        let primary = prepared
+            .bytes_for_with_claude_profile(
+                DispatchPayloadKind::AnthropicMessagesToResponses,
+                Some(&profile),
+                Some("gpt-5.4"),
+            )
+            .expect("primary upstream payload should serialize");
+        let fallback = prepared
+            .bytes_for_with_claude_profile(
+                DispatchPayloadKind::AnthropicMessagesToResponses,
+                Some(&profile),
+                Some("gpt-4.1"),
+            )
+            .expect("fallback upstream payload should serialize");
+
+        let primary_value: Value =
+            serde_json::from_slice(&primary).expect("primary payload should decode");
+        let fallback_value: Value =
+            serde_json::from_slice(&fallback).expect("fallback payload should decode");
+
+        assert_eq!(primary_value["model"], "gpt-5.4");
+        assert_eq!(fallback_value["model"], "gpt-4.1");
+        assert_ne!(primary_value["model"], fallback_value["model"]);
     }
 
     #[tokio::test]
@@ -9039,12 +9126,14 @@ mod tests {
         let expected_message = fixture_json(include_str!(
             "claude/fixtures/claude_code_http_compat_message.json"
         ));
-        let expected_first_payload = fixture_json(include_str!(
-            "claude/fixtures/claude_code_http_compat_first_responses_payload.json"
-        ));
-        let expected_second_payload = fixture_json(include_str!(
-            "claude/fixtures/claude_code_http_compat_second_responses_payload.json"
-        ));
+        let expected_first_payload = fixture_json_with_compat_upstream_model(
+            include_str!("claude/fixtures/claude_code_http_compat_first_responses_payload.json"),
+            "gpt-5.4",
+        );
+        let expected_second_payload = fixture_json_with_compat_upstream_model(
+            include_str!("claude/fixtures/claude_code_http_compat_second_responses_payload.json"),
+            "gpt-5.4",
+        );
 
         let proxy_request = Request::builder()
             .method("POST")
@@ -9132,9 +9221,10 @@ mod tests {
         let expected_message = fixture_json(include_str!(
             "claude/fixtures/claude_code_http_nonstream_message.json"
         ));
-        let mut expected_upstream_payload = fixture_json(include_str!(
-            "claude/fixtures/claude_code_tool_cycle_responses_payload.json"
-        ));
+        let mut expected_upstream_payload = fixture_json_with_compat_upstream_model(
+            include_str!("claude/fixtures/claude_code_tool_cycle_responses_payload.json"),
+            "gpt-5.4",
+        );
         expected_upstream_payload["stream"] = json!(false);
         let nonstream_response = json!({
             "id": "msg_http_nonstream",
@@ -9191,9 +9281,10 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
         let expected_sse = include_str!("claude/fixtures/claude_code_http_stream_anthropic.sse");
-        let expected_upstream_payload = fixture_json(include_str!(
-            "claude/fixtures/claude_code_tool_cycle_responses_payload.json"
-        ));
+        let expected_upstream_payload = fixture_json_with_compat_upstream_model(
+            include_str!("claude/fixtures/claude_code_tool_cycle_responses_payload.json"),
+            "gpt-5.4",
+        );
         let (upstream_addr, captured_requests) =
             spawn_responses_replay_upstream(vec![sse_replay_response(include_str!(
                 "claude/fixtures/claude_code_responses_stream_tool_cycle.sse"
@@ -9244,12 +9335,16 @@ mod tests {
         let db_path = temp_dir.path().join("llmrouter.db");
         let expected_round_one_sse =
             include_str!("claude/fixtures/claude_code_http_stream_anthropic.sse");
-        let expected_round_one_payload = fixture_json(include_str!(
-            "claude/fixtures/claude_code_tool_cycle_responses_payload.json"
-        ));
-        let expected_round_two_payload = fixture_json(include_str!(
-            "claude/fixtures/claude_code_http_transcript_followup_responses_payload.json"
-        ));
+        let expected_round_one_payload = fixture_json_with_compat_upstream_model(
+            include_str!("claude/fixtures/claude_code_tool_cycle_responses_payload.json"),
+            "gpt-5.4",
+        );
+        let expected_round_two_payload = fixture_json_with_compat_upstream_model(
+            include_str!(
+                "claude/fixtures/claude_code_http_transcript_followup_responses_payload.json"
+            ),
+            "gpt-5.4",
+        );
         let expected_round_two_message = fixture_json(include_str!(
             "claude/fixtures/claude_code_http_transcript_followup_message.json"
         ));
@@ -9330,9 +9425,10 @@ mod tests {
         let db_path = temp_dir.path().join("llmrouter.db");
         let expected_prefix =
             include_str!("claude/fixtures/claude_code_http_stream_failure_prefix.sse");
-        let expected_payload = fixture_json(include_str!(
-            "claude/fixtures/claude_code_tool_cycle_responses_payload.json"
-        ));
+        let expected_payload = fixture_json_with_compat_upstream_model(
+            include_str!("claude/fixtures/claude_code_tool_cycle_responses_payload.json"),
+            "gpt-5.4",
+        );
         let awkward_chunks = vec![
             "data: {\"type\":\"response.cr",
             "eated\"}\n\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup_we",

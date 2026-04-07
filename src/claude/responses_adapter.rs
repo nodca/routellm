@@ -13,7 +13,7 @@ use crate::{
     error::AppError,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ResponsesRequestMode {
     #[default]
     Standard,

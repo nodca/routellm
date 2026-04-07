@@ -82,7 +82,7 @@ impl ClaudeProviderCapabilityProfile {
             provider_name: "responses",
             profile_name: "compat-responses",
             profile_kind: ResponsesCapabilityProfileKind::Compat,
-            metadata: CapabilityDisposition::Forward,
+            metadata: CapabilityDisposition::Omit,
             service_tier: CapabilityDisposition::Forward,
             thinking: CapabilityDisposition::IgnoreRequested,
             context_management: CapabilityDisposition::IgnoreRequested,
@@ -254,6 +254,7 @@ mod tests {
 
         assert_eq!(compat.profile_kind, ResponsesCapabilityProfileKind::Compat);
         assert_eq!(compat.profile_name, "compat-responses");
+        assert_eq!(compat.metadata, CapabilityDisposition::Omit);
         assert!(compat.supports_assistant_history_compat_retry());
     }
 }
