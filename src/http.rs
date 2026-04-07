@@ -642,42 +642,90 @@ pub async fn create_message(
     State(state): State<AppState>,
     uri: Uri,
     headers: HeaderMap,
-    Json(payload): Json<Value>,
-) -> Result<Response<Body>, AppError> {
-    let requested_model = payload
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or_else(|| AppError::BadRequest("field `model` is required".to_string()))?
-        .to_string();
+    body: Bytes,
+) -> Response<Body> {
+    let request_id = Uuid::new_v4().to_string();
+    let path = uri.path().to_string();
 
-    let use_responses_adapter = payload
-        .get("anthropic-beta")
-        .and_then(Value::as_array)
-        .is_some();
-    let log_context = build_claude_request_log_context(uri.path(), &headers, Some(&payload))?;
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            let app_error =
+                AppError::BadRequest(format!("request body must be valid json: {error}"));
+            if let Err(log_error) = record_message_ingress_failure(
+                &state,
+                &request_id,
+                &path,
+                &headers,
+                None,
+                &app_error,
+                0,
+            )
+            .await
+            {
+                tracing::error!("failed to persist message parse failure: {log_error}");
+            }
+            return app_error.into_anthropic_response(&request_id);
+        }
+    };
 
-    if use_responses_adapter {
-        let payload = anthropic_payload_with_stream_hint(payload)?;
-        return proxy_request(
-            state,
-            requested_model,
-            payload,
-            Protocol::Messages,
-            None,
-            log_context,
-        )
-        .await;
-    }
+    let log_context = match build_claude_request_log_context(&path, &headers, Some(&payload)) {
+        Ok(context) => context,
+        Err(error) => return error.into_anthropic_response(&request_id),
+    };
+    let payload = match anthropic_payload_with_stream_hint(payload.clone()) {
+        Ok(payload) => payload,
+        Err(error) => {
+            if let Err(log_error) = record_message_ingress_failure(
+                &state,
+                &request_id,
+                &path,
+                &headers,
+                Some(&payload),
+                &error,
+                0,
+            )
+            .await
+            {
+                tracing::error!("failed to persist message validation failure: {log_error}");
+            }
+            return error.into_anthropic_response(&request_id);
+        }
+    };
+    let requested_model = match payload.get("model").and_then(Value::as_str) {
+        Some(model) => model.to_string(),
+        None => {
+            let error = AppError::BadRequest("field `model` is required".to_string());
+            if let Err(log_error) = record_message_ingress_failure(
+                &state,
+                &request_id,
+                &path,
+                &headers,
+                Some(&payload),
+                &error,
+                0,
+            )
+            .await
+            {
+                tracing::error!("failed to persist message validation failure: {log_error}");
+            }
+            return error.into_anthropic_response(&request_id);
+        }
+    };
 
-    proxy_request(
+    match proxy_request(
         state,
         requested_model,
         payload,
         Protocol::Messages,
-        None,
+        Some(request_id.clone()),
         log_context,
     )
     .await
+    {
+        Ok(response) => response,
+        Err(error) => error.into_anthropic_response(&request_id),
+    }
 }
 
 fn anthropic_payload_with_stream_hint(mut payload: Value) -> Result<Value, AppError> {
@@ -783,6 +831,80 @@ fn header_csv_values(headers: &HeaderMap, name: &str) -> Vec<String> {
         .collect()
 }
 
+pub(crate) fn is_anthropic_message_path(path: &str) -> bool {
+    path == "/v1/messages" || path == "/messages"
+}
+
+pub(crate) async fn record_message_ingress_failure(
+    state: &AppState,
+    request_id: &str,
+    path: &str,
+    headers: &HeaderMap,
+    payload: Option<&Value>,
+    error: &AppError,
+    latency_ms: i64,
+) -> Result<(), AppError> {
+    let log_context = build_claude_request_log_context(path, headers, payload)?;
+    let requested_model = payload
+        .and_then(|body| body.get("model"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let route_id = if requested_model.is_empty() {
+        None
+    } else {
+        state.store.find_route(requested_model).await.ok().map(|route| route.id)
+    };
+
+    record_request_without_channel(
+        state,
+        request_id,
+        requested_model,
+        Protocol::Messages,
+        &log_context,
+        route_id,
+        Some(error.status_code().as_u16()),
+        latency_ms,
+        error.to_string(),
+    )
+    .await
+}
+
+async fn record_request_without_channel(
+    state: &AppState,
+    request_id: &str,
+    requested_model: &str,
+    downstream_protocol: Protocol,
+    log_context: &RequestLogContext,
+    route_id: Option<i64>,
+    http_status: Option<u16>,
+    latency_ms: i64,
+    error_message: String,
+) -> Result<(), AppError> {
+    let log = RequestLogWrite {
+        request_id: request_id.to_string(),
+        downstream_client_request_id: log_context.downstream_client_request_id.clone(),
+        downstream_path: log_context
+            .downstream_path
+            .clone()
+            .unwrap_or_else(|| downstream_protocol.path().to_string()),
+        upstream_path: String::new(),
+        model_requested: requested_model.to_string(),
+        route_id,
+        channel_id: None,
+        channel_label: None,
+        site_name: None,
+        upstream_model: None,
+        http_status: http_status.map(i64::from),
+        latency_ms,
+        error_message: Some(error_message),
+        input_tokens: None,
+        output_tokens: None,
+        total_tokens: None,
+        claude_request_fingerprint: log_context.claude_request_fingerprint.clone(),
+    };
+    state.store.record_request(&log).await
+}
+
 pub async fn create_gemini_content(
     State(state): State<AppState>,
     Path(tail): Path<String>,
@@ -830,10 +952,30 @@ async fn proxy_request(
     log_context: RequestLogContext,
 ) -> Result<Response<Body>, AppError> {
     let payloads = PreparedPayloads::new(payload);
-    let route = state.store.find_route(&requested_model).await?;
+    let request_id = request_id_override.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let route = match state.store.find_route(&requested_model).await {
+        Ok(route) => route,
+        Err(error) => {
+            if let Err(log_error) = record_request_without_channel(
+                &state,
+                &request_id,
+                &requested_model,
+                downstream_protocol,
+                &log_context,
+                None,
+                Some(error.status_code().as_u16()),
+                0,
+                error.to_string(),
+            )
+            .await
+            {
+                tracing::error!("failed to persist request rejection: {log_error}");
+            }
+            return Err(error);
+        }
+    };
     let channels = state.store.load_channels(route.id).await?;
     let now = now_ts();
-    let request_id = request_id_override.unwrap_or_else(|| Uuid::new_v4().to_string());
     let ordered_channels =
         routing::ordered_eligible_channel_refs(&channels, downstream_protocol, now);
     if ordered_channels.is_empty() {
@@ -850,9 +992,25 @@ async fn proxy_request(
             )
             .await;
         }
-        return Err(AppError::NoRoute(format!(
+        let error = AppError::NoRoute(format!(
             "no eligible channel for model: {requested_model}"
-        )));
+        ));
+        if let Err(log_error) = record_request_without_channel(
+            &state,
+            &request_id,
+            &requested_model,
+            downstream_protocol,
+            &log_context,
+            Some(route.id),
+            Some(error.status_code().as_u16()),
+            0,
+            error.to_string(),
+        )
+        .await
+        {
+            tracing::error!("failed to persist no-route request log: {log_error}");
+        }
+        return Err(error);
     }
 
     let mut last_error: Option<AppError> = None;
@@ -889,11 +1047,49 @@ async fn attempt_proxy_request(
     downstream_protocol: Protocol,
     log_context: &RequestLogContext,
 ) -> Result<Response<Body>, AppError> {
-    let channel_protocol = Protocol::parse(&selected.protocol)?;
-    let dispatch = build_upstream_dispatch(downstream_protocol, channel_protocol)?;
     let started_at = Instant::now();
+    let channel_protocol = Protocol::parse(&selected.protocol)?;
+    let dispatch = match build_upstream_dispatch(downstream_protocol, channel_protocol) {
+        Ok(dispatch) => dispatch,
+        Err(error) => {
+            record_failure(
+                state,
+                route,
+                selected,
+                request_id,
+                requested_model,
+                downstream_protocol,
+                channel_protocol,
+                log_context,
+                Some(error.status_code().as_u16()),
+                started_at.elapsed().as_millis() as i64,
+                error.to_string(),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
     let is_stream = payloads.is_stream();
-    let payload_bytes = payloads.bytes_for(dispatch.payload_kind)?;
+    let payload_bytes = match payloads.bytes_for(dispatch.payload_kind) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            record_failure(
+                state,
+                route,
+                selected,
+                request_id,
+                requested_model,
+                downstream_protocol,
+                dispatch.upstream_protocol,
+                log_context,
+                Some(error.status_code().as_u16()),
+                started_at.elapsed().as_millis() as i64,
+                error.to_string(),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
 
     let upstream_url = build_upstream_url(&selected.site_base_url, dispatch.upstream_protocol);
     let upstream_client = if is_stream {

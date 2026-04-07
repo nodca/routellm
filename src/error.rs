@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -42,8 +42,22 @@ struct ErrorPayload {
     kind: String,
 }
 
+#[derive(Debug, Serialize)]
+struct AnthropicErrorBody {
+    #[serde(rename = "type")]
+    envelope_type: &'static str,
+    error: AnthropicErrorPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicErrorPayload {
+    message: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
 impl AppError {
-    fn status_code(&self) -> StatusCode {
+    pub(crate) fn status_code(&self) -> StatusCode {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
@@ -68,6 +82,42 @@ impl AppError {
             }
             Self::UpstreamTransport(_) | Self::UpstreamStatus(_, _) => "upstream_error",
         }
+    }
+
+    fn anthropic_error_type(&self) -> &'static str {
+        match self {
+            Self::Unauthorized(_) => "authentication_error",
+            Self::BadRequest(_) | Self::NotFound(_) => "invalid_request_error",
+            Self::UpstreamStatus(_, status)
+                if *status == StatusCode::UNAUTHORIZED || *status == StatusCode::FORBIDDEN =>
+            {
+                "authentication_error"
+            }
+            Self::UpstreamStatus(_, status) if status.is_server_error() => "api_error",
+            Self::NoRoute(_)
+            | Self::Config(_)
+            | Self::Internal(_)
+            | Self::Database(_)
+            | Self::Migration(_)
+            | Self::UpstreamTransport(_) => "api_error",
+            Self::UpstreamStatus(_, _) => "invalid_request_error",
+        }
+    }
+
+    pub(crate) fn into_anthropic_response(self, request_id: &str) -> Response {
+        let status = self.status_code();
+        let body = AnthropicErrorBody {
+            envelope_type: "error",
+            error: AnthropicErrorPayload {
+                message: self.to_string(),
+                kind: self.anthropic_error_type().to_string(),
+            },
+        };
+        let mut response = (status, Json(body)).into_response();
+        if let Ok(value) = HeaderValue::from_str(request_id) {
+            response.headers_mut().insert("request-id", value);
+        }
+        response
     }
 }
 

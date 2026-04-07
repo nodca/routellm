@@ -12,6 +12,7 @@ use axum::{
     response::Response,
 };
 use reqwest::Client;
+use uuid::Uuid;
 
 use crate::{
     config::{Config, CooldownPolicy, ManualInterventionPolicy},
@@ -150,9 +151,28 @@ async fn require_bearer_auth(
         return Ok(next.run(request).await);
     }
 
-    Err(crate::error::AppError::Unauthorized(
+    let error = crate::error::AppError::Unauthorized(
         "missing or invalid authorization token".to_string(),
-    ))
+    );
+    if http::is_anthropic_message_path(request.uri().path()) {
+        let request_id = Uuid::new_v4().to_string();
+        if let Err(log_error) = http::record_message_ingress_failure(
+            &state,
+            &request_id,
+            request.uri().path(),
+            request.headers(),
+            None,
+            &error,
+            0,
+        )
+        .await
+        {
+            tracing::error!("failed to persist message auth rejection: {log_error}");
+        }
+        return Ok(error.into_anthropic_response(&request_id));
+    }
+
+    Err(error)
 }
 
 fn parse_bearer_token(header: Option<&HeaderValue>) -> Option<&str> {
