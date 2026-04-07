@@ -1,18 +1,14 @@
 # llmrouter
 
-一个轻量、确定性、SSH/TUI 友好的 LLM 路由网关。
-
-`llmrouter` 面向个人开发者和小团队，用一个小而稳的中间层解决三件事：
-
-- 多个上游不稳定，挂了就得手工切换
-- 同一个模型在不同上游名字不统一
-- 不想上重型平台，只想快速部署和运维
+一个轻量的 LLM 路由网关。
 
 ## 特点
 
-- 单二进制部署，Linux / Windows 都用
-- 同一次请求内可自动切到下一个可用 channel
-- 支持 TUI 管理、主动测活、运行状态查看
+- 单二进制部署
+- 请求自动路由
+- 支持 TUI 管理、主动一键测活、运行状态查看
+- 支持在claude code中使用Openai兼容模型
+- 支持导入cc-switch已配置模型
 
 ## 核心概念
 
@@ -149,38 +145,6 @@ LLMROUTER_AUTH_KEY=$LLMROUTER_MASTER_KEY \
 - `chat_completions`
 - `messages`
 
-当前兼容关系：
-
-| 下游请求 | 上游 channel |
-| --- | --- |
-| `responses` | `responses` |
-| `chat_completions` | `chat_completions` |
-| `messages` | `messages` |
-| `chat_completions` | `responses`，通过薄兼容层转换 |
-| `messages` | `responses`，通过 Anthropic / Claude Code 兼容层转换 |
-
-对 Claude Code 这条主路径，当前已覆盖：
-
-- `POST /v1/messages` 非流式文本
-- `POST /v1/messages` 文本 SSE 流式
-- 非流式 `tool_use` / `tool_result` 基础映射
-- Anthropic 风格 tool streaming 基础事件：`message_start`、`content_block_start`、`content_block_delta`、`content_block_stop`、`message_delta`、`message_stop`
-- Responses 函数调用流事件到 Anthropic tool streaming 的基础映射：
-  - `response.output_item.added(function_call)` -> `tool_use` block start
-  - `response.function_call_arguments.delta` -> `input_json_delta.partial_json`
-  - `response.function_call_arguments.done` -> tool block stop
-  - `response.completed` -> `message_delta(stop_reason=tool_use/end_turn)` + `message_stop`
-- `GET /v1/models`
-- Claude route（例如 `claude-opus-4-6`）映射到非 Claude upstream model（例如 `gpt-5.4` / `glm-*`）
-
-当前不支持：
-
-- `responses -> chat_completions`
-- `responses -> messages`
-- `messages -> chat_completions`
-- 多模态 content block 全覆盖
-- 所有 beta 头与扩展字段兼容
-- 与 Anthropic 官方错误对象逐字段完全一致
 
 选路顺序：
 
