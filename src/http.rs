@@ -37,7 +37,7 @@ use crate::{
         AdminRouteRow, ChannelRow, ChannelRuntimeStats, ModelRouteRow, RequestLogRow,
         RequestLogWrite,
     },
-    error::AppError,
+    error::{AppError, UpstreamErrorMetadata},
     protocol::Protocol,
     routing,
 };
@@ -1356,6 +1356,45 @@ fn header_csv_values(headers: &HeaderMap, name: &str) -> Vec<String> {
         .collect()
 }
 
+fn extract_upstream_error_metadata(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Option<UpstreamErrorMetadata> {
+    let parsed_body = serde_json::from_slice::<Value>(body).ok();
+    let request_id = header_value(headers, "request-id")
+        .or_else(|| header_value(headers, "x-request-id"))
+        .or_else(|| {
+            parsed_body.as_ref().and_then(|value| {
+                value
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("requestId").and_then(Value::as_str))
+                    .or_else(|| {
+                        value.get("error").and_then(|error| {
+                            error
+                                .get("request_id")
+                                .and_then(Value::as_str)
+                                .or_else(|| error.get("requestId").and_then(Value::as_str))
+                        })
+                    })
+                    .map(ToString::to_string)
+            })
+        });
+    let retry_after = header_value(headers, "retry-after");
+    let should_retry =
+        header_value(headers, "x-should-retry").or_else(|| header_value(headers, "should-retry"));
+
+    if request_id.is_none() && retry_after.is_none() && should_retry.is_none() {
+        return None;
+    }
+
+    Some(UpstreamErrorMetadata {
+        request_id,
+        retry_after,
+        should_retry,
+    })
+}
+
 pub(crate) fn is_anthropic_message_path(path: &str) -> bool {
     path == "/v1/messages" || path == "/messages"
 }
@@ -1777,7 +1816,7 @@ async fn attempt_proxy_request(
             message.clone(),
         )
         .await?;
-        return Err(AppError::UpstreamStatus(message, status));
+        return Err(AppError::UpstreamStatus(message, status, None));
     }
 
     if is_stream {
@@ -4888,7 +4927,7 @@ mod tests {
         response::Response,
         routing::post,
     };
-    use futures_util::future::join_all;
+    use futures_util::{StreamExt, future::join_all};
     use serde_json::{Value, json};
     use sqlx::SqlitePool;
     use tempfile::tempdir;
@@ -5611,26 +5650,47 @@ mod tests {
     #[derive(Clone)]
     enum ReplayFixtureBody {
         Json(Value),
-        Sse(&'static str),
+        Chunked {
+            content_type: &'static str,
+            chunks: Vec<&'static str>,
+        },
     }
 
     #[derive(Clone)]
     struct ReplayFixtureResponse {
         status: StatusCode,
+        headers: Vec<(&'static str, &'static str)>,
         body: ReplayFixtureBody,
     }
 
     fn json_replay_response(status: StatusCode, body: Value) -> ReplayFixtureResponse {
+        json_replay_response_with_headers(status, vec![], body)
+    }
+
+    fn json_replay_response_with_headers(
+        status: StatusCode,
+        headers: Vec<(&'static str, &'static str)>,
+        body: Value,
+    ) -> ReplayFixtureResponse {
         ReplayFixtureResponse {
             status,
+            headers,
             body: ReplayFixtureBody::Json(body),
         }
     }
 
     fn sse_replay_response(body: &'static str) -> ReplayFixtureResponse {
+        sse_chunked_replay_response(vec![body])
+    }
+
+    fn sse_chunked_replay_response(chunks: Vec<&'static str>) -> ReplayFixtureResponse {
         ReplayFixtureResponse {
             status: StatusCode::OK,
-            body: ReplayFixtureBody::Sse(body),
+            headers: vec![],
+            body: ReplayFixtureBody::Chunked {
+                content_type: "text/event-stream",
+                chunks,
+            },
         }
     }
 
@@ -5652,17 +5712,26 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("replay upstream response should exist");
+            let mut builder = Response::builder().status(response.status);
+            for (name, value) in response.headers {
+                builder = builder.header(name, value);
+            }
 
             match response.body {
-                ReplayFixtureBody::Json(body) => Response::builder()
-                    .status(response.status)
+                ReplayFixtureBody::Json(body) => builder
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(serde_json::to_vec(&body).unwrap()))
                     .unwrap(),
-                ReplayFixtureBody::Sse(body) => Response::builder()
-                    .status(response.status)
-                    .header(CONTENT_TYPE, "text/event-stream")
-                    .body(Body::from(body))
+                ReplayFixtureBody::Chunked {
+                    content_type,
+                    chunks,
+                } => builder
+                    .header(CONTENT_TYPE, content_type)
+                    .body(Body::from_stream(tokio_stream::iter(
+                        chunks
+                            .into_iter()
+                            .map(|chunk| Ok::<Bytes, std::io::Error>(Bytes::from(chunk))),
+                    )))
                     .unwrap(),
             }
         }
@@ -5688,6 +5757,20 @@ mod tests {
     async fn response_text(response: Response<Body>) -> String {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    async fn response_stream_prefix_and_error(response: Response<Body>) -> (String, String) {
+        let mut stream = response.into_body().into_data_stream();
+        let mut prefix = String::new();
+
+        while let Some(next_chunk) = stream.next().await {
+            match next_chunk {
+                Ok(chunk) => prefix.push_str(&String::from_utf8_lossy(&chunk)),
+                Err(error) => return (prefix, error.to_string()),
+            }
+        }
+
+        panic!("expected response stream to surface an error");
     }
 
     async fn latest_route_log(app: &Router, route_id: i64) -> Value {
@@ -8947,6 +9030,152 @@ mod tests {
 
         let log = latest_route_log(&app, route_id).await;
         assert_eq!(log["upstream_path"], "/v1/responses");
+    }
+
+    #[tokio::test]
+    async fn claude_http_golden_replay_transcript_followup() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let expected_round_one_sse =
+            include_str!("claude/fixtures/claude_code_http_stream_anthropic.sse");
+        let expected_round_one_payload = fixture_json(include_str!(
+            "claude/fixtures/claude_code_tool_cycle_responses_payload.json"
+        ));
+        let expected_round_two_payload = fixture_json(include_str!(
+            "claude/fixtures/claude_code_http_transcript_followup_responses_payload.json"
+        ));
+        let expected_round_two_message = fixture_json(include_str!(
+            "claude/fixtures/claude_code_http_transcript_followup_message.json"
+        ));
+        let round_two_upstream_response = json!({
+            "id": "msg_http_followup",
+            "output_text": "Pack a light jacket.",
+            "usage": {
+                "input_tokens": 8,
+                "output_tokens": 5,
+                "total_tokens": 13
+            }
+        });
+        let (upstream_addr, captured_requests) = spawn_responses_replay_upstream(vec![
+            sse_replay_response(include_str!(
+                "claude/fixtures/claude_code_responses_stream_tool_cycle.sse"
+            )),
+            json_replay_response(StatusCode::OK, round_two_upstream_response),
+        ])
+        .await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        let route_id =
+            create_route_with_responses_channel(&app, "claude-sonnet-4-6", upstream_addr).await;
+
+        let round_one_request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(include_str!(
+                "claude/fixtures/claude_code_http_stream_request.json"
+            )))
+            .unwrap();
+        let round_one_response = app.clone().oneshot(round_one_request).await.unwrap();
+        assert_eq!(round_one_response.status(), StatusCode::OK);
+        assert_eq!(
+            round_one_response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        let round_one_text = response_text(round_one_response).await;
+        assert_eq!(
+            normalize_anthropic_stream_ids(&round_one_text),
+            expected_round_one_sse
+        );
+
+        let round_two_request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(include_str!(
+                "claude/fixtures/claude_code_http_transcript_followup_request.json"
+            )))
+            .unwrap();
+        let round_two_response = app.clone().oneshot(round_two_request).await.unwrap();
+        assert_eq!(round_two_response.status(), StatusCode::OK);
+        let round_two_value = response_json(round_two_response).await;
+        assert_eq!(round_two_value, expected_round_two_message);
+
+        let captured = captured_requests.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0], expected_round_one_payload);
+        assert_eq!(captured[1], expected_round_two_payload);
+
+        let log = latest_route_log(&app, route_id).await;
+        assert_eq!(log["upstream_path"], "/v1/responses");
+    }
+
+    #[tokio::test]
+    async fn claude_http_golden_replay_stream_failure_chunked() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let expected_prefix = include_str!(
+            "claude/fixtures/claude_code_http_stream_failure_prefix.sse"
+        );
+        let expected_payload = fixture_json(include_str!(
+            "claude/fixtures/claude_code_tool_cycle_responses_payload.json"
+        ));
+        let awkward_chunks = vec![
+            "data: {\"type\":\"response.cr",
+            "eated\"}\n\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup_we",
+            "ather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}\n\ndata: {\"type\":\"response.failed\",\"error\":{\"messa",
+            "ge\":\"model runtime failed\"}}\n\n",
+        ];
+        let (upstream_addr, captured_requests) = spawn_responses_replay_upstream(vec![
+            sse_chunked_replay_response(awkward_chunks),
+        ])
+        .await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        let route_id =
+            create_route_with_responses_channel(&app, "claude-sonnet-4-6", upstream_addr).await;
+
+        let proxy_request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(include_str!(
+                "claude/fixtures/claude_code_http_stream_failure_request.json"
+            )))
+            .unwrap();
+        let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
+        assert_eq!(proxy_response.status(), StatusCode::OK);
+        assert_eq!(
+            proxy_response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        let (prefix, error) = response_stream_prefix_and_error(proxy_response).await;
+        assert_eq!(normalize_anthropic_stream_ids(&prefix), expected_prefix);
+        assert_eq!(error, "model runtime failed");
+
+        let captured = captured_requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0], expected_payload);
+
+        let log = latest_route_log(&app, route_id).await;
+        assert_eq!(log["upstream_path"], "/v1/responses");
+        assert_eq!(log["error_message"], "model runtime failed");
     }
 
     #[tokio::test]
