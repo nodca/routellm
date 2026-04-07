@@ -1,0 +1,68 @@
+{
+  "model": "claude-sonnet-4-6",
+  "system": [
+    {
+      "type": "text",
+      "text": "You are Claude Code. Be concise."
+    }
+  ],
+  "stream": false,
+  "max_tokens": 64,
+  "temperature": 0.1,
+  "top_p": 0.8,
+  "betas": [
+    "claude-code-20250219",
+    "context-management-2025-06-27"
+  ],
+  "thinking": {
+    "type": "enabled",
+    "budget_tokens": 64
+  },
+  "context_management": {
+    "type": "ephemeral"
+  },
+  "metadata": {
+    "tenant": "ops"
+  },
+  "request_hints": {
+    "service_tier": "priority"
+  },
+  "tool_choice": {
+    "type": "tool",
+    "name": "lookup_weather"
+  },
+  "tools": [
+    {
+      "name": "lookup_weather",
+      "description": "Fetch weather",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ]
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "call_1",
+          "content": [
+            {
+              "type": "text",
+              "text": "sunny"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

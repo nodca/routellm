@@ -1,0 +1,41 @@
+{
+  "model": "claude-sonnet-4-6",
+  "input": [
+    {
+      "type": "function_call_output",
+      "call_id": "call_1",
+      "output": "sunny"
+    }
+  ],
+  "stream": false,
+  "temperature": 0.1,
+  "top_p": 0.8,
+  "max_output_tokens": 64,
+  "instructions": "You are Claude Code. Be concise.",
+  "tools": [
+    {
+      "type": "function",
+      "name": "lookup_weather",
+      "description": "Fetch weather",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ]
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "function",
+    "name": "lookup_weather"
+  },
+  "metadata": {
+    "tenant": "ops"
+  },
+  "service_tier": "priority"
+}
