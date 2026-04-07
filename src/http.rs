@@ -4870,6 +4870,7 @@ mod tests {
     };
 
     use std::{
+        collections::VecDeque,
         net::SocketAddr,
         path::PathBuf,
         sync::{
@@ -5107,76 +5108,6 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         addr
-    }
-
-    async fn spawn_assistant_history_sensitive_upstream()
-    -> (SocketAddr, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let captured_requests = Arc::new(Mutex::new(Vec::new()));
-        let attempts_for_handler = attempts.clone();
-        let captured_for_handler = captured_requests.clone();
-
-        async fn handler(
-            State((attempts, captured)): State<(Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>)>,
-            Json(payload): Json<Value>,
-        ) -> Response<Body> {
-            attempts.fetch_add(1, Ordering::SeqCst);
-            captured.lock().unwrap().push(payload.clone());
-
-            let has_assistant_role_history = payload
-                .get("input")
-                .and_then(Value::as_array)
-                .is_some_and(|items| {
-                    items.iter().any(|item| {
-                        item.get("type").and_then(Value::as_str) == Some("message")
-                            && item.get("role").and_then(Value::as_str) == Some("assistant")
-                    })
-                });
-
-            if has_assistant_role_history {
-                return Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{"error":{"message":"assistant role history unsupported","type":"server_error"}}"#,
-                    ))
-                    .unwrap();
-            }
-
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "id": "resp_compat_ok",
-                        "output": [{
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{
-                                "type": "output_text",
-                                "text": "compat fallback ok"
-                            }]
-                        }],
-                        "usage": {
-                            "input_tokens": 12,
-                            "output_tokens": 3,
-                            "total_tokens": 15
-                        }
-                    }))
-                    .unwrap(),
-                ))
-                .unwrap()
-        }
-
-        let app = Router::new()
-            .route("/v1/responses", post(handler))
-            .with_state((attempts_for_handler, captured_for_handler));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (addr, attempts, captured_requests)
     }
 
     async fn spawn_delayed_server_error_upstream(delay: Duration) -> SocketAddr {
@@ -5606,6 +5537,174 @@ mod tests {
 
     fn database_url(path: PathBuf) -> String {
         format!("sqlite://{}", path.display())
+    }
+
+    async fn create_route_with_responses_channel(
+        app: &Router,
+        route_model: &str,
+        upstream_addr: SocketAddr,
+    ) -> i64 {
+        let create_route_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/routes")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "route_model": route_model
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_route_response.status(), StatusCode::CREATED);
+        let create_route_value = response_json(create_route_response).await;
+        let route_id = create_route_value["data"]["route"]["id"].as_i64().unwrap();
+
+        let create_channel_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/routes/{route_id}/channels"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "base_url": format!("http://{upstream_addr}"),
+                            "api_key": "test-key",
+                            "upstream_model": "gpt-5.4",
+                            "protocol": "responses"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_channel_response.status(), StatusCode::CREATED);
+
+        route_id
+    }
+
+    fn fixture_json(raw: &str) -> Value {
+        serde_json::from_str(raw).expect("fixture json should parse")
+    }
+
+    fn normalize_anthropic_stream_ids(stream: &str) -> String {
+        let marker = "\"id\":\"msg_";
+        let Some(start) = stream.find(marker) else {
+            return stream.to_string();
+        };
+        let id_start = start + "\"id\":\"".len();
+        let Some(id_len) = stream[id_start..].find('"') else {
+            return stream.to_string();
+        };
+        let mut normalized = stream.to_string();
+        normalized.replace_range(id_start..id_start + id_len, "msg_req_fixture");
+        normalized
+    }
+
+    #[derive(Clone)]
+    enum ReplayFixtureBody {
+        Json(Value),
+        Sse(&'static str),
+    }
+
+    #[derive(Clone)]
+    struct ReplayFixtureResponse {
+        status: StatusCode,
+        body: ReplayFixtureBody,
+    }
+
+    fn json_replay_response(status: StatusCode, body: Value) -> ReplayFixtureResponse {
+        ReplayFixtureResponse {
+            status,
+            body: ReplayFixtureBody::Json(body),
+        }
+    }
+
+    fn sse_replay_response(body: &'static str) -> ReplayFixtureResponse {
+        ReplayFixtureResponse {
+            status: StatusCode::OK,
+            body: ReplayFixtureBody::Sse(body),
+        }
+    }
+
+    async fn spawn_responses_replay_upstream(
+        responses: Vec<ReplayFixtureResponse>,
+    ) -> (SocketAddr, Arc<Mutex<Vec<Value>>>) {
+        type ReplayState = (
+            Arc<Mutex<VecDeque<ReplayFixtureResponse>>>,
+            Arc<Mutex<Vec<Value>>>,
+        );
+
+        async fn handler(
+            State((responses, captured)): State<ReplayState>,
+            Json(payload): Json<Value>,
+        ) -> Response<Body> {
+            captured.lock().unwrap().push(payload);
+            let response = responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("replay upstream response should exist");
+
+            match response.body {
+                ReplayFixtureBody::Json(body) => Response::builder()
+                    .status(response.status)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+                ReplayFixtureBody::Sse(body) => Response::builder()
+                    .status(response.status)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(body))
+                    .unwrap(),
+            }
+        }
+
+        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let captured_requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/responses", post(handler))
+            .with_state((responses, captured_requests.clone()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, captured_requests)
+    }
+
+    async fn response_json(response: Response<Body>) -> Value {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn response_text(response: Response<Body>) -> String {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    async fn latest_route_log(app: &Router, route_id: i64) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/routes/{route_id}/logs"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = response_json(response).await;
+        value["data"]["logs"][0].clone()
     }
 
     #[tokio::test]
@@ -8613,11 +8712,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_messages_retry_with_assistant_history_compat_after_upstream_5xx() {
+    async fn claude_http_golden_replay_compat_retry() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
-        let (upstream_addr, attempts, captured_requests) =
-            spawn_assistant_history_sensitive_upstream().await;
+        let compat_error = json!({
+            "error": {
+                "message": "assistant role history unsupported",
+                "type": "server_error"
+            }
+        });
+        let compat_success = json!({
+            "id": "msg_http_compat",
+            "output_text": "compat fallback ok",
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 4,
+                "total_tokens": 16
+            }
+        });
+        let (upstream_addr, captured_requests) = spawn_responses_replay_upstream(vec![
+            json_replay_response(StatusCode::BAD_GATEWAY, compat_error),
+            json_replay_response(StatusCode::OK, compat_success),
+        ])
+        .await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             database_url: database_url(db_path),
@@ -8628,108 +8745,39 @@ mod tests {
             manual_intervention_policy: Default::default(),
         };
         let app = app::build_app(&config).await.unwrap();
-
-        let create_route_request = Request::builder()
-            .method("POST")
-            .uri("/api/routes")
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&json!({
-                    "route_model": "claude-opus-4-6"
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        let create_route_response = app.clone().oneshot(create_route_request).await.unwrap();
-        assert_eq!(create_route_response.status(), StatusCode::CREATED);
-        let create_route_body = to_bytes(create_route_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let create_route_value: Value = serde_json::from_slice(&create_route_body).unwrap();
-        let route_id = create_route_value["data"]["route"]["id"].as_i64().unwrap();
-
-        let create_channel_request = Request::builder()
-            .method("POST")
-            .uri(format!("/api/routes/{route_id}/channels"))
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&json!({
-                    "base_url": format!("http://{upstream_addr}"),
-                    "api_key": "test-key",
-                    "upstream_model": "gpt-5.4",
-                    "protocol": "responses"
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        let create_channel_response = app.clone().oneshot(create_channel_request).await.unwrap();
-        assert_eq!(create_channel_response.status(), StatusCode::CREATED);
+        let route_id =
+            create_route_with_responses_channel(&app, "claude-sonnet-4-6", upstream_addr).await;
+        let expected_message = fixture_json(include_str!(
+            "claude/fixtures/claude_code_http_compat_message.json"
+        ));
+        let expected_first_payload = fixture_json(include_str!(
+            "claude/fixtures/claude_code_http_compat_first_responses_payload.json"
+        ));
+        let expected_second_payload = fixture_json(include_str!(
+            "claude/fixtures/claude_code_http_compat_second_responses_payload.json"
+        ));
 
         let proxy_request = Request::builder()
             .method("POST")
             .uri("/v1/messages")
             .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&json!({
-                    "model": "claude-opus-4-6",
-                    "max_tokens": 64,
-                    "messages": [
-                        { "role": "user", "content": [{ "type": "text", "text": "hello" }] },
-                        { "role": "assistant", "content": [{ "type": "text", "text": "pong" }] },
-                        { "role": "user", "content": [{ "type": "text", "text": "ping" }] }
-                    ]
-                }))
-                .unwrap(),
-            ))
+            .body(Body::from(include_str!(
+                "claude/fixtures/claude_code_http_compat_request.json"
+            )))
             .unwrap();
+        assert_eq!(proxy_request.uri().path(), "/v1/messages");
         let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
         assert_eq!(proxy_response.status(), StatusCode::OK);
-        let proxy_body = to_bytes(proxy_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let proxy_value: Value = serde_json::from_slice(&proxy_body).unwrap();
-        assert_eq!(proxy_value["content"][0]["text"], "compat fallback ok");
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let proxy_value = response_json(proxy_response).await;
+        assert_eq!(proxy_value, expected_message);
 
         let captured = captured_requests.lock().unwrap();
         assert_eq!(captured.len(), 2);
-        let first_input = captured[0]["input"].as_array().unwrap();
-        assert!(
-            first_input
-                .iter()
-                .any(|item| { item["type"] == "message" && item["role"] == "assistant" })
-        );
-        let second_input = captured[1]["input"].as_array().unwrap();
-        assert!(
-            !second_input
-                .iter()
-                .any(|item| { item["type"] == "message" && item["role"] == "assistant" })
-        );
-        assert!(second_input.iter().any(|item| {
-            item["type"] == "message"
-                && item["role"] == "user"
-                && item["content"][0]["text"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("Assistant: pong"))
-        }));
+        assert_eq!(captured[0], expected_first_payload);
+        assert_eq!(captured[1], expected_second_payload);
 
-        let logs_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(format!("/api/routes/{route_id}/logs"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(logs_response.status(), StatusCode::OK);
-        let logs_body = to_bytes(logs_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let logs_value: Value = serde_json::from_slice(&logs_body).unwrap();
-        let log = &logs_value["data"]["logs"][0];
+        let log = latest_route_log(&app, route_id).await;
+        assert_eq!(log["upstream_path"], "/v1/responses");
         assert_eq!(
             log["claude_request_fingerprint"]["gateway"]["profile"],
             "compat-responses"
@@ -8789,10 +8837,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_native_gateway_skeleton_keeps_nonstream_messages_flow() {
+    async fn claude_http_golden_replay_nonstream() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
-        let upstream_addr = spawn_json_upstream().await;
+        let expected_message = fixture_json(include_str!(
+            "claude/fixtures/claude_code_http_nonstream_message.json"
+        ));
+        let mut expected_upstream_payload = fixture_json(include_str!(
+            "claude/fixtures/claude_code_tool_cycle_responses_payload.json"
+        ));
+        expected_upstream_payload["stream"] = json!(false);
+        let nonstream_response = json!({
+            "id": "msg_http_nonstream",
+            "output_text": "It is sunny in Paris.",
+            "usage": {
+                "input_tokens": 24,
+                "output_tokens": 7,
+                "total_tokens": 31
+            }
+        });
+        let (upstream_addr, captured_requests) =
+            spawn_responses_replay_upstream(vec![json_replay_response(
+                StatusCode::OK,
+                nonstream_response,
+            )])
+            .await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             database_url: database_url(db_path),
@@ -8803,73 +8872,44 @@ mod tests {
             manual_intervention_policy: Default::default(),
         };
         let app = app::build_app(&config).await.unwrap();
-
-        let create_route_request = Request::builder()
-            .method("POST")
-            .uri("/api/routes")
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&json!({
-                    "route_model": "claude-opus-4-6"
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        let create_route_response = app.clone().oneshot(create_route_request).await.unwrap();
-        assert_eq!(create_route_response.status(), StatusCode::CREATED);
-        let create_route_body = to_bytes(create_route_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let create_route_value: Value = serde_json::from_slice(&create_route_body).unwrap();
-        let route_id = create_route_value["data"]["route"]["id"].as_i64().unwrap();
-
-        let create_channel_request = Request::builder()
-            .method("POST")
-            .uri(format!("/api/routes/{route_id}/channels"))
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&json!({
-                    "base_url": format!("http://{upstream_addr}"),
-                    "api_key": "test-key",
-                    "upstream_model": "gpt-5.4",
-                    "protocol": "responses"
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        let create_channel_response = app.clone().oneshot(create_channel_request).await.unwrap();
-        assert_eq!(create_channel_response.status(), StatusCode::CREATED);
+        let route_id =
+            create_route_with_responses_channel(&app, "claude-sonnet-4-6", upstream_addr).await;
 
         let proxy_request = Request::builder()
             .method("POST")
             .uri("/v1/messages")
             .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&json!({
-                    "model": "claude-opus-4-6",
-                    "max_tokens": 16,
-                    "messages": [{ "role": "user", "content": "ping" }]
-                }))
-                .unwrap(),
-            ))
+            .body(Body::from(include_str!(
+                "claude/fixtures/claude_code_http_nonstream_request.json"
+            )))
             .unwrap();
+        assert_eq!(proxy_request.uri().path(), "/v1/messages");
         let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
         assert_eq!(proxy_response.status(), StatusCode::OK);
-        let proxy_body = to_bytes(proxy_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let proxy_value: Value = serde_json::from_slice(&proxy_body).unwrap();
-        assert_eq!(proxy_value["type"], "message");
-        assert_eq!(proxy_value["model"], "claude-opus-4-6");
-        assert_eq!(proxy_value["content"][0]["type"], "text");
-        assert_eq!(proxy_value["content"][0]["text"], "hello from upstream");
+        let proxy_value = response_json(proxy_response).await;
+        assert_eq!(proxy_value, expected_message);
+
+        let captured = captured_requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0], expected_upstream_payload);
+
+        let log = latest_route_log(&app, route_id).await;
+        assert_eq!(log["upstream_path"], "/v1/responses");
     }
 
     #[tokio::test]
-    async fn claude_native_gateway_skeleton_keeps_stream_tool_flow() {
+    async fn claude_http_golden_replay_stream() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
-        let upstream_addr = spawn_tool_call_streaming_upstream().await;
+        let expected_sse = include_str!("claude/fixtures/claude_code_http_stream_anthropic.sse");
+        let expected_upstream_payload = fixture_json(include_str!(
+            "claude/fixtures/claude_code_tool_cycle_responses_payload.json"
+        ));
+        let (upstream_addr, captured_requests) =
+            spawn_responses_replay_upstream(vec![sse_replay_response(include_str!(
+                "claude/fixtures/claude_code_responses_stream_tool_cycle.sse"
+            ))])
+            .await;
         let config = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             database_url: database_url(db_path),
@@ -8880,73 +8920,33 @@ mod tests {
             manual_intervention_policy: Default::default(),
         };
         let app = app::build_app(&config).await.unwrap();
-
-        let create_route_request = Request::builder()
-            .method("POST")
-            .uri("/api/routes")
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&json!({
-                    "route_model": "claude-sonnet-4-6"
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        let create_route_response = app.clone().oneshot(create_route_request).await.unwrap();
-        assert_eq!(create_route_response.status(), StatusCode::CREATED);
-        let create_route_body = to_bytes(create_route_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let create_route_value: Value = serde_json::from_slice(&create_route_body).unwrap();
-        let route_id = create_route_value["data"]["route"]["id"].as_i64().unwrap();
-
-        let create_channel_request = Request::builder()
-            .method("POST")
-            .uri(format!("/api/routes/{route_id}/channels"))
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&json!({
-                    "base_url": format!("http://{upstream_addr}"),
-                    "api_key": "test-key",
-                    "upstream_model": "gpt-5.4",
-                    "protocol": "responses"
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        let create_channel_response = app.clone().oneshot(create_channel_request).await.unwrap();
-        assert_eq!(create_channel_response.status(), StatusCode::CREATED);
+        let route_id =
+            create_route_with_responses_channel(&app, "claude-sonnet-4-6", upstream_addr).await;
 
         let proxy_request = Request::builder()
             .method("POST")
             .uri("/v1/messages")
             .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&json!({
-                    "model": "claude-sonnet-4-6",
-                    "stream": true,
-                    "max_tokens": 16,
-                    "messages": [{ "role": "user", "content": "weather?" }]
-                }))
-                .unwrap(),
-            ))
+            .body(Body::from(include_str!(
+                "claude/fixtures/claude_code_http_stream_request.json"
+            )))
             .unwrap();
+        assert_eq!(proxy_request.uri().path(), "/v1/messages");
         let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
         assert_eq!(proxy_response.status(), StatusCode::OK);
         assert_eq!(
             proxy_response.headers().get(CONTENT_TYPE).unwrap(),
             "text/event-stream"
         );
-        let body = to_bytes(proxy_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("event: message_start"));
-        assert!(text.contains("event: content_block_start"));
-        assert!(text.contains("\"type\":\"tool_use\""));
-        assert!(text.contains("event: message_delta"));
-        assert!(text.contains("\"stop_reason\":\"tool_use\""));
-        assert!(text.contains("event: message_stop"));
+        let text = response_text(proxy_response).await;
+        assert_eq!(normalize_anthropic_stream_ids(&text), expected_sse);
+
+        let captured = captured_requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0], expected_upstream_payload);
+
+        let log = latest_route_log(&app, route_id).await;
+        assert_eq!(log["upstream_path"], "/v1/responses");
     }
 
     #[tokio::test]
