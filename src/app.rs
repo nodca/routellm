@@ -151,9 +151,8 @@ async fn require_bearer_auth(
         return Ok(next.run(request).await);
     }
 
-    let error = crate::error::AppError::Unauthorized(
-        "missing or invalid authorization token".to_string(),
-    );
+    let error =
+        crate::error::AppError::Unauthorized("missing or invalid authorization token".to_string());
     if http::is_anthropic_message_path(request.uri().path()) {
         let request_id = Uuid::new_v4().to_string();
         if let Err(log_error) = http::record_message_ingress_failure(

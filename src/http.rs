@@ -803,7 +803,9 @@ fn build_claude_request_log_context(
         downstream_path: Some(path.to_string()),
         downstream_client_request_id: client_request_id,
         claude_request_fingerprint: Some(serde_json::to_string(&fingerprint).map_err(|error| {
-            AppError::Internal(format!("failed to serialize claude request fingerprint: {error}"))
+            AppError::Internal(format!(
+                "failed to serialize claude request fingerprint: {error}"
+            ))
         })?),
     })
 }
@@ -852,7 +854,12 @@ pub(crate) async fn record_message_ingress_failure(
     let route_id = if requested_model.is_empty() {
         None
     } else {
-        state.store.find_route(requested_model).await.ok().map(|route| route.id)
+        state
+            .store
+            .find_route(requested_model)
+            .await
+            .ok()
+            .map(|route| route.id)
     };
 
     record_request_without_channel(
@@ -992,9 +999,7 @@ async fn proxy_request(
             )
             .await;
         }
-        let error = AppError::NoRoute(format!(
-            "no eligible channel for model: {requested_model}"
-        ));
+        let error = AppError::NoRoute(format!("no eligible channel for model: {requested_model}"));
         if let Err(log_error) = record_request_without_channel(
             &state,
             &request_id,
@@ -8056,10 +8061,7 @@ mod tests {
             log["claude_request_fingerprint"]["headers"]["x_anthropic_additional_protection_present"],
             true
         );
-        assert_eq!(
-            log["claude_request_fingerprint"]["body"]["tool_count"],
-            1
-        );
+        assert_eq!(log["claude_request_fingerprint"]["body"]["tool_count"], 1);
         assert_eq!(
             log["claude_request_fingerprint"]["body"]["tool_choice_type"],
             "auto"
