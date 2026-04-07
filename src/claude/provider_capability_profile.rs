@@ -2,6 +2,18 @@ use serde_json::{Map, Value};
 
 use crate::claude::semantic_core::{ClaudeRequestExtensions, ClaudeThinkingConfig};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResponsesCapabilityProfileKind {
+    Strict,
+    Compat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantHistoryDisposition {
+    PreserveNativeRole,
+    RetryWithTranscriptCompat,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityDisposition {
     Forward,
@@ -13,11 +25,14 @@ pub enum CapabilityDisposition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeProviderCapabilityProfile {
     pub provider_name: &'static str,
+    pub profile_name: &'static str,
+    pub profile_kind: ResponsesCapabilityProfileKind,
     pub metadata: CapabilityDisposition,
     pub service_tier: CapabilityDisposition,
     pub thinking: CapabilityDisposition,
     pub context_management: CapabilityDisposition,
     pub beta_hints: CapabilityDisposition,
+    pub assistant_history: AssistantHistoryDisposition,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,14 +60,50 @@ pub struct FlagCapabilityDecision {
 
 impl ClaudeProviderCapabilityProfile {
     pub fn responses() -> Self {
+        Self::responses_strict()
+    }
+
+    pub fn responses_strict() -> Self {
         Self {
             provider_name: "responses",
+            profile_name: "strict-responses",
+            profile_kind: ResponsesCapabilityProfileKind::Strict,
             metadata: CapabilityDisposition::Forward,
             service_tier: CapabilityDisposition::Forward,
             thinking: CapabilityDisposition::IgnoreRequested,
             context_management: CapabilityDisposition::IgnoreRequested,
             beta_hints: CapabilityDisposition::Unsupported,
+            assistant_history: AssistantHistoryDisposition::PreserveNativeRole,
         }
+    }
+
+    pub fn responses_compat() -> Self {
+        Self {
+            provider_name: "responses",
+            profile_name: "compat-responses",
+            profile_kind: ResponsesCapabilityProfileKind::Compat,
+            metadata: CapabilityDisposition::Forward,
+            service_tier: CapabilityDisposition::Forward,
+            thinking: CapabilityDisposition::IgnoreRequested,
+            context_management: CapabilityDisposition::IgnoreRequested,
+            beta_hints: CapabilityDisposition::Unsupported,
+            assistant_history: AssistantHistoryDisposition::RetryWithTranscriptCompat,
+        }
+    }
+
+    pub fn for_responses_endpoint(base_url: &str) -> Self {
+        if is_official_openai_responses_endpoint(base_url) {
+            Self::responses_strict()
+        } else {
+            Self::responses_compat()
+        }
+    }
+
+    pub fn supports_assistant_history_compat_retry(&self) -> bool {
+        matches!(
+            self.assistant_history,
+            AssistantHistoryDisposition::RetryWithTranscriptCompat
+        )
     }
 
     pub fn resolve_extensions(
@@ -96,6 +147,11 @@ impl ClaudeProviderCapabilityProfile {
     }
 }
 
+fn is_official_openai_responses_endpoint(base_url: &str) -> bool {
+    let trimmed = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
+    trimmed.starts_with("https://api.openai.com") || trimmed.starts_with("http://api.openai.com")
+}
+
 fn forwarded_value<T>(disposition: CapabilityDisposition, value: Option<T>) -> Option<T> {
     match disposition {
         CapabilityDisposition::Forward => value,
@@ -125,9 +181,10 @@ mod tests {
         }))
         .expect("request should parse");
 
-        let resolution =
-            ClaudeProviderCapabilityProfile::responses().resolve_extensions(&request.extensions);
+        let profile = ClaudeProviderCapabilityProfile::responses();
+        let resolution = profile.resolve_extensions(&request.extensions);
 
+        assert_eq!(profile.profile_name, "strict-responses");
         assert_eq!(
             resolution.metadata.disposition,
             CapabilityDisposition::Forward
@@ -161,6 +218,7 @@ mod tests {
                 "context-management-2025-06-27".to_string()
             ]
         );
+        assert!(!profile.supports_assistant_history_compat_retry());
     }
 
     #[test]
@@ -171,8 +229,8 @@ mod tests {
         }))
         .expect("request should parse");
 
-        let resolution =
-            ClaudeProviderCapabilityProfile::responses().resolve_extensions(&request.extensions);
+        let resolution = ClaudeProviderCapabilityProfile::responses_strict()
+            .resolve_extensions(&request.extensions);
 
         assert!(!resolution.metadata.requested);
         assert!(resolution.metadata.forwarded.is_none());
@@ -181,5 +239,21 @@ mod tests {
         assert!(!resolution.thinking.requested);
         assert!(!resolution.context_management.requested);
         assert!(resolution.unsupported_beta_hints.is_empty());
+    }
+
+    #[test]
+    fn claude_provider_capability_profile_classifies_official_vs_compat_responses_endpoints() {
+        let strict =
+            ClaudeProviderCapabilityProfile::for_responses_endpoint("https://api.openai.com/v1");
+        let compat =
+            ClaudeProviderCapabilityProfile::for_responses_endpoint("https://free.9e.nz/v1");
+
+        assert_eq!(strict.profile_kind, ResponsesCapabilityProfileKind::Strict);
+        assert_eq!(strict.profile_name, "strict-responses");
+        assert!(!strict.supports_assistant_history_compat_retry());
+
+        assert_eq!(compat.profile_kind, ResponsesCapabilityProfileKind::Compat);
+        assert_eq!(compat.profile_name, "compat-responses");
+        assert!(compat.supports_assistant_history_compat_retry());
     }
 }

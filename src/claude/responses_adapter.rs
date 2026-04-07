@@ -76,11 +76,17 @@ impl ResponsesProviderAdapter {
         self.request_mode
     }
 
+    pub fn capability_profile(&self) -> &ClaudeProviderCapabilityProfile {
+        &self.capability_profile
+    }
+
     pub fn should_retry_with_assistant_history_compat(
         &self,
         request: &ClaudeMessageRequest,
     ) -> bool {
-        request.has_plaintext_assistant_history()
+        self.capability_profile
+            .supports_assistant_history_compat_retry()
+            && request.has_plaintext_assistant_history()
     }
 
     pub fn extension_policy(&self, request: &ClaudeMessageRequest) -> ClaudeExtensionResolution {
@@ -913,6 +919,26 @@ mod tests {
 
         assert_eq!(payload["input"][1]["role"], "user");
         assert_eq!(payload["input"][1]["content"][0]["text"], "Assistant: pong");
+    }
+
+    #[test]
+    fn claude_responses_adapter_only_allows_assistant_history_retry_for_compat_profile() {
+        let request = ClaudeMessageRequest::parse_json(&json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                { "role": "user", "content": "hello" },
+                { "role": "assistant", "content": [{ "type": "text", "text": "pong" }] }
+            ]
+        }))
+        .unwrap();
+
+        let strict_adapter = ResponsesProviderAdapter::new()
+            .with_capability_profile(ClaudeProviderCapabilityProfile::responses_strict());
+        let compat_adapter = ResponsesProviderAdapter::new()
+            .with_capability_profile(ClaudeProviderCapabilityProfile::responses_compat());
+
+        assert!(!strict_adapter.should_retry_with_assistant_history_compat(&request));
+        assert!(compat_adapter.should_retry_with_assistant_history_compat(&request));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     error::Error as StdError,
-    sync::OnceLock,
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -26,7 +26,9 @@ use uuid::Uuid;
 use crate::{
     app::AppState,
     claude::{
-        provider_capability_profile::ClaudeProviderCapabilityProfile,
+        provider_capability_profile::{
+            CapabilityDisposition, ClaudeProviderCapabilityProfile, ResponsesCapabilityProfileKind,
+        },
         responses_adapter::{ResponsesProviderAdapter, ResponsesRequestMode},
         semantic_core::ClaudeMessageRequest,
     },
@@ -115,10 +117,15 @@ struct PreparedPayloads {
 #[derive(Debug)]
 struct ClaudeMessagePayloads {
     semantic_request: ClaudeMessageRequest,
-    response_adapter: ResponsesProviderAdapter,
-    compat_response_adapter: ResponsesProviderAdapter,
-    anthropic_to_responses_json: OnceLock<Bytes>,
-    anthropic_compat_to_responses_json: OnceLock<Bytes>,
+    responses_payload_cache: Mutex<HashMap<ClaudePayloadCacheKey, Bytes>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ClaudePayloadCacheKey {
+    StrictStandard,
+    StrictAssistantHistoryCompat,
+    CompatStandard,
+    CompatAssistantHistoryCompat,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -126,6 +133,60 @@ struct RequestLogContext {
     downstream_path: Option<String>,
     downstream_client_request_id: Option<String>,
     claude_request_fingerprint: Option<String>,
+    claude_gateway: Option<Value>,
+}
+
+impl ClaudePayloadCacheKey {
+    fn new(
+        capability_profile: &ClaudeProviderCapabilityProfile,
+        request_mode: ResponsesRequestMode,
+    ) -> Self {
+        match (capability_profile.profile_kind, request_mode) {
+            (ResponsesCapabilityProfileKind::Strict, ResponsesRequestMode::Standard) => {
+                Self::StrictStandard
+            }
+            (
+                ResponsesCapabilityProfileKind::Strict,
+                ResponsesRequestMode::AssistantHistoryCompat,
+            ) => Self::StrictAssistantHistoryCompat,
+            (ResponsesCapabilityProfileKind::Compat, ResponsesRequestMode::Standard) => {
+                Self::CompatStandard
+            }
+            (
+                ResponsesCapabilityProfileKind::Compat,
+                ResponsesRequestMode::AssistantHistoryCompat,
+            ) => Self::CompatAssistantHistoryCompat,
+        }
+    }
+}
+
+impl RequestLogContext {
+    fn with_claude_gateway(&self, gateway: Value) -> Self {
+        let mut next = self.clone();
+        next.claude_gateway = Some(gateway);
+        next
+    }
+
+    fn serialized_claude_request_fingerprint(&self) -> Option<String> {
+        let mut fingerprint = self
+            .claude_request_fingerprint
+            .as_ref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .unwrap_or_else(|| json!({}));
+
+        if let Some(gateway) = &self.claude_gateway {
+            fingerprint
+                .as_object_mut()
+                .unwrap_or_else(|| unreachable!("json object fallback should stay object"))
+                .insert("gateway".to_string(), gateway.clone());
+        }
+
+        if fingerprint == json!({}) && self.claude_gateway.is_none() {
+            return self.claude_request_fingerprint.clone();
+        }
+
+        serde_json::to_string(&fingerprint).ok()
+    }
 }
 
 impl PreparedPayloads {
@@ -139,20 +200,13 @@ impl PreparedPayloads {
     }
 
     fn for_claude_message(payload: Value, semantic_request: ClaudeMessageRequest) -> Self {
-        let capability_profile = ClaudeProviderCapabilityProfile::responses();
         Self {
             original_value: payload,
             original_json: OnceLock::new(),
             chat_to_responses_json: OnceLock::new(),
             claude_message: Some(ClaudeMessagePayloads {
                 semantic_request,
-                response_adapter: ResponsesProviderAdapter::new()
-                    .with_capability_profile(capability_profile.clone()),
-                compat_response_adapter: ResponsesProviderAdapter::new()
-                    .with_capability_profile(capability_profile)
-                    .with_request_mode(ResponsesRequestMode::AssistantHistoryCompat),
-                anthropic_to_responses_json: OnceLock::new(),
-                anthropic_compat_to_responses_json: OnceLock::new(),
+                responses_payload_cache: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -165,6 +219,14 @@ impl PreparedPayloads {
     }
 
     fn bytes_for(&self, kind: DispatchPayloadKind) -> Result<Bytes, AppError> {
+        self.bytes_for_with_claude_profile(kind, None)
+    }
+
+    fn bytes_for_with_claude_profile(
+        &self,
+        kind: DispatchPayloadKind,
+        capability_profile: Option<&ClaudeProviderCapabilityProfile>,
+    ) -> Result<Bytes, AppError> {
         match kind {
             DispatchPayloadKind::Original => {
                 if let Some(bytes) = self.original_json.get() {
@@ -191,17 +253,30 @@ impl PreparedPayloads {
                         "missing claude message adapter state".to_string(),
                     ));
                 };
-                if let Some(bytes) = claude_message.anthropic_to_responses_json.get() {
-                    return Ok(bytes.clone());
+                let profile = capability_profile
+                    .cloned()
+                    .unwrap_or_else(ClaudeProviderCapabilityProfile::responses_strict);
+                let cache_key =
+                    ClaudePayloadCacheKey::new(&profile, ResponsesRequestMode::Standard);
+                if let Some(bytes) = claude_message
+                    .responses_payload_cache
+                    .lock()
+                    .unwrap()
+                    .get(&cache_key)
+                    .cloned()
+                {
+                    return Ok(bytes);
                 }
 
-                let adapted = claude_message
-                    .response_adapter
+                let adapted = ResponsesProviderAdapter::new()
+                    .with_capability_profile(profile)
                     .request_to_payload(&claude_message.semantic_request)?;
                 let bytes = serialize_json_bytes(&adapted)?;
-                let _ = claude_message
-                    .anthropic_to_responses_json
-                    .set(bytes.clone());
+                claude_message
+                    .responses_payload_cache
+                    .lock()
+                    .unwrap()
+                    .insert(cache_key, bytes.clone());
                 Ok(bytes)
             }
             DispatchPayloadKind::AnthropicMessagesToResponsesAssistantHistoryCompat => {
@@ -210,17 +285,33 @@ impl PreparedPayloads {
                         "missing claude message adapter state".to_string(),
                     ));
                 };
-                if let Some(bytes) = claude_message.anthropic_compat_to_responses_json.get() {
-                    return Ok(bytes.clone());
+                let profile = capability_profile
+                    .cloned()
+                    .unwrap_or_else(ClaudeProviderCapabilityProfile::responses_strict);
+                let cache_key = ClaudePayloadCacheKey::new(
+                    &profile,
+                    ResponsesRequestMode::AssistantHistoryCompat,
+                );
+                if let Some(bytes) = claude_message
+                    .responses_payload_cache
+                    .lock()
+                    .unwrap()
+                    .get(&cache_key)
+                    .cloned()
+                {
+                    return Ok(bytes);
                 }
 
-                let adapted = claude_message
-                    .compat_response_adapter
+                let adapted = ResponsesProviderAdapter::new()
+                    .with_capability_profile(profile)
+                    .with_request_mode(ResponsesRequestMode::AssistantHistoryCompat)
                     .request_to_payload(&claude_message.semantic_request)?;
                 let bytes = serialize_json_bytes(&adapted)?;
-                let _ = claude_message
-                    .anthropic_compat_to_responses_json
-                    .set(bytes.clone());
+                claude_message
+                    .responses_payload_cache
+                    .lock()
+                    .unwrap()
+                    .insert(cache_key, bytes.clone());
                 Ok(bytes)
             }
         }
@@ -232,18 +323,30 @@ impl PreparedPayloads {
             .map(|claude_message| claude_message.semantic_request.model.as_str())
     }
 
-    fn should_retry_with_assistant_history_compat(&self) -> bool {
+    fn semantic_claude_request(&self) -> Option<&ClaudeMessageRequest> {
+        self.claude_message
+            .as_ref()
+            .map(|claude_message| &claude_message.semantic_request)
+    }
+
+    fn should_retry_with_assistant_history_compat(
+        &self,
+        capability_profile: &ClaudeProviderCapabilityProfile,
+    ) -> bool {
         self.claude_message.as_ref().is_some_and(|claude_message| {
-            claude_message
-                .response_adapter
+            ResponsesProviderAdapter::new()
+                .with_capability_profile(capability_profile.clone())
                 .should_retry_with_assistant_history_compat(&claude_message.semantic_request)
         })
     }
 
-    fn claude_response_adapter(&self) -> Option<ResponsesProviderAdapter> {
-        self.claude_message
-            .as_ref()
-            .map(|claude_message| claude_message.response_adapter.clone())
+    fn claude_response_adapter(
+        &self,
+        capability_profile: &ClaudeProviderCapabilityProfile,
+    ) -> Option<ResponsesProviderAdapter> {
+        self.claude_message.as_ref().map(|_| {
+            ResponsesProviderAdapter::new().with_capability_profile(capability_profile.clone())
+        })
     }
 }
 
@@ -938,6 +1041,45 @@ fn build_claude_request_log_context(
                 "failed to serialize claude request fingerprint: {error}"
             ))
         })?),
+        claude_gateway: None,
+    })
+}
+
+fn capability_disposition_label(disposition: CapabilityDisposition) -> &'static str {
+    match disposition {
+        CapabilityDisposition::Forward => "forward",
+        CapabilityDisposition::Omit => "omit",
+        CapabilityDisposition::IgnoreRequested => "ignore_requested",
+        CapabilityDisposition::Unsupported => "unsupported",
+    }
+}
+
+fn build_claude_gateway_log_entry(
+    capability_profile: &ClaudeProviderCapabilityProfile,
+    request: &ClaudeMessageRequest,
+    fallback_trigger_status: Option<u16>,
+    fallback_applied: bool,
+) -> Value {
+    let adapter =
+        ResponsesProviderAdapter::new().with_capability_profile(capability_profile.clone());
+    let extension_policy = adapter.extension_policy(request);
+
+    json!({
+        "provider": capability_profile.provider_name,
+        "profile": capability_profile.profile_name,
+        "assistant_history": {
+            "plaintext_history_present": request.has_plaintext_assistant_history(),
+            "compat_retry_allowed": capability_profile.supports_assistant_history_compat_retry(),
+            "fallback_applied": fallback_applied,
+            "fallback_trigger_status": fallback_trigger_status
+        },
+        "extensions": {
+            "metadata": capability_disposition_label(extension_policy.metadata.disposition),
+            "service_tier": capability_disposition_label(extension_policy.service_tier.disposition),
+            "thinking": capability_disposition_label(extension_policy.thinking.disposition),
+            "context_management": capability_disposition_label(extension_policy.context_management.disposition),
+            "unsupported_beta_hints": extension_policy.unsupported_beta_hints
+        }
     })
 }
 
@@ -1288,7 +1430,7 @@ async fn record_request_without_channel(
         input_tokens: None,
         output_tokens: None,
         total_tokens: None,
-        claude_request_fingerprint: log_context.claude_request_fingerprint.clone(),
+        claude_request_fingerprint: log_context.serialized_claude_request_fingerprint(),
     };
     state.store.record_request(&log).await
 }
@@ -1454,8 +1596,22 @@ async fn attempt_proxy_request(
             return Err(error);
         }
     };
+    let claude_capability_profile = (dispatch.response_adapter
+        == ResponseAdapter::ResponsesToAnthropicMessages)
+        .then(|| ClaudeProviderCapabilityProfile::for_responses_endpoint(&selected.site_base_url));
+    let mut attempt_log_context = match (
+        claude_capability_profile.as_ref(),
+        payloads.semantic_claude_request(),
+    ) {
+        (Some(profile), Some(request)) => log_context.with_claude_gateway(
+            build_claude_gateway_log_entry(profile, request, None, false),
+        ),
+        _ => log_context.clone(),
+    };
     let is_stream = payloads.is_stream();
-    let payload_bytes = match payloads.bytes_for(dispatch.payload_kind) {
+    let payload_bytes = match payloads
+        .bytes_for_with_claude_profile(dispatch.payload_kind, claude_capability_profile.as_ref())
+    {
         Ok(bytes) => bytes,
         Err(error) => {
             record_failure(
@@ -1466,7 +1622,7 @@ async fn attempt_proxy_request(
                 requested_model,
                 downstream_protocol,
                 dispatch.upstream_protocol,
-                log_context,
+                &attempt_log_context,
                 Some(error.status_code().as_u16()),
                 started_at.elapsed().as_millis() as i64,
                 error.to_string(),
@@ -1502,7 +1658,7 @@ async fn attempt_proxy_request(
                 requested_model,
                 downstream_protocol,
                 dispatch.upstream_protocol,
-                log_context,
+                &attempt_log_context,
                 None,
                 started_at.elapsed().as_millis() as i64,
                 error.to_string(),
@@ -1516,17 +1672,35 @@ async fn attempt_proxy_request(
     let mut status = upstream_response.status();
     if status.is_server_error()
         && dispatch.payload_kind == DispatchPayloadKind::AnthropicMessagesToResponses
-        && payloads.should_retry_with_assistant_history_compat()
+        && claude_capability_profile
+            .as_ref()
+            .is_some_and(|profile| payloads.should_retry_with_assistant_history_compat(profile))
     {
+        if let (Some(profile), Some(request)) = (
+            claude_capability_profile.as_ref(),
+            payloads.semantic_claude_request(),
+        ) {
+            attempt_log_context = log_context.with_claude_gateway(build_claude_gateway_log_entry(
+                profile,
+                request,
+                Some(status.as_u16()),
+                true,
+            ));
+        }
         tracing::warn!(
             request_id,
             requested_model,
+            profile = claude_capability_profile
+                .as_ref()
+                .map(|profile| profile.profile_name)
+                .unwrap_or("responses"),
             status = status.as_u16(),
             "retrying anthropic messages request with assistant-history compatibility payload"
         );
-        let compat_payload_bytes = match payloads
-            .bytes_for(DispatchPayloadKind::AnthropicMessagesToResponsesAssistantHistoryCompat)
-        {
+        let compat_payload_bytes = match payloads.bytes_for_with_claude_profile(
+            DispatchPayloadKind::AnthropicMessagesToResponsesAssistantHistoryCompat,
+            claude_capability_profile.as_ref(),
+        ) {
             Ok(bytes) => bytes,
             Err(error) => {
                 record_failure(
@@ -1537,7 +1711,7 @@ async fn attempt_proxy_request(
                     requested_model,
                     downstream_protocol,
                     dispatch.upstream_protocol,
-                    log_context,
+                    &attempt_log_context,
                     Some(error.status_code().as_u16()),
                     started_at.elapsed().as_millis() as i64,
                     error.to_string(),
@@ -1566,7 +1740,7 @@ async fn attempt_proxy_request(
                     requested_model,
                     downstream_protocol,
                     dispatch.upstream_protocol,
-                    log_context,
+                    &attempt_log_context,
                     None,
                     started_at.elapsed().as_millis() as i64,
                     error.to_string(),
@@ -1597,7 +1771,7 @@ async fn attempt_proxy_request(
             requested_model,
             downstream_protocol,
             dispatch.upstream_protocol,
-            log_context,
+            &attempt_log_context,
             Some(status.as_u16()),
             started_at.elapsed().as_millis() as i64,
             message.clone(),
@@ -1621,7 +1795,7 @@ async fn attempt_proxy_request(
                     started_at,
                     downstream_protocol,
                     dispatch.upstream_protocol,
-                    log_context.clone(),
+                    attempt_log_context.clone(),
                     !is_stream,
                 )
                 .await
@@ -1636,7 +1810,7 @@ async fn attempt_proxy_request(
                     upstream_response,
                     started_at,
                     dispatch.upstream_protocol,
-                    log_context.clone(),
+                    attempt_log_context.clone(),
                 )
                 .await
             }
@@ -1650,9 +1824,13 @@ async fn attempt_proxy_request(
                     upstream_response,
                     started_at,
                     dispatch.upstream_protocol,
-                    log_context.clone(),
+                    attempt_log_context.clone(),
                     payloads
-                        .claude_response_adapter()
+                        .claude_response_adapter(
+                            claude_capability_profile
+                                .as_ref()
+                                .unwrap_or(&ClaudeProviderCapabilityProfile::responses_strict()),
+                        )
                         .unwrap_or_else(ResponsesProviderAdapter::new),
                 )
                 .await
@@ -1673,7 +1851,7 @@ async fn attempt_proxy_request(
             started_at,
             downstream_protocol,
             dispatch.upstream_protocol,
-            log_context.clone(),
+            attempt_log_context.clone(),
         )
         .await;
     }
@@ -1691,7 +1869,7 @@ async fn attempt_proxy_request(
             started_at,
             downstream_protocol,
             dispatch.upstream_protocol,
-            log_context.clone(),
+            attempt_log_context.clone(),
             !is_stream,
         )
         .await;
@@ -1724,7 +1902,7 @@ async fn attempt_proxy_request(
                 requested_model,
                 downstream_protocol,
                 dispatch.upstream_protocol,
-                log_context,
+                &attempt_log_context,
                 Some(status.as_u16()),
                 started_at.elapsed().as_millis() as i64,
                 message.clone(),
@@ -1761,7 +1939,11 @@ async fn attempt_proxy_request(
             responses_json_to_chat_completion(&response_value, requested_model, request_id)
         }
         ResponseAdapter::ResponsesToAnthropicMessages => payloads
-            .claude_response_adapter()
+            .claude_response_adapter(
+                claude_capability_profile
+                    .as_ref()
+                    .unwrap_or(&ClaudeProviderCapabilityProfile::responses_strict()),
+            )
             .unwrap_or_else(ResponsesProviderAdapter::new)
             .response_to_message(&response_value, requested_model, request_id)?,
         ResponseAdapter::Passthrough => response_value.clone(),
@@ -1775,7 +1957,7 @@ async fn attempt_proxy_request(
         requested_model,
         downstream_protocol,
         dispatch.upstream_protocol,
-        log_context,
+        &attempt_log_context,
         status.as_u16(),
         started_at.elapsed().as_millis() as i64,
         token_usage,
@@ -2889,7 +3071,7 @@ fn build_request_log_write(
         input_tokens,
         output_tokens,
         total_tokens,
-        claude_request_fingerprint: log_context.claude_request_fingerprint.clone(),
+        claude_request_fingerprint: log_context.serialized_claude_request_fingerprint(),
     }
 }
 
@@ -4683,7 +4865,9 @@ fn truncate(message: &str, max_len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DispatchPayloadKind, build_claude_message_payloads};
+    use super::{
+        ClaudeProviderCapabilityProfile, DispatchPayloadKind, build_claude_message_payloads,
+    };
 
     use std::{
         net::SocketAddr,
@@ -7960,6 +8144,14 @@ mod tests {
             true
         );
         assert_eq!(log["claude_request_fingerprint"]["body"]["stream"], true);
+        assert_eq!(
+            log["claude_request_fingerprint"]["gateway"]["profile"],
+            "compat-responses"
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["gateway"]["assistant_history"]["fallback_applied"],
+            false
+        );
 
         let pool = SqlitePool::connect(&config.database_url).await.unwrap();
         let row = sqlx::query_as::<_, (String, String)>(
@@ -8520,6 +8712,40 @@ mod tests {
                     .as_str()
                     .is_some_and(|text| text.contains("Assistant: pong"))
         }));
+
+        let logs_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/routes/{route_id}/logs"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logs_response.status(), StatusCode::OK);
+        let logs_body = to_bytes(logs_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let logs_value: Value = serde_json::from_slice(&logs_body).unwrap();
+        let log = &logs_value["data"]["logs"][0];
+        assert_eq!(
+            log["claude_request_fingerprint"]["gateway"]["profile"],
+            "compat-responses"
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["gateway"]["assistant_history"]["compat_retry_allowed"],
+            true
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["gateway"]["assistant_history"]["fallback_applied"],
+            true
+        );
+        assert_eq!(
+            log["claude_request_fingerprint"]["gateway"]["assistant_history"]["fallback_trigger_status"],
+            502
+        );
     }
 
     #[test]
@@ -8554,7 +8780,12 @@ mod tests {
         assert!(adapted.get("context_management").is_none());
         assert!(adapted.get("betas").is_none());
         assert_eq!(adapted["input"][0]["role"], "user");
-        assert!(prepared.should_retry_with_assistant_history_compat());
+        assert!(prepared.should_retry_with_assistant_history_compat(
+            &ClaudeProviderCapabilityProfile::responses_compat()
+        ));
+        assert!(!prepared.should_retry_with_assistant_history_compat(
+            &ClaudeProviderCapabilityProfile::responses_strict()
+        ));
     }
 
     #[tokio::test]
