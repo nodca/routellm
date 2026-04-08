@@ -3,7 +3,7 @@ use std::time::Duration;
 use axum::{
     Router,
     body::Body,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{
         Request,
         header::{AUTHORIZATION, HeaderValue},
@@ -19,6 +19,8 @@ use crate::{
     http,
     store::SqliteStore,
 };
+
+const PROXY_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -100,6 +102,8 @@ pub fn build_router(state: AppState) -> Router {
             "/channels/{channel_id}/reset-cooldown",
             axum::routing::post(http::reset_channel_cooldown),
         );
+    // Image requests often arrive as data URLs inside JSON, which quickly exceeds
+    // axum's 2MB default body limit for Bytes/Json extractors.
     let v1_router = Router::new()
         .route("/responses", axum::routing::post(http::create_response))
         .route(
@@ -107,7 +111,8 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::post(http::create_chat_completion),
         )
         .route("/messages", axum::routing::post(http::create_message))
-        .route("/models", axum::routing::get(http::list_models));
+        .route("/models", axum::routing::get(http::list_models))
+        .layer(DefaultBodyLimit::max(PROXY_BODY_LIMIT_BYTES));
     let compat_router = Router::new()
         .route("/responses", axum::routing::post(http::create_response))
         .route(
@@ -127,7 +132,8 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/models/{tail}",
             axum::routing::post(http::create_gemini_content),
-        );
+        )
+        .layer(DefaultBodyLimit::max(PROXY_BODY_LIMIT_BYTES));
 
     Router::new()
         .route("/healthz", axum::routing::get(http::healthz))
@@ -259,6 +265,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
+    use serde_json::json;
     use tempfile::tempdir;
     use tower::ServiceExt;
 
@@ -385,5 +392,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(query_authorized.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn proxy_routes_accept_json_bodies_larger_than_axum_default_limit() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(&db_path),
+            request_timeout_secs: 30,
+            master_key: Some("sk-llmrouter-test".to_string()),
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = build_app(&config).await.unwrap();
+        let oversized_data_url = format!("data:image/png;base64,{}", "A".repeat(3 * 1024 * 1024));
+        let payload = json!({
+            "model": "gpt-5.4",
+            "input": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "image_url": oversized_data_url
+                }]
+            }]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("Authorization", "Bearer sk-llmrouter-test")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
