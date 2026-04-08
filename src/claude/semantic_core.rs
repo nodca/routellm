@@ -38,6 +38,8 @@ pub enum ClaudeContentBlock {
     Text(ClaudeTextBlock),
     ToolUse(ClaudeToolUse),
     ToolResult(ClaudeToolResult),
+    Thinking(ClaudeOpaqueContentBlock),
+    RedactedThinking(ClaudeOpaqueContentBlock),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +59,11 @@ pub struct ClaudeToolResult {
     pub tool_use_id: String,
     pub content: ClaudeToolResultContent,
     pub is_error: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClaudeOpaqueContentBlock {
+    pub raw: Value,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -366,6 +373,12 @@ fn parse_content_block(value: &Value) -> Result<ClaudeContentBlock, AppError> {
                 .transpose()?
                 .unwrap_or(false),
         })),
+        "thinking" => Ok(ClaudeContentBlock::Thinking(ClaudeOpaqueContentBlock {
+            raw: value.clone(),
+        })),
+        "redacted_thinking" => Ok(ClaudeContentBlock::RedactedThinking(
+            ClaudeOpaqueContentBlock { raw: value.clone() },
+        )),
         other => Err(AppError::BadRequest(format!(
             "unsupported anthropic content block type: {other}"
         ))),
@@ -739,6 +752,38 @@ mod tests {
         assert!(matches!(
             &request.messages[1].content[1],
             ClaudeContentBlock::ToolUse(ClaudeToolUse { id, name, .. }) if id == "call_1" && name == "lookup_weather"
+        ));
+    }
+
+    #[test]
+    fn claude_semantic_core_accepts_thinking_blocks_in_message_history() {
+        let request = ClaudeMessageRequest::parse_json(&json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "thinking", "thinking": "step 1", "signature": "sig_1" },
+                        { "type": "redacted_thinking", "data": "opaque" },
+                        { "type": "text", "text": "final answer" }
+                    ]
+                }
+            ]
+        }))
+        .expect("thinking blocks should parse");
+
+        assert_eq!(request.messages.len(), 1);
+        assert!(matches!(
+            &request.messages[0].content[0],
+            ClaudeContentBlock::Thinking(_)
+        ));
+        assert!(matches!(
+            &request.messages[0].content[1],
+            ClaudeContentBlock::RedactedThinking(_)
+        ));
+        assert!(matches!(
+            &request.messages[0].content[2],
+            ClaudeContentBlock::Text(ClaudeTextBlock { text }) if text == "final answer"
         ));
     }
 

@@ -579,6 +579,11 @@ fn message_to_responses_items(
             ClaudeContentBlock::ToolResult(tool_result) => {
                 items.push(tool_result_to_responses_item(tool_result)?);
             }
+            ClaudeContentBlock::Thinking(_) | ClaudeContentBlock::RedactedThinking(_) => {
+                // Anthropic thinking signatures are provider-specific. We accept
+                // them in Claude-compatible history so the gateway won't reject
+                // the request, but omit them when adapting into Responses input.
+            }
         }
     }
 
@@ -1088,6 +1093,31 @@ mod tests {
             .expect("non-reasoning model should still map");
 
         assert!(payload.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn claude_responses_adapter_ignores_thinking_blocks_in_assistant_history() {
+        let request = ClaudeMessageRequest::parse_json(&json!({
+            "model": "gpt-5.4",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "thinking", "thinking": "step 1", "signature": "sig_1" },
+                        { "type": "redacted_thinking", "data": "opaque" },
+                        { "type": "text", "text": "pong" }
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+
+        let payload = ResponsesProviderAdapter::new()
+            .request_to_payload(&request)
+            .expect("thinking blocks should be ignored");
+
+        assert_eq!(payload["input"][0]["role"], "assistant");
+        assert_eq!(payload["input"][0]["content"][0]["text"], "pong");
     }
 
     #[test]
