@@ -106,6 +106,15 @@ struct UpstreamDispatch {
     response_adapter: ResponseAdapter,
 }
 
+#[derive(Debug, Clone)]
+struct StreamRetryRequest {
+    upstream_client: reqwest::Client,
+    upstream_url: String,
+    upstream_protocol: Protocol,
+    api_key: String,
+    payload_bytes: Bytes,
+}
+
 #[derive(Debug)]
 struct PreparedPayloads {
     original_value: Value,
@@ -445,6 +454,23 @@ async fn dispatch_upstream_request(
             ))
         })
     })
+}
+
+async fn read_upstream_error_response_message(
+    upstream_response: reqwest::Response,
+) -> (u16, String) {
+    let status = upstream_response.status();
+    let upstream_url = upstream_response.url().to_string();
+    let message = match upstream_response.bytes().await {
+        Ok(body) => truncate(String::from_utf8_lossy(&body).as_ref(), 800),
+        Err(error) => format!(
+            "upstream returned status={} but failed to read error body: {}",
+            status.as_u16(),
+            describe_reqwest_error("read_error_response_body", Some(&upstream_url), &error)
+        ),
+    };
+
+    (status.as_u16(), message)
 }
 
 #[derive(Debug)]
@@ -1763,6 +1789,7 @@ async fn attempt_proxy_request(
             return Err(error);
         }
     };
+    let mut active_payload_bytes = payload_bytes.clone();
 
     let upstream_url = build_upstream_url(&selected.site_base_url, dispatch.upstream_protocol);
     let upstream_client = if is_stream {
@@ -1859,7 +1886,7 @@ async fn attempt_proxy_request(
             &upstream_url,
             dispatch.upstream_protocol,
             &selected.account_api_key,
-            compat_payload_bytes,
+            compat_payload_bytes.clone(),
         )
         .await
         {
@@ -1882,6 +1909,7 @@ async fn attempt_proxy_request(
                 return Err(error);
             }
         };
+        active_payload_bytes = compat_payload_bytes;
         status = upstream_response.status();
     }
 
@@ -1987,6 +2015,13 @@ async fn attempt_proxy_request(
                                 .unwrap_or(&ClaudeProviderCapabilityProfile::responses_strict()),
                         )
                         .unwrap_or_else(ResponsesProviderAdapter::new),
+                    StreamRetryRequest {
+                        upstream_client: upstream_client.clone(),
+                        upstream_url: upstream_url.clone(),
+                        upstream_protocol: dispatch.upstream_protocol,
+                        api_key: selected.account_api_key.clone(),
+                        payload_bytes: active_payload_bytes.clone(),
+                    },
                 )
                 .await
             }
@@ -2622,6 +2657,77 @@ async fn proxy_chat_completions_stream(
     )
 }
 
+async fn forward_responses_stream_to_anthropic<S>(
+    tx: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    first_chunk: Option<Bytes>,
+    upstream_stream: &mut S,
+    upstream_url: &str,
+    response_adapter: &ResponsesProviderAdapter,
+    requested_model: &str,
+    request_id: &str,
+    sent_anything: &mut bool,
+    downstream_disconnected: &mut bool,
+) -> Option<String>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
+    let mut buffer = String::new();
+    let mut stream_adapter = response_adapter.stream_event_adapter(requested_model, request_id);
+
+    if let Some(chunk) = first_chunk {
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        let frames = drain_sse_frames(&mut buffer);
+        'first_chunk: for frame in frames {
+            match stream_adapter.translate_frame(&frame) {
+                Ok(lines) => {
+                    for line in lines {
+                        if tx.send(Ok(Bytes::from(line))).await.is_err() {
+                            *downstream_disconnected = true;
+                            break 'first_chunk;
+                        }
+                        *sent_anything = true;
+                    }
+                }
+                Err(error) => return Some(error),
+            }
+        }
+    }
+
+    if !*downstream_disconnected {
+        'outer: while let Some(next_chunk) = upstream_stream.next().await {
+            match next_chunk {
+                Ok(chunk) => {
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    let frames = drain_sse_frames(&mut buffer);
+                    for frame in frames {
+                        match stream_adapter.translate_frame(&frame) {
+                            Ok(lines) => {
+                                for line in lines {
+                                    if tx.send(Ok(Bytes::from(line))).await.is_err() {
+                                        *downstream_disconnected = true;
+                                        break 'outer;
+                                    }
+                                    *sent_anything = true;
+                                }
+                            }
+                            Err(error) => return Some(error),
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Some(describe_reqwest_error(
+                        "read_anthropic_adapter_stream_chunk",
+                        Some(upstream_url),
+                        &error,
+                    ));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 async fn proxy_anthropic_message_stream(
     state: &AppState,
     route: &ModelRouteRow,
@@ -2633,6 +2739,7 @@ async fn proxy_anthropic_message_stream(
     upstream_protocol: Protocol,
     log_context: RequestLogContext,
     response_adapter: ResponsesProviderAdapter,
+    stream_retry_request: StreamRetryRequest,
 ) -> Result<Response<Body>, AppError> {
     if upstream_protocol != Protocol::Responses {
         let upstream_url = upstream_response.url().to_string();
@@ -2710,73 +2817,85 @@ async fn proxy_anthropic_message_stream(
     let request_id_for_task = request_id.clone();
     let requested_model_for_task = requested_model.clone();
     let log_context_for_task = log_context.clone();
+    let response_adapter_for_task = response_adapter.clone();
+    let stream_retry_request_for_task = stream_retry_request.clone();
 
     tokio::spawn(async move {
-        let mut buffer = String::new();
-        let mut stream_adapter =
-            response_adapter.stream_event_adapter(&requested_model_for_task, &request_id_for_task);
-        let mut stream_error: Option<String> = None;
+        let mut sent_anything = false;
         let mut downstream_disconnected = false;
+        let mut stream_error_status = StatusCode::BAD_GATEWAY.as_u16();
+        let mut stream_error = forward_responses_stream_to_anthropic(
+            &tx,
+            first_chunk,
+            &mut upstream_stream,
+            &upstream_url,
+            &response_adapter_for_task,
+            &requested_model_for_task,
+            &request_id_for_task,
+            &mut sent_anything,
+            &mut downstream_disconnected,
+        )
+        .await;
 
-        if let Some(chunk) = first_chunk {
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-            let frames = drain_sse_frames(&mut buffer);
-            'first_chunk: for frame in frames {
-                match stream_adapter.translate_frame(&frame) {
-                    Ok(lines) => {
-                        for line in lines {
-                            if tx.send(Ok(Bytes::from(line))).await.is_err() {
-                                downstream_disconnected = true;
-                                break 'first_chunk;
+        if stream_error.is_some() && !sent_anything && !downstream_disconnected {
+            tracing::warn!(
+                request_id = %request_id_for_task,
+                requested_model = %requested_model_for_task,
+                "retrying anthropic stream after upstream failed before first translated event"
+            );
+
+            match dispatch_upstream_request(
+                &stream_retry_request_for_task.upstream_client,
+                &stream_retry_request_for_task.upstream_url,
+                stream_retry_request_for_task.upstream_protocol,
+                &stream_retry_request_for_task.api_key,
+                stream_retry_request_for_task.payload_bytes.clone(),
+            )
+            .await
+            {
+                Ok(retry_response) => {
+                    if retry_response.status().is_success() {
+                        let retry_upstream_url = retry_response.url().to_string();
+                        let mut retry_stream = retry_response.bytes_stream();
+                        stream_error = match await_first_upstream_chunk(
+                            "read_anthropic_adapter_retry_first_chunk",
+                            &retry_upstream_url,
+                            &mut retry_stream,
+                        )
+                        .await
+                        {
+                            Ok(retry_first_chunk) => {
+                                forward_responses_stream_to_anthropic(
+                                    &tx,
+                                    retry_first_chunk,
+                                    &mut retry_stream,
+                                    &retry_upstream_url,
+                                    &response_adapter_for_task,
+                                    &requested_model_for_task,
+                                    &request_id_for_task,
+                                    &mut sent_anything,
+                                    &mut downstream_disconnected,
+                                )
+                                .await
                             }
-                        }
+                            Err(message) => Some(message),
+                        };
+                    } else {
+                        let (status, message) =
+                            read_upstream_error_response_message(retry_response).await;
+                        stream_error_status = status;
+                        stream_error = Some(message);
                     }
-                    Err(error) => {
-                        let _ = tx.send(Err(std::io::Error::other(error.clone()))).await;
-                        stream_error = Some(error);
-                        break 'first_chunk;
-                    }
+                }
+                Err(error) => {
+                    stream_error_status = error.status_code().as_u16();
+                    stream_error = Some(error.to_string());
                 }
             }
         }
 
-        if !downstream_disconnected && stream_error.is_none() {
-            'outer: while let Some(next_chunk) = upstream_stream.next().await {
-                match next_chunk {
-                    Ok(chunk) => {
-                        buffer.push_str(&String::from_utf8_lossy(&chunk));
-                        let frames = drain_sse_frames(&mut buffer);
-                        for frame in frames {
-                            match stream_adapter.translate_frame(&frame) {
-                                Ok(lines) => {
-                                    for line in lines {
-                                        if tx.send(Ok(Bytes::from(line))).await.is_err() {
-                                            downstream_disconnected = true;
-                                            break 'outer;
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    let _ =
-                                        tx.send(Err(std::io::Error::other(error.clone()))).await;
-                                    stream_error = Some(error);
-                                    break 'outer;
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        let message = describe_reqwest_error(
-                            "read_anthropic_adapter_stream_chunk",
-                            Some(&upstream_url),
-                            &error,
-                        );
-                        let _ = tx.send(Err(std::io::Error::other(message.clone()))).await;
-                        stream_error = Some(message);
-                        break;
-                    }
-                }
-            }
+        if let Some(message) = stream_error.clone() {
+            let _ = tx.send(Err(std::io::Error::other(message))).await;
         }
 
         drop(tx);
@@ -2792,7 +2911,7 @@ async fn proxy_anthropic_message_stream(
                 Protocol::Messages,
                 upstream_protocol,
                 &log_context_for_task,
-                Some(StatusCode::BAD_GATEWAY.as_u16()),
+                Some(stream_error_status),
                 latency_ms,
                 message,
             )
@@ -9353,6 +9472,115 @@ mod tests {
 
         let log = latest_route_log(&app, route_id).await;
         assert_eq!(log["upstream_path"], "/v1/responses");
+    }
+
+    #[tokio::test]
+    async fn claude_stream_retries_once_when_responses_fail_before_first_anthropic_event() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let early_failure =
+            "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"model runtime failed\"}}\n\n";
+        let expected_sse = include_str!("claude/fixtures/claude_code_http_stream_anthropic.sse");
+        let expected_payload = fixture_json_with_compat_upstream_model(
+            include_str!("claude/fixtures/claude_code_tool_cycle_responses_payload.json"),
+            "gpt-5.4",
+        );
+        let (upstream_addr, captured_requests) = spawn_responses_replay_upstream(vec![
+            sse_replay_response(early_failure),
+            sse_replay_response(include_str!(
+                "claude/fixtures/claude_code_responses_stream_tool_cycle.sse"
+            )),
+        ])
+        .await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        let route_id =
+            create_route_with_responses_channel(&app, "claude-sonnet-4-6", upstream_addr).await;
+
+        let proxy_request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(include_str!(
+                "claude/fixtures/claude_code_http_stream_request.json"
+            )))
+            .unwrap();
+        let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
+        assert_eq!(proxy_response.status(), StatusCode::OK);
+        let text = response_text(proxy_response).await;
+        assert_eq!(normalize_anthropic_stream_ids(&text), expected_sse);
+
+        let captured = captured_requests.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0], expected_payload);
+        assert_eq!(captured[1], expected_payload);
+
+        let log = latest_route_log(&app, route_id).await;
+        assert_eq!(log["upstream_path"], "/v1/responses");
+        assert_eq!(log["http_status"], 200);
+        assert_eq!(log["error_message"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn claude_stream_only_retries_once_before_reporting_failure() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let early_failure =
+            "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"model runtime failed\"}}\n\n";
+        let expected_payload = fixture_json_with_compat_upstream_model(
+            include_str!("claude/fixtures/claude_code_tool_cycle_responses_payload.json"),
+            "gpt-5.4",
+        );
+        let (upstream_addr, captured_requests) = spawn_responses_replay_upstream(vec![
+            sse_replay_response(early_failure),
+            sse_replay_response(early_failure),
+        ])
+        .await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        let route_id =
+            create_route_with_responses_channel(&app, "claude-sonnet-4-6", upstream_addr).await;
+
+        let proxy_request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(include_str!(
+                "claude/fixtures/claude_code_http_stream_request.json"
+            )))
+            .unwrap();
+        let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
+        assert_eq!(proxy_response.status(), StatusCode::OK);
+        let (prefix, error) = response_stream_prefix_and_error(proxy_response).await;
+        assert_eq!(prefix, "");
+        assert_eq!(error, "model runtime failed");
+
+        let captured = captured_requests.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0], expected_payload);
+        assert_eq!(captured[1], expected_payload);
+
+        let log = latest_route_log(&app, route_id).await;
+        assert_eq!(log["upstream_path"], "/v1/responses");
+        assert_eq!(log["http_status"], 502);
+        assert_eq!(log["error_message"], "model runtime failed");
+        assert_eq!(log["error_kind"], "upstream_server_error");
     }
 
     #[tokio::test]
