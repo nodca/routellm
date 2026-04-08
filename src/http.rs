@@ -2579,7 +2579,7 @@ async fn proxy_chat_completions_stream(
                 Protocol::ChatCompletions,
                 upstream_protocol,
                 &log_context_for_task,
-                Some(StatusCode::OK.as_u16()),
+                Some(StatusCode::BAD_GATEWAY.as_u16()),
                 latency_ms,
                 message,
             )
@@ -2792,7 +2792,7 @@ async fn proxy_anthropic_message_stream(
                 Protocol::Messages,
                 upstream_protocol,
                 &log_context_for_task,
-                Some(StatusCode::OK.as_u16()),
+                Some(StatusCode::BAD_GATEWAY.as_u16()),
                 latency_ms,
                 message,
             )
@@ -9501,7 +9501,87 @@ mod tests {
 
         let log = latest_route_log(&app, route_id).await;
         assert_eq!(log["upstream_path"], "/v1/responses");
+        assert_eq!(log["http_status"], 502);
         assert_eq!(log["error_message"], "model runtime failed");
+        assert_eq!(log["error_kind"], "upstream_server_error");
+    }
+
+    #[tokio::test]
+    async fn claude_stream_failures_enter_cooldown_after_third_consecutive_failure() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let awkward_chunks = vec![
+            "data: {\"type\":\"response.created\"}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"model runtime failed\"}}\n\n",
+        ];
+        let (upstream_addr, _) = spawn_responses_replay_upstream(vec![
+            sse_chunked_replay_response(awkward_chunks.clone()),
+            sse_chunked_replay_response(awkward_chunks.clone()),
+            sse_chunked_replay_response(awkward_chunks),
+        ])
+        .await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        let route_id =
+            create_route_with_responses_channel(&app, "claude-sonnet-4-6", upstream_addr).await;
+        let pool = SqlitePool::connect(&config.database_url).await.unwrap();
+
+        for attempt in 1..=3 {
+            let proxy_request = Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(include_str!(
+                    "claude/fixtures/claude_code_http_stream_failure_request.json"
+                )))
+                .unwrap();
+            let proxy_response = app.clone().oneshot(proxy_request).await.unwrap();
+            assert_eq!(proxy_response.status(), StatusCode::OK);
+            let (_, error) = response_stream_prefix_and_error(proxy_response).await;
+            assert_eq!(error, "model runtime failed");
+
+            let mut row = None;
+            for _ in 0..10 {
+                let next_row =
+                    sqlx::query_as::<_, (i64, Option<i64>, Option<i64>, Option<String>)>(
+                        r#"
+                    select consecutive_fail_count, cooldown_until, last_status, last_error
+                    from channels
+                    where route_id = ?
+                    order by id
+                    limit 1
+                    "#,
+                    )
+                    .bind(route_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                if next_row.0 == attempt {
+                    row = Some(next_row);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            let row = row.expect("stream failure should update channel state");
+
+            assert_eq!(row.0, attempt);
+            assert_eq!(row.2, Some(502));
+            assert_eq!(row.3.as_deref(), Some("model runtime failed"));
+            if attempt < 3 {
+                assert!(row.1.is_none());
+            } else {
+                assert!(row.1.is_some());
+            }
+        }
     }
 
     #[tokio::test]
