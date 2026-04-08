@@ -8,22 +8,13 @@
 - 请求自动路由
 - 支持 TUI 管理、主动一键测活、运行状态查看
 - 支持在claude code中使用openai兼容模型
-- 支持导入cc-switch已配置模型
+- 支持导入cc-switch配置
 
 ![tui](tui.png)
 
-## 核心概念
-
-| 概念 | 说明 |
-| --- | --- |
-| Route | 稳定的下游模型名，例如 `gpt-5.4` |
-| Channel | Route 下的一条具体上游通道，包含 `base_url`、`api_key`、`upstream_model`、`protocol`、`priority` |
-| Priority | 越小越优先，只在最小 `priority` 组内继续选路 |
-| Cooldown | 请求失败后的自动冷却状态，带倒计时 |
-
 ## 快速开始
 
-### 本机模式
+### 单机模式
 
 ### Linux
 
@@ -109,6 +100,18 @@ $script = [scriptblock]::Create((irm https://raw.githubusercontent.com/nodca/rou
 - API Key：填写服务端的 `master_key`
 - model：填写你在 route 里定义的模型名，例如 `gpt-5.4`
 
+### Claude Code 推理强度映射
+
+映射关系：
+
+| Claude Code `effort` | OpenAI `reasoning.effort` |
+| --- | --- |
+| `max` | `xhigh` |
+| `high` | `high` |
+| `medium` | `medium` |
+| `low` | `low` |
+
+
 ### 手动启动
 
 如果你不用安装脚本，而是直接手动启动二进制，建议自己先生成一个随机 `master_key`。
@@ -150,13 +153,9 @@ LLMROUTER_AUTH_KEY=$LLMROUTER_MASTER_KEY \
 
 选路顺序：
 
-1. 根据请求里的 `model` 匹配 route
-2. 过滤不可用 channel：
-   `OFF`、`UNAVAIL`、冷却中、协议不兼容、站点/账号不可用
-3. 取最小 `priority` 的可用组
-4. 同优先级内优先直连协议
-5. 同优先级且同协议成本时，优先历史延迟更低的 channel
-6. 最后按添加顺序稳定落位
+1. 取最小 `priority` 的可用组
+2. 同优先级内优先直连协议
+3. 同优先级且同协议时，优先历史延迟更低的 channel
 
 ## 状态与故障处理
 
@@ -173,7 +172,7 @@ LLMROUTER_AUTH_KEY=$LLMROUTER_MASTER_KEY \
 主动测活：
 
 - `t`：测活当前 channel
-- `T`：并发测活当前 route 下全部 channel，并实时刷新结果
+- `T`：测活当前 route 下全部 channel，并实时刷新结果
 - 测活成功回到 `RUN`
 - 测活失败默认进入 `UNAVAIL`
 
@@ -191,23 +190,6 @@ LLMROUTER_AUTH_KEY=$LLMROUTER_MASTER_KEY \
 - 右上：Channels
 - 右下：Logs
 - 底部：Status
-
-导入 `cc-switch`：
-
-- `lrtui --import cc-switch`
-- `lrtui --import /path/to/cc-switch.db`
-
-导入时会自动确保这三个 route 存在：
-
-- `gpt-5.4`
-- `claude-opus-4-6`
-- `gemini-3.1-pro-preview`
-
-CLI 执行结束后会打印：
-
-- `imported_channels`
-- `created_routes`
-- `skipped`
 
 常用快捷键：
 
@@ -236,8 +218,6 @@ CLI 执行结束后会打印：
 TUI 能管理应用状态，但不能替代系统级运维工具。服务启停、systemd、计划任务这些仍然由系统管理。
 
 ## 配置
-
-`llmrouter.toml` 描述静态拓扑，SQLite 保存运行态状态和日志。
 
 最小示例：
 
@@ -328,15 +308,6 @@ channel 字段：
 - 没有多用户、计费、配额、多租户
 - 没有复杂智能调度和负载均衡
 - 还没有自动协议探测
-- 仍然依赖 SQLite 保存运行态
-- Windows 可用，但主支持平台仍更偏 Linux
-
-## 开发
-
-```bash
-cargo fmt
-cargo test
-```
 
 ## License
 
