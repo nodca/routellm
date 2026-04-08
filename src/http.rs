@@ -9214,6 +9214,32 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn claude_native_gateway_maps_output_config_effort_to_openai_reasoning() {
+        let payload = json!({
+            "model": "gpt-5.4",
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "output_config": { "effort": "max" },
+            "messages": [
+                { "role": "user", "content": [{ "type": "text", "text": "hello" }] }
+            ]
+        });
+
+        let prepared =
+            build_claude_message_payloads(payload.clone()).expect("payload should prepare");
+        let adapted = serde_json::from_slice::<Value>(
+            &prepared
+                .bytes_for(DispatchPayloadKind::AnthropicMessagesToResponses)
+                .expect("request should adapt"),
+        )
+        .expect("adapted payload should deserialize");
+
+        assert_eq!(adapted["reasoning"]["effort"], "xhigh");
+        assert!(adapted.get("temperature").is_none());
+        assert!(adapted.get("top_p").is_none());
+    }
+
     #[tokio::test]
     async fn claude_http_golden_replay_nonstream() {
         let temp_dir = tempdir().unwrap();

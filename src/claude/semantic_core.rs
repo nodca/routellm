@@ -88,6 +88,7 @@ pub struct ClaudeRequestExtensions {
     pub metadata: Option<Map<String, Value>>,
     pub beta_hints: ClaudeBetaHints,
     pub request_hints: ClaudeRequestHints,
+    pub output_config: ClaudeOutputConfigHints,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,6 +112,11 @@ pub struct ClaudeBetaHints {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ClaudeRequestHints {
     pub service_tier: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClaudeOutputConfigHints {
+    pub effort: Option<String>,
 }
 
 impl ClaudeMessageRequest {
@@ -183,6 +189,7 @@ impl ClaudeMessageRequest {
                     object.get("request_hints"),
                     object.get("service_tier"),
                 )?,
+                output_config: parse_output_config(object.get("output_config"))?,
             },
         })
     }
@@ -559,6 +566,21 @@ fn parse_request_hints(
     }
 }
 
+fn parse_output_config(output_config: Option<&Value>) -> Result<ClaudeOutputConfigHints, AppError> {
+    match output_config {
+        None | Some(Value::Null) => Ok(ClaudeOutputConfigHints::default()),
+        Some(Value::Object(object)) => Ok(ClaudeOutputConfigHints {
+            effort: optional_string(
+                object.get("effort"),
+                "field `output_config.effort` must be a string",
+            )?,
+        }),
+        Some(_) => Err(AppError::BadRequest(
+            "field `output_config` must be an object".to_string(),
+        )),
+    }
+}
+
 fn required_string(
     value: Option<&Value>,
     missing_message: &str,
@@ -635,6 +657,7 @@ mod tests {
             "context_management": { "strategy": "retain" },
             "metadata": { "tenant": "ops" },
             "service_tier": "priority",
+            "output_config": { "effort": "max" },
             "messages": [
                 {
                     "role": "user",
@@ -686,6 +709,10 @@ mod tests {
         assert_eq!(
             request.extensions.request_hints.service_tier.as_deref(),
             Some("priority")
+        );
+        assert_eq!(
+            request.extensions.output_config.effort.as_deref(),
+            Some("max")
         );
         assert_eq!(
             request.extensions.beta_hints.values,
@@ -765,6 +792,28 @@ mod tests {
 
         assert!(
             matches!(error, AppError::BadRequest(message) if message.contains("field `metadata` must be an object"))
+        );
+
+        let error = ClaudeMessageRequest::parse_json(&json!({
+            "model": "claude-sonnet-4-6",
+            "output_config": "high",
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .expect_err("non-object output_config should fail");
+
+        assert!(
+            matches!(error, AppError::BadRequest(message) if message.contains("field `output_config` must be an object"))
+        );
+
+        let error = ClaudeMessageRequest::parse_json(&json!({
+            "model": "claude-sonnet-4-6",
+            "output_config": { "effort": 1 },
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .expect_err("non-string effort should fail");
+
+        assert!(
+            matches!(error, AppError::BadRequest(message) if message.contains("field `output_config.effort` must be a string"))
         );
     }
 }

@@ -103,6 +103,10 @@ impl ResponsesProviderAdapter {
             }
         };
         let extension_policy = self.extension_policy(request);
+        let reasoning_effort = map_openai_reasoning_effort(
+            request.extensions.output_config.effort.as_deref(),
+            &request.model,
+        );
         let mut body = Map::new();
         body.insert(
             "model".to_string(),
@@ -117,10 +121,10 @@ impl ResponsesProviderAdapter {
         );
         body.insert("stream".to_string(), Value::Bool(request.stream));
 
-        if let Some(temperature) = request.temperature {
+        if let Some(temperature) = request.temperature.filter(|_| reasoning_effort.is_none()) {
             body.insert("temperature".to_string(), json!(temperature));
         }
-        if let Some(top_p) = request.top_p {
+        if let Some(top_p) = request.top_p.filter(|_| reasoning_effort.is_none()) {
             body.insert("top_p".to_string(), json!(top_p));
         }
         if let Some(max_tokens) = request.max_tokens {
@@ -152,6 +156,12 @@ impl ResponsesProviderAdapter {
         }
         if let Some(service_tier) = extension_policy.service_tier.forwarded {
             body.insert("service_tier".to_string(), Value::String(service_tier));
+        }
+        if let Some(reasoning_effort) = reasoning_effort {
+            body.insert(
+                "reasoning".to_string(),
+                json!({ "effort": reasoning_effort }),
+            );
         }
 
         Ok(Value::Object(body))
@@ -229,6 +239,99 @@ impl ResponsesProviderAdapter {
             state: AnthropicStreamState::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum OpenAiReasoningEffort {
+    Low,
+    Medium,
+    High,
+    XHigh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenAiReasoningSupport {
+    min: OpenAiReasoningEffort,
+    max: OpenAiReasoningEffort,
+}
+
+fn map_openai_reasoning_effort(claude_effort: Option<&str>, model: &str) -> Option<&'static str> {
+    let desired = match claude_effort?.trim().to_ascii_lowercase().as_str() {
+        "low" => OpenAiReasoningEffort::Low,
+        "medium" => OpenAiReasoningEffort::Medium,
+        "high" => OpenAiReasoningEffort::High,
+        "max" => OpenAiReasoningEffort::XHigh,
+        _ => return None,
+    };
+    let support = openai_reasoning_support(model)?;
+    let effective = desired.clamp(support.min, support.max);
+    Some(match effective {
+        OpenAiReasoningEffort::Low => "low",
+        OpenAiReasoningEffort::Medium => "medium",
+        OpenAiReasoningEffort::High => "high",
+        OpenAiReasoningEffort::XHigh => "xhigh",
+    })
+}
+
+fn openai_reasoning_support(model: &str) -> Option<OpenAiReasoningSupport> {
+    let normalized = model.trim().to_ascii_lowercase();
+
+    if model_starts_with_any(
+        &normalized,
+        &["gpt-5.4-pro", "gpt-5-4-pro", "gpt-5.2-pro", "gpt-5-2-pro"],
+    ) {
+        return Some(OpenAiReasoningSupport {
+            min: OpenAiReasoningEffort::Medium,
+            max: OpenAiReasoningEffort::XHigh,
+        });
+    }
+
+    if model_starts_with_any(&normalized, &["gpt-5-pro"]) {
+        return Some(OpenAiReasoningSupport {
+            min: OpenAiReasoningEffort::High,
+            max: OpenAiReasoningEffort::High,
+        });
+    }
+
+    if model_starts_with_any(
+        &normalized,
+        &[
+            "gpt-5.4",
+            "gpt-5-4",
+            "gpt-5.2",
+            "gpt-5-2",
+            "gpt-5.3-codex",
+            "gpt-5-3-codex",
+        ],
+    ) {
+        return Some(OpenAiReasoningSupport {
+            min: OpenAiReasoningEffort::Low,
+            max: OpenAiReasoningEffort::XHigh,
+        });
+    }
+
+    if model_starts_with_any(
+        &normalized,
+        &[
+            "gpt-5.1",
+            "gpt-5-1",
+            "gpt-5",
+            "gpt-oss",
+            "codex-mini-latest",
+            "codex-1",
+        ],
+    ) {
+        return Some(OpenAiReasoningSupport {
+            min: OpenAiReasoningEffort::Low,
+            max: OpenAiReasoningEffort::High,
+        });
+    }
+
+    None
+}
+
+fn model_starts_with_any(model: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|prefix| model.starts_with(prefix))
 }
 
 impl AnthropicStreamEventAdapter {
@@ -923,6 +1026,68 @@ mod tests {
         .expect("expected interruption payload should parse");
 
         assert_eq!(payload, expected_payload);
+    }
+
+    #[test]
+    fn claude_responses_adapter_maps_effort_to_openai_reasoning_for_gpt_routes() {
+        let request = ClaudeMessageRequest::parse_json(&json!({
+            "model": "gpt-5.4",
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "output_config": { "effort": "max" },
+            "messages": [{ "role": "user", "content": "hello" }]
+        }))
+        .unwrap();
+
+        let payload = ResponsesProviderAdapter::new()
+            .request_to_payload(&request)
+            .expect("effort request should map");
+
+        assert_eq!(payload["reasoning"]["effort"], "xhigh");
+        assert!(payload.get("temperature").is_none());
+        assert!(payload.get("top_p").is_none());
+    }
+
+    #[test]
+    fn claude_responses_adapter_clamps_effort_when_target_model_has_narrower_support() {
+        let gpt_5_pro = ClaudeMessageRequest::parse_json(&json!({
+            "model": "gpt-5-pro",
+            "output_config": { "effort": "medium" },
+            "messages": [{ "role": "user", "content": "hello" }]
+        }))
+        .unwrap();
+        let gpt_5 = ClaudeMessageRequest::parse_json(&json!({
+            "model": "gpt-5",
+            "output_config": { "effort": "max" },
+            "messages": [{ "role": "user", "content": "hello" }]
+        }))
+        .unwrap();
+
+        let gpt_5_pro_payload = ResponsesProviderAdapter::new()
+            .request_to_payload(&gpt_5_pro)
+            .expect("gpt-5-pro should map");
+        let gpt_5_payload = ResponsesProviderAdapter::new()
+            .request_to_payload(&gpt_5)
+            .expect("gpt-5 should map");
+
+        assert_eq!(gpt_5_pro_payload["reasoning"]["effort"], "high");
+        assert_eq!(gpt_5_payload["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn claude_responses_adapter_ignores_effort_for_non_reasoning_models() {
+        let request = ClaudeMessageRequest::parse_json(&json!({
+            "model": "gpt-4.1",
+            "output_config": { "effort": "high" },
+            "messages": [{ "role": "user", "content": "hello" }]
+        }))
+        .unwrap();
+
+        let payload = ResponsesProviderAdapter::new()
+            .request_to_payload(&request)
+            .expect("non-reasoning model should still map");
+
+        assert!(payload.get("reasoning").is_none());
     }
 
     #[test]
