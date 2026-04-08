@@ -309,6 +309,9 @@ channel 字段：
 - 没有复杂智能调度和负载均衡
 - 还没有自动协议探测
 
+## LinuxDo友链
+https://linux.do/
+
 ## License
 
 MIT
