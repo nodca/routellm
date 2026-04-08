@@ -43,6 +43,9 @@ use crate::{
 };
 
 const AUTO_COOLDOWN_FAILURE_THRESHOLD: i64 = 3;
+const STREAM_PRELUDE_FAILOVER_MARKER: &str = "[llmrouter:stream-prelude-failover]";
+const STREAM_PRELUDE_FAILOVER_NOTE: &str =
+    "failover applied before first byte after retryable capacity event";
 
 #[derive(Debug, Deserialize)]
 pub struct RouteDecisionQuery {
@@ -121,6 +124,11 @@ struct PreparedPayloads {
     original_json: OnceLock<Bytes>,
     chat_to_responses_json: OnceLock<Bytes>,
     claude_message: Option<ClaudeMessagePayloads>,
+}
+
+enum ResponsesPassthroughPrelude {
+    Ready(Vec<Bytes>),
+    RetryableCapacity { status: StatusCode, message: String },
 }
 
 #[derive(Debug)]
@@ -216,6 +224,7 @@ impl PreparedPayloads {
             .unwrap_or(false)
     }
 
+    #[cfg(test)]
     fn bytes_for(&self, kind: DispatchPayloadKind) -> Result<Bytes, AppError> {
         self.bytes_for_with_claude_profile(kind, None, None)
     }
@@ -1674,6 +1683,7 @@ async fn proxy_request(
                 &payloads,
                 downstream_protocol,
                 &log_context,
+                None,
             )
             .await;
         }
@@ -1697,6 +1707,8 @@ async fn proxy_request(
     }
 
     let mut last_error: Option<AppError> = None;
+    let mut stream_failover_used = false;
+    let mut stream_failover_note: Option<String> = None;
     for selected in ordered_channels {
         match attempt_proxy_request(
             &state,
@@ -1707,11 +1719,23 @@ async fn proxy_request(
             &payloads,
             downstream_protocol,
             &log_context,
+            stream_failover_note.clone(),
         )
         .await
         {
             Ok(response) => return Ok(response),
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                let (is_stream_failover, error) = split_stream_prelude_failover_error(error);
+                last_error = Some(error);
+                if is_stream_failover {
+                    if stream_failover_used {
+                        break;
+                    }
+                    stream_failover_used = true;
+                    stream_failover_note =
+                        Some(STREAM_PRELUDE_FAILOVER_NOTE.to_string());
+                }
+            }
         }
     }
 
@@ -1729,6 +1753,7 @@ async fn attempt_proxy_request(
     payloads: &PreparedPayloads,
     downstream_protocol: Protocol,
     log_context: &RequestLogContext,
+    stream_success_note: Option<String>,
 ) -> Result<Response<Body>, AppError> {
     let started_at = Instant::now();
     let channel_protocol = Protocol::parse(&selected.protocol)?;
@@ -1979,6 +2004,7 @@ async fn attempt_proxy_request(
                     downstream_protocol,
                     dispatch.upstream_protocol,
                     attempt_log_context.clone(),
+                    stream_success_note.clone(),
                     !is_stream,
                 )
                 .await
@@ -2060,6 +2086,7 @@ async fn attempt_proxy_request(
             downstream_protocol,
             dispatch.upstream_protocol,
             attempt_log_context.clone(),
+            stream_success_note,
             !is_stream,
         )
         .await;
@@ -2234,6 +2261,7 @@ async fn proxy_passthrough_stream(
     downstream_protocol: Protocol,
     upstream_protocol: Protocol,
     log_context: RequestLogContext,
+    success_note_prefix: Option<String>,
     capture_usage: bool,
 ) -> Result<Response<Body>, AppError> {
     let upstream_url = upstream_response.url().to_string();
@@ -2264,6 +2292,58 @@ async fn proxy_passthrough_stream(
             return Err(AppError::UpstreamTransport(message));
         }
     };
+    let initial_chunks = if downstream_protocol == Protocol::Responses
+        && upstream_protocol == Protocol::Responses
+    {
+        match collect_responses_passthrough_prelude(first_chunk, &mut upstream_stream, &upstream_url)
+            .await
+        {
+            Ok(ResponsesPassthroughPrelude::Ready(chunks)) => chunks,
+            Ok(ResponsesPassthroughPrelude::RetryableCapacity {
+                status: failure_status,
+                message,
+            }) => {
+                record_failure(
+                    &state,
+                    &route,
+                    &selected,
+                    &request_id,
+                    &requested_model,
+                    downstream_protocol,
+                    upstream_protocol,
+                    &log_context,
+                    Some(failure_status.as_u16()),
+                    started_at.elapsed().as_millis() as i64,
+                    message.clone(),
+                )
+                .await?;
+                return Err(mark_stream_prelude_failover_error(AppError::UpstreamStatus(
+                    message,
+                    failure_status,
+                    None,
+                )));
+            }
+            Err(message) => {
+                record_failure(
+                    &state,
+                    &route,
+                    &selected,
+                    &request_id,
+                    &requested_model,
+                    downstream_protocol,
+                    upstream_protocol,
+                    &log_context,
+                    Some(status.as_u16()),
+                    started_at.elapsed().as_millis() as i64,
+                    message.clone(),
+                )
+                .await?;
+                return Err(AppError::UpstreamTransport(message));
+            }
+        }
+    } else {
+        first_chunk.into_iter().collect::<Vec<_>>()
+    };
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     let state_for_task = state.clone();
@@ -2278,12 +2358,13 @@ async fn proxy_passthrough_stream(
         let mut downstream_disconnected = false;
         let mut usage_buffer = capture_usage.then(Vec::new);
 
-        if let Some(chunk) = first_chunk {
+        for chunk in initial_chunks {
             if let Some(buffer) = usage_buffer.as_mut() {
                 buffer.extend_from_slice(&chunk);
             }
             if tx.send(Ok(chunk)).await.is_err() {
                 downstream_disconnected = true;
+                break;
             }
         }
 
@@ -2337,8 +2418,11 @@ async fn proxy_passthrough_stream(
             return;
         }
 
-        let success_note = downstream_disconnected
-            .then(|| "downstream disconnected before stream completion".to_string());
+        let success_note = merge_success_notes(
+            success_note_prefix,
+            downstream_disconnected
+                .then(|| "downstream disconnected before stream completion".to_string()),
+        );
         let token_usage = usage_buffer
             .as_deref()
             .and_then(|body| extract_usage_from_body(upstream_protocol, body));
@@ -4583,6 +4667,155 @@ fn extract_sse_data(frame: &str) -> Option<String> {
     (!data.is_empty()).then_some(data)
 }
 
+fn classify_retryable_responses_prelude_error(frame: &str) -> Option<(StatusCode, String)> {
+    let data = extract_sse_data(frame)?;
+    if data == "[DONE]" {
+        return None;
+    }
+
+    let event: Value = serde_json::from_str(&data).ok()?;
+    let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
+    if !matches!(event_type, "error" | "response.failed") {
+        return None;
+    }
+
+    let error = event.get("error");
+    let error_type = error
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let message = error
+        .and_then(|value| value.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| event.get("message").and_then(Value::as_str))
+        .unwrap_or("upstream reported stream failure")
+        .to_string();
+    let normalized_message = message.to_ascii_lowercase();
+    let retryable = error_type == "overloaded_error"
+        || normalized_message.contains("at capacity")
+        || normalized_message.contains("capacity")
+        || normalized_message.contains("overloaded")
+        || normalized_message.contains("try a different model");
+
+    retryable.then_some((StatusCode::from_u16(529).unwrap(), message))
+}
+
+fn mark_stream_prelude_failover_error(error: AppError) -> AppError {
+    match error {
+        AppError::UpstreamTransport(message) => {
+            AppError::UpstreamTransport(format!("{STREAM_PRELUDE_FAILOVER_MARKER}{message}"))
+        }
+        AppError::UpstreamStatus(message, status, metadata) => AppError::UpstreamStatus(
+            format!("{STREAM_PRELUDE_FAILOVER_MARKER}{message}"),
+            status,
+            metadata,
+        ),
+        other => other,
+    }
+}
+
+fn split_stream_prelude_failover_error(error: AppError) -> (bool, AppError) {
+    match error {
+        AppError::UpstreamTransport(message) => {
+            if let Some(clean) = message.strip_prefix(STREAM_PRELUDE_FAILOVER_MARKER) {
+                return (true, AppError::UpstreamTransport(clean.to_string()));
+            }
+            (false, AppError::UpstreamTransport(message))
+        }
+        AppError::UpstreamStatus(message, status, metadata) => {
+            if let Some(clean) = message.strip_prefix(STREAM_PRELUDE_FAILOVER_MARKER) {
+                return (
+                    true,
+                    AppError::UpstreamStatus(clean.to_string(), status, metadata),
+                );
+            }
+            (false, AppError::UpstreamStatus(message, status, metadata))
+        }
+        other => (false, other),
+    }
+}
+
+fn merge_success_notes(primary: Option<String>, secondary: Option<String>) -> Option<String> {
+    match (primary, secondary) {
+        (Some(primary), Some(secondary)) => Some(format!("{primary}; {secondary}")),
+        (Some(primary), None) => Some(primary),
+        (None, Some(secondary)) => Some(secondary),
+        (None, None) => None,
+    }
+}
+
+async fn collect_responses_passthrough_prelude<S>(
+    first_chunk: Option<Bytes>,
+    upstream_stream: &mut S,
+    upstream_url: &str,
+) -> Result<ResponsesPassthroughPrelude, String>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
+    let mut buffered_chunks = Vec::new();
+    let mut parse_buffer = String::new();
+    let mut pending_chunk = first_chunk;
+
+    loop {
+        let Some(chunk) = pending_chunk.take() else {
+            return Ok(ResponsesPassthroughPrelude::Ready(buffered_chunks));
+        };
+
+        parse_buffer.push_str(&String::from_utf8_lossy(&chunk));
+        buffered_chunks.push(chunk);
+
+        let frames = drain_sse_frames(&mut parse_buffer);
+        if frames.is_empty() {
+            pending_chunk = match upstream_stream.next().await {
+                Some(Ok(next_chunk)) => Some(next_chunk),
+                Some(Err(error)) => {
+                    return Err(describe_reqwest_error(
+                        "read_responses_passthrough_prelude_chunk",
+                        Some(upstream_url),
+                        &error,
+                    ));
+                }
+                None => None,
+            };
+            continue;
+        }
+
+        for frame in frames {
+            if let Some((status, message)) = classify_retryable_responses_prelude_error(&frame) {
+                return Ok(ResponsesPassthroughPrelude::RetryableCapacity { status, message });
+            }
+
+            let Some(data) = extract_sse_data(&frame) else {
+                continue;
+            };
+            if data == "[DONE]" {
+                return Ok(ResponsesPassthroughPrelude::Ready(buffered_chunks));
+            }
+
+            let Ok(event) = serde_json::from_str::<Value>(&data) else {
+                return Ok(ResponsesPassthroughPrelude::Ready(buffered_chunks));
+            };
+            let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
+            if event_type != "response.created" {
+                return Ok(ResponsesPassthroughPrelude::Ready(buffered_chunks));
+            }
+        }
+
+        pending_chunk = match upstream_stream.next().await {
+            Some(Ok(next_chunk)) => Some(next_chunk),
+            Some(Err(error)) => {
+                return Err(describe_reqwest_error(
+                    "read_responses_passthrough_prelude_chunk",
+                    Some(upstream_url),
+                    &error,
+                ));
+            }
+            None => None,
+        };
+    }
+}
+
 fn transform_chat_frame_to_gemini_sse(
     frame: &str,
     requested_model: &str,
@@ -5140,7 +5373,8 @@ fn truncate(message: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeProviderCapabilityProfile, DispatchPayloadKind, build_claude_message_payloads,
+        ClaudeProviderCapabilityProfile, DispatchPayloadKind, STREAM_PRELUDE_FAILOVER_NOTE,
+        build_claude_message_payloads,
     };
 
     use std::{
@@ -5864,6 +6098,47 @@ mod tests {
         route_id
     }
 
+    async fn add_responses_channel(
+        database_url: &str,
+        route_id: i64,
+        label: &str,
+        upstream_addr: SocketAddr,
+        priority: i64,
+    ) {
+        let pool = SqlitePool::connect(database_url).await.unwrap();
+        let site_name = format!("{label}-site");
+        let account_label = format!("{label}-account");
+        let channel_label = label.to_string();
+
+        let site_id = sqlx::query("insert into sites (name, base_url, status) values (?, ?, 'active')")
+            .bind(&site_name)
+            .bind(format!("http://{upstream_addr}"))
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        let account_id = sqlx::query(
+            "insert into accounts (site_id, label, api_key, status) values (?, ?, 'test-key', 'active')",
+        )
+        .bind(site_id)
+        .bind(&account_label)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        sqlx::query(
+            "insert into channels (route_id, account_id, label, upstream_model, supports_responses, enabled, weight, priority, protocol) values (?, ?, ?, 'gpt-5.4', 1, 1, 10, ?, 'responses')",
+        )
+        .bind(route_id)
+        .bind(account_id)
+        .bind(&channel_label)
+        .bind(priority)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
     fn fixture_json(raw: &str) -> Value {
         serde_json::from_str(raw).expect("fixture json should parse")
     }
@@ -6272,6 +6547,138 @@ mod tests {
         assert!(text.contains("\"content\":\"hel\""));
         assert!(text.contains("\"content\":\"lo\""));
         assert!(text.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn responses_stream_fails_over_once_before_first_byte_on_retryable_capacity_error() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let failing_stream = concat!(
+            "data: {\"type\":\"response.created\"}\n\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Selected model is at capacity. Please try a different model.\"}}\n\n"
+        );
+        let healthy_stream = concat!(
+            "data: {\"type\":\"response.created\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"backup\"}\n\n",
+            "data: {\"type\":\"response.completed\"}\n\n"
+        );
+        let (failing_addr, failing_captured) =
+            spawn_responses_replay_upstream(vec![sse_replay_response(failing_stream)]).await;
+        let (healthy_addr, healthy_captured) =
+            spawn_responses_replay_upstream(vec![sse_replay_response(healthy_stream)]).await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path.clone()),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        let route_id = create_route_with_responses_channel(&app, "gpt-5.4", failing_addr).await;
+        add_responses_channel(&config.database_url, route_id, "backup", healthy_addr, 1).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.4",
+                    "stream": true,
+                    "input": "ping"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = response_text(response).await;
+        assert!(text.contains("\"delta\":\"backup\""));
+        assert!(!text.contains("Selected model is at capacity"));
+
+        let failing_captured = failing_captured.lock().unwrap();
+        let healthy_captured = healthy_captured.lock().unwrap();
+        assert_eq!(failing_captured.len(), 1);
+        assert_eq!(healthy_captured.len(), 1);
+
+        let log = latest_route_log(&app, route_id).await;
+        assert_eq!(log["site_name"], "backup-site");
+        assert_eq!(log["http_status"], 200);
+        assert_eq!(log["error_message"], STREAM_PRELUDE_FAILOVER_NOTE);
+    }
+
+    #[tokio::test]
+    async fn responses_stream_failover_stops_after_one_retryable_capacity_switch() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let failing_stream = concat!(
+            "data: {\"type\":\"response.created\"}\n\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Selected model is at capacity. Please try a different model.\"}}\n\n"
+        );
+        let healthy_stream = concat!(
+            "data: {\"type\":\"response.created\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"third\"}\n\n",
+            "data: {\"type\":\"response.completed\"}\n\n"
+        );
+        let (first_addr, first_captured) =
+            spawn_responses_replay_upstream(vec![sse_replay_response(failing_stream)]).await;
+        let (second_addr, second_captured) =
+            spawn_responses_replay_upstream(vec![sse_replay_response(failing_stream)]).await;
+        let (third_addr, third_captured) =
+            spawn_responses_replay_upstream(vec![sse_replay_response(healthy_stream)]).await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path.clone()),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+        let route_id = create_route_with_responses_channel(&app, "gpt-5.4", first_addr).await;
+        add_responses_channel(&config.database_url, route_id, "second", second_addr, 1).await;
+        add_responses_channel(&config.database_url, route_id, "third", third_addr, 2).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.4",
+                    "stream": true,
+                    "input": "ping"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::from_u16(529).unwrap());
+        let value = response_json(response).await;
+        assert_eq!(
+            value["error"]["message"],
+            "Selected model is at capacity. Please try a different model."
+        );
+
+        let first_captured = first_captured.lock().unwrap();
+        let second_captured = second_captured.lock().unwrap();
+        let third_captured = third_captured.lock().unwrap();
+        assert_eq!(first_captured.len(), 1);
+        assert_eq!(second_captured.len(), 1);
+        assert_eq!(third_captured.len(), 0);
+
+        let log = latest_route_log(&app, route_id).await;
+        assert_eq!(log["site_name"], "second-site");
+        assert_eq!(log["http_status"], 529);
+        assert_eq!(
+            log["error_message"],
+            "Selected model is at capacity. Please try a different model."
+        );
     }
 
     #[tokio::test]
