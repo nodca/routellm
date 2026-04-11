@@ -236,24 +236,17 @@ impl PreparedPayloads {
         upstream_model_override: Option<&str>,
     ) -> Result<Bytes, AppError> {
         match kind {
-            DispatchPayloadKind::Original => {
-                if let Some(bytes) = self.original_json.get() {
-                    return Ok(bytes.clone());
-                }
-
-                let bytes = serialize_json_bytes(&self.original_value)?;
-                let _ = self.original_json.set(bytes.clone());
-                Ok(bytes)
-            }
+            DispatchPayloadKind::Original => serialize_original_payload_bytes(
+                &self.original_value,
+                &self.original_json,
+                upstream_model_override,
+            ),
             DispatchPayloadKind::ChatCompletionsToResponses => {
-                if let Some(bytes) = self.chat_to_responses_json.get() {
-                    return Ok(bytes.clone());
-                }
-
-                let adapted = chat_completions_to_responses_payload(&self.original_value)?;
-                let bytes = serialize_json_bytes(&adapted)?;
-                let _ = self.chat_to_responses_json.set(bytes.clone());
-                Ok(bytes)
+                serialize_chat_to_responses_payload_bytes(
+                    &self.original_value,
+                    &self.chat_to_responses_json,
+                    upstream_model_override,
+                )
             }
             DispatchPayloadKind::AnthropicMessagesToResponses => {
                 let Some(claude_message) = &self.claude_message else {
@@ -1732,8 +1725,7 @@ async fn proxy_request(
                         break;
                     }
                     stream_failover_used = true;
-                    stream_failover_note =
-                        Some(STREAM_PRELUDE_FAILOVER_NOTE.to_string());
+                    stream_failover_note = Some(STREAM_PRELUDE_FAILOVER_NOTE.to_string());
                 }
             }
         }
@@ -2292,58 +2284,59 @@ async fn proxy_passthrough_stream(
             return Err(AppError::UpstreamTransport(message));
         }
     };
-    let initial_chunks = if downstream_protocol == Protocol::Responses
-        && upstream_protocol == Protocol::Responses
-    {
-        match collect_responses_passthrough_prelude(first_chunk, &mut upstream_stream, &upstream_url)
+    let initial_chunks =
+        if downstream_protocol == Protocol::Responses && upstream_protocol == Protocol::Responses {
+            match collect_responses_passthrough_prelude(
+                first_chunk,
+                &mut upstream_stream,
+                &upstream_url,
+            )
             .await
-        {
-            Ok(ResponsesPassthroughPrelude::Ready(chunks)) => chunks,
-            Ok(ResponsesPassthroughPrelude::RetryableCapacity {
-                status: failure_status,
-                message,
-            }) => {
-                record_failure(
-                    &state,
-                    &route,
-                    &selected,
-                    &request_id,
-                    &requested_model,
-                    downstream_protocol,
-                    upstream_protocol,
-                    &log_context,
-                    Some(failure_status.as_u16()),
-                    started_at.elapsed().as_millis() as i64,
-                    message.clone(),
-                )
-                .await?;
-                return Err(mark_stream_prelude_failover_error(AppError::UpstreamStatus(
+            {
+                Ok(ResponsesPassthroughPrelude::Ready(chunks)) => chunks,
+                Ok(ResponsesPassthroughPrelude::RetryableCapacity {
+                    status: failure_status,
                     message,
-                    failure_status,
-                    None,
-                )));
+                }) => {
+                    record_failure(
+                        &state,
+                        &route,
+                        &selected,
+                        &request_id,
+                        &requested_model,
+                        downstream_protocol,
+                        upstream_protocol,
+                        &log_context,
+                        Some(failure_status.as_u16()),
+                        started_at.elapsed().as_millis() as i64,
+                        message.clone(),
+                    )
+                    .await?;
+                    return Err(mark_stream_prelude_failover_error(
+                        AppError::UpstreamStatus(message, failure_status, None),
+                    ));
+                }
+                Err(message) => {
+                    record_failure(
+                        &state,
+                        &route,
+                        &selected,
+                        &request_id,
+                        &requested_model,
+                        downstream_protocol,
+                        upstream_protocol,
+                        &log_context,
+                        Some(status.as_u16()),
+                        started_at.elapsed().as_millis() as i64,
+                        message.clone(),
+                    )
+                    .await?;
+                    return Err(AppError::UpstreamTransport(message));
+                }
             }
-            Err(message) => {
-                record_failure(
-                    &state,
-                    &route,
-                    &selected,
-                    &request_id,
-                    &requested_model,
-                    downstream_protocol,
-                    upstream_protocol,
-                    &log_context,
-                    Some(status.as_u16()),
-                    started_at.elapsed().as_millis() as i64,
-                    message.clone(),
-                )
-                .await?;
-                return Err(AppError::UpstreamTransport(message));
-            }
-        }
-    } else {
-        first_chunk.into_iter().collect::<Vec<_>>()
-    };
+        } else {
+            first_chunk.into_iter().collect::<Vec<_>>()
+        };
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     let state_for_task = state.clone();
@@ -3263,6 +3256,72 @@ fn serialize_json_bytes(value: &Value) -> Result<Bytes, AppError> {
         .map_err(|error| AppError::Internal(format!("failed to serialize json body: {error}")))
 }
 
+fn payload_model(payload: &Value) -> Option<&str> {
+    payload.get("model").and_then(Value::as_str)
+}
+
+fn payload_with_upstream_model(payload: &Value, upstream_model: &str) -> Result<Value, AppError> {
+    let mut adapted = payload.clone();
+    let object = adapted
+        .as_object_mut()
+        .ok_or_else(|| AppError::BadRequest("request body must be a json object".to_string()))?;
+    object.insert(
+        "model".to_string(),
+        Value::String(upstream_model.to_string()),
+    );
+    Ok(adapted)
+}
+
+fn serialize_original_payload_bytes(
+    payload: &Value,
+    cache: &OnceLock<Bytes>,
+    upstream_model_override: Option<&str>,
+) -> Result<Bytes, AppError> {
+    let override_matches_payload = upstream_model_override
+        .map(|upstream_model| payload_model(payload) == Some(upstream_model))
+        .unwrap_or(true);
+    if override_matches_payload {
+        if let Some(bytes) = cache.get() {
+            return Ok(bytes.clone());
+        }
+
+        let bytes = serialize_json_bytes(payload)?;
+        let _ = cache.set(bytes.clone());
+        return Ok(bytes);
+    }
+
+    let upstream_model = upstream_model_override
+        .ok_or_else(|| AppError::Internal("missing upstream model override".to_string()))?;
+    let adapted = payload_with_upstream_model(payload, upstream_model)?;
+    serialize_json_bytes(&adapted)
+}
+
+fn serialize_chat_to_responses_payload_bytes(
+    payload: &Value,
+    cache: &OnceLock<Bytes>,
+    upstream_model_override: Option<&str>,
+) -> Result<Bytes, AppError> {
+    let override_matches_payload = upstream_model_override
+        .map(|upstream_model| payload_model(payload) == Some(upstream_model))
+        .unwrap_or(true);
+    if override_matches_payload {
+        if let Some(bytes) = cache.get() {
+            return Ok(bytes.clone());
+        }
+    }
+
+    let adapted = if override_matches_payload {
+        chat_completions_to_responses_payload(payload)?
+    } else {
+        chat_completions_to_responses_payload_with_upstream_model(payload, upstream_model_override)?
+    };
+    let bytes = serialize_json_bytes(&adapted)?;
+    if override_matches_payload {
+        let _ = cache.set(bytes.clone());
+    }
+    Ok(bytes)
+}
+
 fn build_json_response(status: StatusCode, body: &Value) -> Result<Response<Body>, AppError> {
     let bytes = serialize_json_bytes(body)?;
     let mut headers = HeaderMap::new();
@@ -3833,10 +3892,18 @@ fn select_last_chance_channel(
 }
 
 fn chat_completions_to_responses_payload(payload: &Value) -> Result<Value, AppError> {
-    let model = payload
+    chat_completions_to_responses_payload_with_upstream_model(payload, None)
+}
+
+fn chat_completions_to_responses_payload_with_upstream_model(
+    payload: &Value,
+    upstream_model_override: Option<&str>,
+) -> Result<Value, AppError> {
+    let requested_model = payload
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::BadRequest("field `model` is required".to_string()))?;
+    let model = upstream_model_override.unwrap_or(requested_model);
     let messages = payload
         .get("messages")
         .and_then(Value::as_array)
@@ -4674,7 +4741,10 @@ fn classify_retryable_responses_prelude_error(frame: &str) -> Option<(StatusCode
     }
 
     let event: Value = serde_json::from_str(&data).ok()?;
-    let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if !matches!(event_type, "error" | "response.failed") {
         return None;
     }
@@ -4796,7 +4866,10 @@ where
             let Ok(event) = serde_json::from_str::<Value>(&data) else {
                 return Ok(ResponsesPassthroughPrelude::Ready(buffered_chunks));
             };
-            let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
+            let event_type = event
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if event_type != "response.created" {
                 return Ok(ResponsesPassthroughPrelude::Ready(buffered_chunks));
             }
@@ -5373,8 +5446,8 @@ fn truncate(message: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeProviderCapabilityProfile, DispatchPayloadKind, STREAM_PRELUDE_FAILOVER_NOTE,
-        build_claude_message_payloads,
+        ClaudeProviderCapabilityProfile, DispatchPayloadKind, PreparedPayloads,
+        STREAM_PRELUDE_FAILOVER_NOTE, build_claude_message_payloads,
     };
 
     use std::{
@@ -6047,10 +6120,12 @@ mod tests {
         format!("sqlite://{}", path.display())
     }
 
-    async fn create_route_with_responses_channel(
+    async fn create_route_with_channel(
         app: &Router,
         route_model: &str,
         upstream_addr: SocketAddr,
+        upstream_model: &str,
+        protocol: &str,
     ) -> i64 {
         let create_route_response = app
             .clone()
@@ -6084,8 +6159,8 @@ mod tests {
                         serde_json::to_vec(&json!({
                             "base_url": format!("http://{upstream_addr}"),
                             "api_key": "test-key",
-                            "upstream_model": "gpt-5.4",
-                            "protocol": "responses"
+                            "upstream_model": upstream_model,
+                            "protocol": protocol
                         }))
                         .unwrap(),
                     ))
@@ -6096,6 +6171,14 @@ mod tests {
         assert_eq!(create_channel_response.status(), StatusCode::CREATED);
 
         route_id
+    }
+
+    async fn create_route_with_responses_channel(
+        app: &Router,
+        route_model: &str,
+        upstream_addr: SocketAddr,
+    ) -> i64 {
+        create_route_with_channel(app, route_model, upstream_addr, "gpt-5.4", "responses").await
     }
 
     async fn add_responses_channel(
@@ -6110,13 +6193,14 @@ mod tests {
         let account_label = format!("{label}-account");
         let channel_label = label.to_string();
 
-        let site_id = sqlx::query("insert into sites (name, base_url, status) values (?, ?, 'active')")
-            .bind(&site_name)
-            .bind(format!("http://{upstream_addr}"))
-            .execute(&pool)
-            .await
-            .unwrap()
-            .last_insert_rowid();
+        let site_id =
+            sqlx::query("insert into sites (name, base_url, status) values (?, ?, 'active')")
+                .bind(&site_name)
+                .bind(format!("http://{upstream_addr}"))
+                .execute(&pool)
+                .await
+                .unwrap()
+                .last_insert_rowid();
         let account_id = sqlx::query(
             "insert into accounts (site_id, label, api_key, status) values (?, ?, 'test-key', 'active')",
         )
@@ -6218,7 +6302,8 @@ mod tests {
         }
     }
 
-    async fn spawn_responses_replay_upstream(
+    async fn spawn_openai_replay_upstream(
+        path: &'static str,
         responses: Vec<ReplayFixtureResponse>,
     ) -> (SocketAddr, Arc<Mutex<Vec<Value>>>) {
         type ReplayState = (
@@ -6263,7 +6348,7 @@ mod tests {
         let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
         let captured_requests = Arc::new(Mutex::new(Vec::new()));
         let app = Router::new()
-            .route("/v1/responses", post(handler))
+            .route(path, post(handler))
             .with_state((responses, captured_requests.clone()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -6271,6 +6356,18 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (addr, captured_requests)
+    }
+
+    async fn spawn_responses_replay_upstream(
+        responses: Vec<ReplayFixtureResponse>,
+    ) -> (SocketAddr, Arc<Mutex<Vec<Value>>>) {
+        spawn_openai_replay_upstream("/v1/responses", responses).await
+    }
+
+    async fn spawn_chat_replay_upstream(
+        responses: Vec<ReplayFixtureResponse>,
+    ) -> (SocketAddr, Arc<Mutex<Vec<Value>>>) {
+        spawn_openai_replay_upstream("/v1/chat/completions", responses).await
     }
 
     async fn response_json(response: Response<Body>) -> Value {
@@ -6298,20 +6395,29 @@ mod tests {
     }
 
     async fn latest_route_log(app: &Router, route_id: i64) -> Value {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(format!("/api/routes/{route_id}/logs"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let value = response_json(response).await;
-        value["data"]["logs"][0].clone()
+        for _ in 0..20 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(format!("/api/routes/{route_id}/logs"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = response_json(response).await;
+            let first = value["data"]["logs"][0].clone();
+            if first != Value::Null {
+                return first;
+            }
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        panic!("expected at least one route log for route_id={route_id}");
     }
 
     #[tokio::test]
@@ -9577,6 +9683,143 @@ mod tests {
         assert_eq!(captured[0]["model"], "gpt-5.4");
     }
 
+    #[tokio::test]
+    async fn chat_completions_route_can_target_passthrough_upstream_model() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("llmrouter.db");
+        let (upstream_addr, captured_requests) =
+            spawn_chat_replay_upstream(vec![json_replay_response(
+                StatusCode::OK,
+                json!({
+                    "id": "chatcmpl_123",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "grok-4.20-0309",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "hello from upstream"
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 11,
+                        "completion_tokens": 7,
+                        "total_tokens": 18
+                    }
+                }),
+            )])
+            .await;
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url(db_path),
+            request_timeout_secs: 30,
+            master_key: None,
+            bootstrap: None,
+            cooldown_policy: Default::default(),
+            manual_intervention_policy: Default::default(),
+        };
+        let app = app::build_app(&config).await.unwrap();
+
+        let _route_id = create_route_with_channel(
+            &app,
+            "grok-4.20-beta",
+            upstream_addr,
+            "grok-4.20-0309",
+            "chat_completions",
+        )
+        .await;
+
+        let proxy_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "grok-4.20-beta",
+                            "messages": [{ "role": "user", "content": "ping" }]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(proxy_response.status(), StatusCode::OK);
+        let proxy_value = response_json(proxy_response).await;
+        assert_eq!(
+            proxy_value["choices"][0]["message"]["content"],
+            "hello from upstream"
+        );
+
+        let captured = captured_requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0]["model"], "grok-4.20-0309");
+    }
+
+    #[test]
+    fn openai_prepared_payloads_use_selected_upstream_model_without_cache_leak() {
+        let prepared = PreparedPayloads::new(json!({
+            "model": "grok-4.20-beta",
+            "messages": [{ "role": "user", "content": "ping" }]
+        }));
+
+        let passthrough_primary = prepared
+            .bytes_for_with_claude_profile(
+                DispatchPayloadKind::Original,
+                None,
+                Some("grok-4.20-0309"),
+            )
+            .expect("passthrough primary payload should serialize");
+        let passthrough_fallback = prepared
+            .bytes_for_with_claude_profile(
+                DispatchPayloadKind::Original,
+                None,
+                Some("grok-4.20-0401"),
+            )
+            .expect("passthrough fallback payload should serialize");
+        let adapted_primary = prepared
+            .bytes_for_with_claude_profile(
+                DispatchPayloadKind::ChatCompletionsToResponses,
+                None,
+                Some("grok-4.20-0309"),
+            )
+            .expect("adapter primary payload should serialize");
+        let adapted_fallback = prepared
+            .bytes_for_with_claude_profile(
+                DispatchPayloadKind::ChatCompletionsToResponses,
+                None,
+                Some("grok-4.20-0401"),
+            )
+            .expect("adapter fallback payload should serialize");
+
+        let passthrough_primary_value: Value = serde_json::from_slice(&passthrough_primary)
+            .expect("passthrough primary should decode");
+        let passthrough_fallback_value: Value = serde_json::from_slice(&passthrough_fallback)
+            .expect("passthrough fallback should decode");
+        let adapted_primary_value: Value =
+            serde_json::from_slice(&adapted_primary).expect("adapter primary should decode");
+        let adapted_fallback_value: Value =
+            serde_json::from_slice(&adapted_fallback).expect("adapter fallback should decode");
+
+        assert_eq!(passthrough_primary_value["model"], "grok-4.20-0309");
+        assert_eq!(passthrough_fallback_value["model"], "grok-4.20-0401");
+        assert_ne!(
+            passthrough_primary_value["model"],
+            passthrough_fallback_value["model"]
+        );
+        assert_eq!(adapted_primary_value["model"], "grok-4.20-0309");
+        assert_eq!(adapted_fallback_value["model"], "grok-4.20-0401");
+        assert_ne!(
+            adapted_primary_value["model"],
+            adapted_fallback_value["model"]
+        );
+    }
+
     #[test]
     fn claude_prepared_payloads_use_selected_upstream_model_without_cache_leak() {
         let prepared = build_claude_message_payloads(json!({
@@ -9885,8 +10128,7 @@ mod tests {
     async fn claude_stream_retries_once_when_responses_fail_before_first_anthropic_event() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
-        let early_failure =
-            "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"model runtime failed\"}}\n\n";
+        let early_failure = "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"model runtime failed\"}}\n\n";
         let expected_sse = include_str!("claude/fixtures/claude_code_http_stream_anthropic.sse");
         let expected_payload = fixture_json_with_compat_upstream_model(
             include_str!("claude/fixtures/claude_code_tool_cycle_responses_payload.json"),
@@ -9940,8 +10182,7 @@ mod tests {
     async fn claude_stream_only_retries_once_before_reporting_failure() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("llmrouter.db");
-        let early_failure =
-            "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"model runtime failed\"}}\n\n";
+        let early_failure = "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"model runtime failed\"}}\n\n";
         let expected_payload = fixture_json_with_compat_upstream_model(
             include_str!("claude/fixtures/claude_code_tool_cycle_responses_payload.json"),
             "gpt-5.4",
